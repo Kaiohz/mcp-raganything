@@ -1,0 +1,17 @@
+{
+    "mcpServers": {
+        "raganything": {
+            "command": "uv",
+            "args": [
+                "run",
+                "--directory",
+                "/Users/yohan/git/mcp-raganything",
+                "python",
+                "main.py"
+            ],
+            "env": {
+                "MCP_TRANSPORT": "stdio"
+            }
+        }
+    }
+}

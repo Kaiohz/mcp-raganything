@@ -1,0 +1,25 @@
+[project]
+name = "mcp-raganything"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "asyncpg>=0.31.0",
+    "docling>=2.64.0",
+    "fastapi>=0.124.0",
+    "fastmcp>=2.13.2",
+    "lightrag-hku>=1.4.9.8",
+    "mcp>=1.23.1",
+    "openai>=2.9.0",
+    "pgvector>=0.4.2",
+    "pydantic-settings>=2.12.0",
+    "python-dotenv>=1.2.1",
+    "python-multipart>=0.0.20",
+    "raganything",
+    "sqlalchemy[asyncio]>=2.0.0",
+    "uvicorn>=0.38.0",
+]
+
+[tool.uv.sources]
+raganything = { git = "https://github.com/HKUDS/RAG-Anything" }
