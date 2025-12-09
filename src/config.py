@@ -23,6 +23,9 @@ class AppConfig(BaseSettings):
     PORT: int = Field(
         default=8000, description="Server port"
     )
+    UVICORN_LOG_LEVEL: str = Field(
+        default="critical", description="Uvicorn log level when running with MCP stdio"
+    )
 
 
 class DatabaseConfig(BaseSettings):

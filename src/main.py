@@ -1,8 +1,9 @@
-"""
-Main entry point for the RAGAnything API.
+"""Main entry point for the RAGAnything API.
 Simplified following hexagonal architecture pattern from pickpro_indexing_api.
 """
 import contextlib
+import sys
+import threading
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from config import AppConfig
@@ -22,7 +23,6 @@ async def lifespan(app: FastAPI):
         # Initialize RAG engine
         await rag_adapter.initialize()
         yield
-
 
 app = FastAPI(title="RAG Anything API", lifespan=lifespan)
 
@@ -56,7 +56,20 @@ elif app_config.MCP_TRANSPORT == "sse":
 # ============= MAIN =============
 
 if __name__ == "__main__":
-    uvicorn.run(app, host=app_config.HOST, port=app_config.PORT)
+
     if app_config.MCP_TRANSPORT == "stdio":
-        # Standard usage: stdio for Claude Desktop
+        def run_fastapi():
+            uvicorn.run(
+                app, 
+                host=app_config.HOST, 
+                port=app_config.PORT,
+                log_level="critical",
+                access_log=False
+            )
+        
+        api_thread = threading.Thread(target=run_fastapi, daemon=True)
+        api_thread.start()
+        
         mcp.run(transport="stdio")
+    else:
+        uvicorn.run(app, host=app_config.HOST, port=app_config.PORT, log_level=app_config.UVICORN_LOG_LEVEL)
