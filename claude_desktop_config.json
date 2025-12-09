@@ -5,13 +5,10 @@
             "args": [
                 "run",
                 "--directory",
-                "/Users/yohan/git/mcp-raganything",
+                "${path}",
                 "python",
                 "main.py"
-            ],
-            "env": {
-                "MCP_TRANSPORT": "stdio"
-            }
+            ]
         }
     }
 }
