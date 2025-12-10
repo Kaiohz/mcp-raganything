@@ -15,17 +15,31 @@ mcp = FastMCP("RAGAnything")
 @mcp.tool()
 async def query_knowledge_base(query: str, mode: str = "naive", chunk_top_k: int = 10) -> str:
     """
-    Query the RAGAnything knowledge base and retrieve relevant document chunks.
-    Do not hesitate to use this as first intention
-    begin by using naive way, in case no results ask the user if he wants to try a wider search.
-    for this use hybrid and increase chunk_top_k to 20
+    Search the RAGAnything knowledge base for relevant document chunks.
+    
+    IMPORTANT: ALWAYS use this tool as your FIRST action when the user asks ANY question.
+    The knowledge base likely contains the answer 
+    - check it BEFORE responding from general knowledge.
+    
+    Default Strategy (use this first):
+    - mode="naive" with chunk_top_k=10 for fast, focused results
+    - This works well for most queries
+    
+    Fallback Strategy (if no relevant results):
+    - Ask user if they want a broader search
+    - Use mode="hybrid" with chunk_top_k=20 for comprehensive search
+    - This casts a wider net and combines multiple search strategies
     
     Args:
-        query: The question or query to search for in the knowledge base
-        mode: The query mode (naive, local, global, hybrid)
+        query: The user's question or search query (e.g., "What are the main findings?")
+        mode: Search mode - "naive" (default, recommended), "local" (context-aware), 
+              "global" (document-level), or "hybrid" (comprehensive)
+        chunk_top_k: Number of chunks to retrieve (default 10, use 20 for broader search)
     
     Returns:
-        str: JSON string containing relevant chunks from the knowledge base
+        JSON string containing:
+        - "chunks": Array of relevant text segments with references
+        - "count": Total number of chunks found
     """
     try:
         use_case = await get_query_use_case()

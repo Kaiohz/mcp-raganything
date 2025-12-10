@@ -129,7 +129,7 @@ rag_instance = RAGAnything(
         "cosine_threshold": rag_config.COSINE_THRESHOLD,
     } if rag_config.RAG_STORAGE_TYPE == "postgres" else {
         "kv_storage": "JsonKVStorage",
-        "vector_storage": "NanoVectorDB",
+        "vector_storage": "NanoVectorDBStorage",
         "graph_storage": "NetworkXStorage",
         "doc_status_storage": "JsonDocStatusStorage",
         "cosine_threshold": rag_config.COSINE_THRESHOLD,
