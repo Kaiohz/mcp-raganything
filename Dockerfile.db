@@ -1,20 +1,20 @@
-FROM pgvector/pgvector:pg16
+FROM pgvector/pgvector:pg17
 
 # Install build dependencies
 USER root
 RUN apt-get update && apt-get install -y \
     build-essential \
     git \
-    postgresql-server-dev-16 \
+    postgresql-server-dev-17 \
     flex \
     bison \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Apache AGE
+# Install Apache AGE (v1.6.0 for PG17)
 RUN cd /tmp && \
-    git clone https://github.com/apache/age.git && \
+    git clone --branch PG17/v1.6.0-rc0 https://github.com/apache/age.git && \
     cd age && \
-    make PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config install || \
+    make PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config install || \
     (echo "Failed to build AGE" && exit 1)
 
 # Cleanup

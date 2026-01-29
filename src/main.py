@@ -13,7 +13,6 @@ from dependencies import rag_adapter
 from infrastructure.proxy.lightrag_proxy_client import (
     init_lightrag_client,
     close_lightrag_client,
-    get_lightrag_client_instance,
 )
 from application.api.indexing_routes import indexing_router
 from application.api.health_routes import health_router
@@ -183,27 +182,18 @@ elif app_config.MCP_TRANSPORT == "sse":
 
 # ============= MAIN =============
 
+def run_fastapi():
+    uvicorn.run(
+        app,
+        host=app_config.HOST,
+        port=app_config.PORT,
+        log_level="critical",
+        access_log=False,
+    )
+
 if __name__ == "__main__":
+    api_thread = threading.Thread(target=run_fastapi, daemon=True)
+    api_thread.start()
 
     if app_config.MCP_TRANSPORT == "stdio":
-
-        def run_fastapi():
-            uvicorn.run(
-                app,
-                host=app_config.HOST,
-                port=app_config.PORT,
-                log_level="critical",
-                access_log=False,
-            )
-
-        api_thread = threading.Thread(target=run_fastapi, daemon=True)
-        api_thread.start()
-
         mcp.run(transport="stdio")
-    else:
-        uvicorn.run(
-            app,
-            host=app_config.HOST,
-            port=app_config.PORT,
-            log_level=app_config.UVICORN_LOG_LEVEL,
-        )
