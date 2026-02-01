@@ -30,13 +30,19 @@ services:
     ports:
       - "8000:8000"
     env_file:
-      - .env.docker
+      - .env
+    volumes:
+      - rag_storage:/app/ragdata
     depends_on:
       postgres:
         condition: service_healthy
+      qdrant:
+        condition: service_started
     networks:
       - raganything-network
     restart: unless-stopped
+    # profiles:
+    #   - qdrant
 
   # LightRAG Server with Web UI
   lightrag-server:
@@ -47,13 +53,71 @@ services:
     ports:
       - "9621:9621"
     env_file:
-      - .env.lightrag.server.docker
+      - .env.lightrag.server
+    volumes:
+      - rag_storage:/app/ragdata
     depends_on:
       postgres:
         condition: service_healthy
+      qdrant:
+        condition: service_started
     networks:
       - raganything-network
     restart: unless-stopped
+    # profiles:
+    #   - qdrant
+
+  # Qdrant Vector Database (Optional - for high-performance vector storage)
+  # Start with: docker-compose --profile qdrant up -d
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: raganything-qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks:
+      - raganything-network
+    # profiles:
+    #   - qdrant
+    restart: unless-stopped
+
+  # Neo4j Graph Database (Optional - for advanced graph storage)
+  # Start with: docker-compose --profile neo4j up -d
+  # neo4j:
+  #   image: neo4j:5.15-community
+  #   container_name: raganything-neo4j
+  #   ports:
+  #     - "7474:7474"
+  #     - "7687:7687"
+  #   environment:
+  #     NEO4J_AUTH: neo4j/your_password_change_me
+  #     NEO4J_PLUGINS: '["apoc", "graph-data-science"]'
+  #   volumes:
+  #     - neo4j_data:/data
+  #     - neo4j_logs:/logs
+  #   networks:
+  #     - raganything-network
+  #   profiles:
+  #     - neo4j
+  #   restart: unless-stopped
+
+  # Redis Key-Value Store (Optional - for fast KV storage and caching)
+  # Start with: docker-compose --profile redis up -d
+  # redis:
+  #   image: redis:7-alpine
+  #   container_name: raganything-redis
+  #   ports:
+  #     - "6379:6379"
+  #   volumes:
+  #     - redis_data:/data
+  #   command: redis-server --save 60 1 --loglevel warning
+  #   networks:
+  #     - raganything-network
+  #   profiles:
+  #     - redis
+  #   restart: unless-stopped
 
 volumes:
   postgres_data:
@@ -62,6 +126,14 @@ volumes:
     driver: local
   output_data:
     driver: local
+  qdrant_data:
+    driver: local
+  # neo4j_data:
+  #   driver: local
+  # neo4j_logs:
+  #   driver: local
+  # redis_data:
+  #   driver: local
 
 networks:
   raganything-network:
