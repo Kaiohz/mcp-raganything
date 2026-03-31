@@ -19,6 +19,40 @@ services:
       timeout: 5s
       retries: 5
 
+  # MinIO object storage
+  minio:
+    image: minio/minio:latest
+    container_name: raganything-minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # MinIO init — creates the bucket then exits
+  minio-init:
+    image: minio/mc:latest
+    container_name: raganything-minio-init
+    entrypoint: >
+      sh -c "
+        until mc alias set local http://minio:9000 minioadmin minioadmin 2>/dev/null; do sleep 1; done;
+        mc mb --ignore-existing local/raganything;
+        echo 'MinIO init done: bucket raganything created.';
+      "
+    depends_on:
+      minio:
+        condition: service_healthy
+    restart: "no"
+
   # RAG-Anything API application
   raganything-api:
     build:
@@ -32,12 +66,12 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      minio:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:
   postgres_data:
     driver: local
-  rag_storage:
-    driver: local
-  output_data:
+  minio_data:
     driver: local

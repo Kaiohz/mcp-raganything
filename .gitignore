@@ -14,3 +14,4 @@ trivy-report.json
 trivy-report-fixed.json
 coverage.xml
 .ruff_cache
+.pytest_cache
