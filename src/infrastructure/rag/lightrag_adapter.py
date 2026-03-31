@@ -9,6 +9,7 @@ from lightrag.llm.openai import openai_complete_if_cache, openai_embed
 from lightrag.utils import EmbeddingFunc
 from raganything import RAGAnything, RAGAnythingConfig
 
+from application.requests.query_request import MultimodalContentItem
 from config import LLMConfig, RAGConfig
 from domain.entities.indexing_result import (
     FileIndexingResult,
@@ -42,7 +43,7 @@ class LightRAGAdapter(RAGEnginePort):
     def __init__(self, llm_config: LLMConfig, rag_config: RAGConfig) -> None:
         self._llm_config = llm_config
         self._rag_config = rag_config
-        self.rag: dict[str,RAGAnything] = {}
+        self.rag: dict[str, RAGAnything] = {}
 
     @staticmethod
     def _make_workspace(working_dir: str) -> str:
@@ -93,6 +94,7 @@ class LightRAGAdapter(RAGEnginePort):
             },
         )
         return self.rag[working_dir]
+
     # ------------------------------------------------------------------
     # LLM callables (passed directly to RAGAnything)
     # ------------------------------------------------------------------
@@ -217,7 +219,9 @@ class LightRAGAdapter(RAGEnginePort):
     # Port implementation — query
     # ------------------------------------------------------------------
 
-    async def query(self, query: str, mode: str = "naive", top_k: int = 10, working_dir: str = "") -> dict:
+    async def query(
+        self, query: str, mode: str = "naive", top_k: int = 10, working_dir: str = ""
+    ) -> dict:
         rag = self._ensure_initialized(working_dir)
         await rag._ensure_lightrag_initialized()
         if rag.lightrag is None:
@@ -228,6 +232,26 @@ class LightRAGAdapter(RAGEnginePort):
             }
         param = QueryParam(mode=cast(QueryMode, mode), top_k=top_k, chunk_top_k=top_k)
         return await rag.lightrag.aquery_data(query=query, param=param)
+
+    async def query_multimodal(
+        self,
+        query: str,
+        multimodal_content: list[MultimodalContentItem],
+        mode: str = "hybrid",
+        top_k: int = 10,
+        working_dir: str = "",
+    ) -> str:
+        rag = self._ensure_initialized(working_dir)
+        await rag._ensure_lightrag_initialized()
+        raw_content = [
+            item.model_dump(exclude_none=True) for item in multimodal_content
+        ]
+        return await rag.aquery_with_multimodal(
+            query=query,
+            multimodal_content=raw_content,
+            mode=mode,
+            top_k=top_k,
+        )
 
     # ------------------------------------------------------------------
     # Private helpers

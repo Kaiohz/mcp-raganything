@@ -1,9 +1,10 @@
 from fastapi import APIRouter, Depends, status
 
-from application.requests.query_request import QueryRequest
-from application.responses.query_response import QueryResponse
+from application.requests.query_request import MultimodalQueryRequest, QueryRequest
+from application.responses.query_response import MultimodalQueryResponse, QueryResponse
+from application.use_cases.multimodal_query_use_case import MultimodalQueryUseCase
 from application.use_cases.query_use_case import QueryUseCase
-from dependencies import get_query_use_case
+from dependencies import get_multimodal_query_use_case, get_query_use_case
 
 query_router = APIRouter(tags=["RAG Query"])
 
@@ -22,3 +23,22 @@ async def query_knowledge_base(
         top_k=request.top_k,
     )
     return QueryResponse(**result)
+
+
+@query_router.post(
+    "/query/multimodal",
+    response_model=MultimodalQueryResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def query_knowledge_base_multimodal(
+    request: MultimodalQueryRequest,
+    use_case: MultimodalQueryUseCase = Depends(get_multimodal_query_use_case),
+) -> MultimodalQueryResponse:
+    result = await use_case.execute(
+        working_dir=request.working_dir,
+        query=request.query,
+        multimodal_content=request.multimodal_content,
+        mode=request.mode,
+        top_k=request.top_k,
+    )
+    return MultimodalQueryResponse(**result)

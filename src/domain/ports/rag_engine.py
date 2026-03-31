@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 
+from application.requests.query_request import MultimodalContentItem
 from domain.entities.indexing_result import FileIndexingResult, FolderIndexingResult
 
 
@@ -29,5 +30,18 @@ class RAGEnginePort(ABC):
         pass
 
     @abstractmethod
-    async def query(self, query: str, mode: str = "naive", top_k: int = 10, working_dir: str = "") -> dict:
+    async def query(
+        self, query: str, mode: str = "naive", top_k: int = 10, working_dir: str = ""
+    ) -> dict:
+        pass
+
+    @abstractmethod
+    async def query_multimodal(
+        self,
+        query: str,
+        multimodal_content: list[MultimodalContentItem],
+        mode: str = "hybrid",
+        top_k: int = 10,
+        working_dir: str = "",
+    ) -> str:
         pass
