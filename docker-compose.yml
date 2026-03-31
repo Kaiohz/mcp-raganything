@@ -18,11 +18,9 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-    networks:
-      - raganything-network
 
   # RAG-Anything API application
-  api:
+  raganything-api:
     build:
       context: .
       dockerfile: Dockerfile
@@ -34,25 +32,6 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    networks:
-      - raganything-network
-    restart: unless-stopped
-
-  # LightRAG Server with Web UI
-  lightrag-server:
-    build:
-      context: .
-      dockerfile: Dockerfile.lightrag
-    container_name: raganything-lightrag
-    ports:
-      - "9621:9621"
-    env_file:
-      - .env.lightrag.server.docker
-    depends_on:
-      postgres:
-        condition: service_healthy
-    networks:
-      - raganything-network
     restart: unless-stopped
 
 volumes:
@@ -62,7 +41,3 @@ volumes:
     driver: local
   output_data:
     driver: local
-
-networks:
-  raganything-network:
-    driver: bridge
