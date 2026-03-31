@@ -1,0 +1,10 @@
+# Test Document
+
+This is a test document for RAGAnything indexing.
+
+## Key Information
+- Company: TestCo
+- Product: MultimodalRAG
+- Version: 1.0
+
+This document contains important information about our product.

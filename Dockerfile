@@ -35,7 +35,11 @@ ENV PYTHONPATH=/app/src:$PYTHONPATH
 ENV PATH="/app/.venv/bin:$PATH"
 
 # Create non-root user for security
-RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+RUN useradd -m -u 1000 appuser && \
+    chown -R appuser:appuser /app && \
+    mkdir -p /app/ragdata && \
+    chown -R appuser:appuser /app/ragdata
+
 USER appuser
 
 # Expose port

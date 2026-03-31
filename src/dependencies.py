@@ -8,7 +8,7 @@ import tempfile
 from raganything import RAGAnything, RAGAnythingConfig
 from lightrag.llm.openai import openai_complete_if_cache, openai_embed
 from lightrag.utils import EmbeddingFunc
-from config import DatabaseConfig, LLMConfig, RAGConfig, AppConfig, ProxyConfig
+from config import DatabaseConfig, LLMConfig, RAGConfig, AppConfig, ProxyConfig, StorageConfig
 from infrastructure.rag.lightrag_adapter import LightRAGAdapter
 from infrastructure.proxy.lightrag_proxy_client import (
     LightRAGProxyClient,
@@ -18,6 +18,7 @@ from infrastructure.proxy.lightrag_proxy_client import (
 )
 from application.use_cases.index_file_use_case import IndexFileUseCase
 from application.use_cases.index_folder_use_case import IndexFolderUseCase
+from application.use_cases.index_batch_use_case import IndexBatchUseCase
 from application.use_cases.lightrag_proxy_use_case import LightRAGProxyUseCase
 
 
@@ -28,6 +29,7 @@ db_config = DatabaseConfig()  # type: ignore
 llm_config = LLMConfig()  # type: ignore
 rag_config = RAGConfig()  # type: ignore
 proxy_config = ProxyConfig()  # type: ignore
+storage_config = StorageConfig()  # type: ignore
 
 # ============= ENVIRONMENT SETUP =============
 
@@ -39,9 +41,10 @@ os.environ["POSTGRES_PORT"] = db_config.POSTGRES_PORT
 
 # ============= DIRECTORIES =============
 
-WORKING_DIR = os.path.join(tempfile.gettempdir(), "rag_storage")
+# Read WORKING_DIR from environment variable, fallback to temp dir
+WORKING_DIR = os.getenv("WORKING_DIR", os.path.join(tempfile.gettempdir(), "rag_storage"))
 os.makedirs(WORKING_DIR, exist_ok=True)
-OUTPUT_DIR = os.path.join(tempfile.gettempdir(), "output")
+OUTPUT_DIR = os.path.join(WORKING_DIR, "output")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ============= DATABASE ENGINE =============
@@ -50,10 +53,87 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # ============= RAG SETUP =============
 
 
+def get_storage_config() -> dict:
+    """
+    Factory function to get storage configuration based on StorageConfig.
+    Returns dict with all 4 storage types: vector, graph, kv, doc_status.
+    """
+    storage_dict = {}
+
+    # 1. VECTOR STORAGE
+    if storage_config.VECTOR_STORAGE_TYPE == "pgvector":
+        storage_dict["vector_storage"] = "PGVectorStorage"
+    elif storage_config.VECTOR_STORAGE_TYPE == "qdrant":
+        if storage_config.QDRANT_URL:
+            os.environ["QDRANT_URL"] = storage_config.QDRANT_URL
+        if storage_config.QDRANT_API_KEY:
+            os.environ["QDRANT_API_KEY"] = storage_config.QDRANT_API_KEY
+        storage_dict["vector_storage"] = "QdrantVectorDBStorage"
+    elif storage_config.VECTOR_STORAGE_TYPE == "milvus":
+        storage_dict["vector_storage"] = "MilvusVectorDBStorage"
+    elif storage_config.VECTOR_STORAGE_TYPE == "local":
+        storage_dict["vector_storage"] = "NanoVectorDBStorage"
+    else:
+        storage_dict["vector_storage"] = "PGVectorStorage"  # Default fallback
+
+    # 2. GRAPH STORAGE (CRITICAL - for knowledge graph)
+    if storage_config.GRAPH_STORAGE_TYPE == "postgres":
+        storage_dict["graph_storage"] = "PGGraphStorage"
+    elif storage_config.GRAPH_STORAGE_TYPE == "neo4j":
+        if storage_config.NEO4J_URI:
+            os.environ["NEO4J_URI"] = storage_config.NEO4J_URI
+        if storage_config.NEO4J_USERNAME:
+            os.environ["NEO4J_USERNAME"] = storage_config.NEO4J_USERNAME
+        if storage_config.NEO4J_PASSWORD:
+            os.environ["NEO4J_PASSWORD"] = storage_config.NEO4J_PASSWORD
+        storage_dict["graph_storage"] = "Neo4JStorage"
+    elif storage_config.GRAPH_STORAGE_TYPE == "networkx":
+        storage_dict["graph_storage"] = "NetworkXStorage"
+    elif storage_config.GRAPH_STORAGE_TYPE == "memgraph":
+        if storage_config.NEO4J_URI:
+            os.environ["NEO4J_URI"] = storage_config.NEO4J_URI
+        if storage_config.NEO4J_USERNAME:
+            os.environ["NEO4J_USERNAME"] = storage_config.NEO4J_USERNAME
+        if storage_config.NEO4J_PASSWORD:
+            os.environ["NEO4J_PASSWORD"] = storage_config.NEO4J_PASSWORD
+        storage_dict["graph_storage"] = "MemgraphStorage"
+    else:
+        storage_dict["graph_storage"] = "PGGraphStorage"  # Default fallback
+
+    # 3. KV STORAGE (for LLM cache, chunks, documents)
+    if storage_config.KV_STORAGE_TYPE == "postgres":
+        storage_dict["kv_storage"] = "PGKVStorage"
+    elif storage_config.KV_STORAGE_TYPE == "redis":
+        if storage_config.REDIS_URI:
+            os.environ["REDIS_URI"] = storage_config.REDIS_URI
+        storage_dict["kv_storage"] = "RedisKVStorage"
+    elif storage_config.KV_STORAGE_TYPE == "mongo":
+        storage_dict["kv_storage"] = "MongoKVStorage"
+    elif storage_config.KV_STORAGE_TYPE == "json":
+        storage_dict["kv_storage"] = "JsonKVStorage"
+    else:
+        storage_dict["kv_storage"] = "PGKVStorage"  # Default fallback
+
+    # 4. DOC STATUS STORAGE
+    if storage_config.DOC_STATUS_STORAGE_TYPE == "postgres":
+        storage_dict["doc_status_storage"] = "PGDocStatusStorage"
+    elif storage_config.DOC_STATUS_STORAGE_TYPE == "mongo":
+        storage_dict["doc_status_storage"] = "MongoDocStatusStorage"
+    elif storage_config.DOC_STATUS_STORAGE_TYPE == "json":
+        storage_dict["doc_status_storage"] = "JsonDocStatusStorage"
+    else:
+        storage_dict["doc_status_storage"] = "PGDocStatusStorage"  # Default fallback
+
+    # Add cosine threshold
+    storage_dict["cosine_threshold"] = rag_config.COSINE_THRESHOLD
+
+    return storage_dict
+
+
 async def llm_model_func(prompt, system_prompt=None, history_messages=[], **kwargs):
-    """LLM function for RAGAnything."""
+    """LLM function for RAGAnything - supports multiple providers."""
     return await openai_complete_if_cache(
-        llm_config.CHAT_MODEL,
+        llm_config.model_name,
         prompt,
         system_prompt=system_prompt,
         history_messages=history_messages,
@@ -126,23 +206,7 @@ rag_instance = RAGAnything(
     llm_model_func=llm_model_func,
     vision_model_func=vision_model_func,
     embedding_func=embedding_func,
-    lightrag_kwargs=(
-        {
-            "kv_storage": "PGKVStorage",
-            "vector_storage": "PGVectorStorage",
-            "graph_storage": "PGGraphStorage",
-            "doc_status_storage": "PGDocStatusStorage",
-            "cosine_threshold": rag_config.COSINE_THRESHOLD,
-        }
-        if rag_config.RAG_STORAGE_TYPE == "postgres"
-        else {
-            "kv_storage": "JsonKVStorage",
-            "vector_storage": "NanoVectorDBStorage",
-            "graph_storage": "NetworkXStorage",
-            "doc_status_storage": "JsonDocStatusStorage",
-            "cosine_threshold": rag_config.COSINE_THRESHOLD,
-        }
-    ),
+    lightrag_kwargs=get_storage_config(),
 )
 
 # ============= ADAPTERS =============
@@ -170,6 +234,16 @@ async def get_index_folder_use_case() -> IndexFolderUseCase:
         IndexFolderUseCase: The configured use case.
     """
     return IndexFolderUseCase(rag_adapter, OUTPUT_DIR)
+
+
+async def get_index_batch_use_case() -> IndexBatchUseCase:
+    """
+    Dependency injection function for IndexBatchUseCase.
+
+    Returns:
+        IndexBatchUseCase: The configured use case for batch file indexing.
+    """
+    return IndexBatchUseCase(rag_adapter, OUTPUT_DIR)
 
 
 async def get_lightrag_client() -> LightRAGProxyClient:

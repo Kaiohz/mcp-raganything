@@ -4,6 +4,16 @@ FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim AS builder
 
 WORKDIR /app
 
+# Install build dependencies for numpy and other C extensions
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    gcc \
+    g++ \
+    gfortran \
+    libopenblas-dev \
+    liblapack-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 # Install lightrag-hku with API extras
 RUN uv pip install --system "lightrag-hku[api]"
 
@@ -12,6 +22,8 @@ FROM python:3.13-slim-bookworm
 
 RUN apt-get update && apt-get install -y \
     libgomp1 \
+    libopenblas0 \
+    libgfortran5 \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
@@ -22,7 +34,11 @@ COPY --from=builder /usr/local/lib/python3.13/site-packages /usr/local/lib/pytho
 COPY --from=builder /usr/local/bin/lightrag-server /usr/local/bin/lightrag-server
 
 # Create non-root user
-RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+RUN useradd -m -u 1000 appuser && \
+    chown -R appuser:appuser /app && \
+    mkdir -p /app/ragdata && \
+    chown -R appuser:appuser /app/ragdata
+
 USER appuser
 
 EXPOSE 9621

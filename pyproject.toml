@@ -13,14 +13,21 @@ dependencies = [
     "lightrag-hku>=1.4.9.8",
     "lightrag-hku[api]>=1.4.9.8",
     "mcp>=1.23.1",
+    "neo4j>=6.0.3",
     "openai>=2.9.0",
     "pgvector>=0.4.2",
     "pydantic-settings>=2.12.0",
     "python-dotenv>=1.2.1",
     "python-multipart>=0.0.20",
+    "qdrant-client>=1.16.2",
     "raganything>=1.2.8",
+    "redis>=7.1.0",
     "sqlalchemy[asyncio]>=2.0.0",
     "uvicorn>=0.38.0",
+    # Optional storage backends (install if needed)
+    # "qdrant-client>=1.11.0",  # For Qdrant vector storage
+    # "neo4j>=5.0.0",  # For Neo4j graph storage
+    # "redis>=5.0.0",  # For Redis KV storage
 ]
 
 [dependency-groups]
