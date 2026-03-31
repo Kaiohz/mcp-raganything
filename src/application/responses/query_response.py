@@ -65,3 +65,11 @@ class QueryResponse(BaseModel):
     message: str = ""
     data: QueryDataResponse = Field(default_factory=QueryDataResponse)
     metadata: QueryMetadataResponse | None = None
+
+
+class MultimodalQueryResponse(BaseModel):
+    status: str
+    message: str = ""
+    data: str = Field(
+        default="", description="Réponse textuelle de l'analyse multimodale"
+    )

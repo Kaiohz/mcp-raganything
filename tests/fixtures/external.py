@@ -39,6 +39,8 @@ def mock_rag_engine() -> AsyncMock:
         processing_time_ms=500.0,
     )
 
+    mock.query_multimodal.return_value = "Multimodal analysis result"
+
     return mock
 
 

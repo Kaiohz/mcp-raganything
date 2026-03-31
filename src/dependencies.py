@@ -4,6 +4,7 @@ import os
 
 from application.use_cases.index_file_use_case import IndexFileUseCase
 from application.use_cases.index_folder_use_case import IndexFolderUseCase
+from application.use_cases.multimodal_query_use_case import MultimodalQueryUseCase
 from application.use_cases.query_use_case import QueryUseCase
 from config import AppConfig, LLMConfig, MinioConfig, RAGConfig
 from infrastructure.rag.lightrag_adapter import LightRAGAdapter
@@ -45,3 +46,7 @@ def get_index_folder_use_case() -> IndexFolderUseCase:
 
 def get_query_use_case() -> QueryUseCase:
     return QueryUseCase(rag_adapter)
+
+
+def get_multimodal_query_use_case() -> MultimodalQueryUseCase:
+    return MultimodalQueryUseCase(rag_adapter)

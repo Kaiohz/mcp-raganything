@@ -4,10 +4,17 @@ import httpx
 import pytest
 from httpx import ASGITransport
 
+from application.requests.query_request import MultimodalContentItem
 from application.use_cases.index_file_use_case import IndexFileUseCase
 from application.use_cases.index_folder_use_case import IndexFolderUseCase
+from application.use_cases.multimodal_query_use_case import MultimodalQueryUseCase
 from application.use_cases.query_use_case import QueryUseCase
-from dependencies import get_index_file_use_case, get_index_folder_use_case, get_query_use_case
+from dependencies import (
+    get_index_file_use_case,
+    get_index_folder_use_case,
+    get_multimodal_query_use_case,
+    get_query_use_case,
+)
 from main import app
 
 
@@ -309,6 +316,148 @@ class TestQueryRoute:
                     "working_dir": "/tmp/rag/test",
                     "query": "test",
                     "mode": "invalid_mode",
+                },
+            )
+
+        assert response.status_code == 422
+
+
+class TestMultimodalQueryRoute:
+    @pytest.fixture
+    def mock_multimodal_query_use_case(self) -> AsyncMock:
+        mock = AsyncMock(spec=MultimodalQueryUseCase)
+        mock.execute.return_value = {
+            "status": "success",
+            "data": "Multimodal analysis result",
+        }
+        return mock
+
+    async def test_multimodal_query_returns_200(
+        self,
+        mock_multimodal_query_use_case: AsyncMock,
+    ) -> None:
+        app.dependency_overrides[get_multimodal_query_use_case] = (
+            lambda: mock_multimodal_query_use_case
+        )
+
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/api/v1/query/multimodal",
+                json={
+                    "working_dir": "/tmp/rag/test",
+                    "query": "What does this image show?",
+                    "multimodal_content": [
+                        {"type": "image", "img_path": "/tmp/img.png"},
+                    ],
+                },
+            )
+
+        assert response.status_code == 200
+
+    async def test_multimodal_query_calls_use_case_with_correct_params(
+        self,
+        mock_multimodal_query_use_case: AsyncMock,
+    ) -> None:
+        app.dependency_overrides[get_multimodal_query_use_case] = (
+            lambda: mock_multimodal_query_use_case
+        )
+
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            await client.post(
+                "/api/v1/query/multimodal",
+                json={
+                    "working_dir": "/tmp/rag/project_42",
+                    "query": "Analyze this table",
+                    "multimodal_content": [
+                        {"type": "table", "table_data": "A,B\n1,2", "table_caption": "Test"},
+                    ],
+                    "mode": "global",
+                    "top_k": 20,
+                },
+            )
+
+        mock_multimodal_query_use_case.execute.assert_called_once_with(
+            working_dir="/tmp/rag/project_42",
+            query="Analyze this table",
+            multimodal_content=[
+                MultimodalContentItem(type="table", table_data="A,B\n1,2", table_caption="Test"),
+            ],
+            mode="global",
+            top_k=20,
+        )
+
+    async def test_multimodal_query_returns_response_body(
+        self,
+        mock_multimodal_query_use_case: AsyncMock,
+    ) -> None:
+        app.dependency_overrides[get_multimodal_query_use_case] = (
+            lambda: mock_multimodal_query_use_case
+        )
+
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/api/v1/query/multimodal",
+                json={
+                    "working_dir": "/tmp/rag/test",
+                    "query": "Describe this",
+                    "multimodal_content": [
+                        {"type": "image", "img_path": "/tmp/img.png"},
+                    ],
+                },
+            )
+
+        body = response.json()
+        assert body["status"] == "success"
+        assert body["data"] == "Multimodal analysis result"
+
+    async def test_multimodal_query_rejects_missing_query(self) -> None:
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/api/v1/query/multimodal",
+                json={
+                    "working_dir": "/tmp/rag/test",
+                    "multimodal_content": [
+                        {"type": "image", "img_path": "/tmp/img.png"},
+                    ],
+                },
+            )
+
+        assert response.status_code == 422
+
+    async def test_multimodal_query_rejects_missing_multimodal_content(self) -> None:
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/api/v1/query/multimodal",
+                json={
+                    "working_dir": "/tmp/rag/test",
+                    "query": "test",
+                },
+            )
+
+        assert response.status_code == 422
+
+    async def test_multimodal_query_rejects_invalid_content_type(self) -> None:
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/api/v1/query/multimodal",
+                json={
+                    "working_dir": "/tmp/rag/test",
+                    "query": "test",
+                    "multimodal_content": [
+                        {"type": "video", "path": "/tmp/video.mp4"},
+                    ],
                 },
             )
 
