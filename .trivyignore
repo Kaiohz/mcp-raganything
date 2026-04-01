@@ -1,0 +1,3 @@
+# ecdsa: Minerva attack - no fixed version available (status: affected)
+# Transitive dependency via authlib. Monitor for upstream fix.
+CVE-2024-23342

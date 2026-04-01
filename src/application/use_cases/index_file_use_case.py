@@ -44,5 +44,5 @@ class IndexFileUseCase:
         )
 
         logger.info(f"Indexation finished: {result.model_dump()}")
-        
+
         return result
