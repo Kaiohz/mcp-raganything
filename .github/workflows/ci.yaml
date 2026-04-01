@@ -69,7 +69,6 @@ jobs:
         retention-days: 7
 
     - name: SonarQube Scan
-      if: env.SONAR_TOKEN != ''
       uses: SonarSource/sonarqube-scan-action@v5
       env:
         SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
