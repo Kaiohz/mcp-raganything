@@ -1,4 +1,4 @@
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -235,6 +235,7 @@ class TestQueryRoute:
         self,
         mock_query_use_case: AsyncMock,
     ) -> None:
+        """Route now returns list[ChunkResponse] (data.chunks), not the full dict."""
         app.dependency_overrides[get_query_use_case] = (
             lambda: mock_query_use_case
         )
@@ -251,12 +252,8 @@ class TestQueryRoute:
             )
 
         body = response.json()
-        assert body["status"] == "success"
-        assert "data" in body
-        assert body["data"]["entities"] == []
-        assert body["data"]["relationships"] == []
-        assert body["data"]["chunks"] == []
-        assert body["data"]["references"] == []
+        assert isinstance(body, list)
+        assert body == []
 
     async def test_query_uses_default_mode_and_top_k(
         self,

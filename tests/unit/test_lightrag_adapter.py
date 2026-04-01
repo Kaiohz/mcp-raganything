@@ -1,3 +1,5 @@
+import os
+import tempfile
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -51,13 +53,14 @@ class TestLightRAGAdapter:
         llm_config: LLMConfig,
         rag_config_postgres: RAGConfig,
     ) -> None:
-        """Should instantiate RAGAnything with correct working_dir on init_project."""
+        """Should instantiate RAGAnything with safe working_dir on init_project."""
         adapter = LightRAGAdapter(llm_config, rag_config_postgres)
         adapter.init_project("/tmp/test_project")
 
+        expected_dir = os.path.join(tempfile.gettempdir(), "raganything", "tmp/test_project")
         mock_rag_cls.assert_called_once()
         call_kwargs = mock_rag_cls.call_args[1]
-        assert call_kwargs["config"].working_dir == "/tmp/test_project"
+        assert call_kwargs["config"].working_dir == expected_dir
         assert adapter.rag["/tmp/test_project"] is mock_rag_cls.return_value
 
     @patch("infrastructure.rag.lightrag_adapter.EmbeddingFunc")
@@ -196,23 +199,22 @@ class TestLightRAGAdapter:
         self,
         llm_config: LLMConfig,
         rag_config_postgres: RAGConfig,
+        tmp_path,
     ) -> None:
-        """Should return SUCCESS result when process_folder_complete succeeds."""
+        """Should return SUCCESS result when all files are processed successfully."""
         adapter = LightRAGAdapter(llm_config, rag_config_postgres)
         mock_rag = MagicMock()
         mock_rag._ensure_lightrag_initialized = AsyncMock()
-        mock_rag.process_folder_complete = AsyncMock(
-            return_value={
-                "total_files": 3,
-                "successful_files": 3,
-                "failed_files": 0,
-                "skipped_files": 0,
-            }
-        )
+        mock_rag.process_document_complete = AsyncMock()
         adapter.rag["test_dir"] = mock_rag
 
+        # Create test files
+        (tmp_path / "a.pdf").write_text("pdf1")
+        (tmp_path / "b.pdf").write_text("pdf2")
+        (tmp_path / "c.txt").write_text("skip")
+
         result = await adapter.index_folder(
-            folder_path="/tmp/docs",
+            folder_path=str(tmp_path),
             output_dir="/tmp/output",
             recursive=True,
             file_extensions=[".pdf"],
@@ -220,10 +222,10 @@ class TestLightRAGAdapter:
         )
 
         assert result.status == IndexingStatus.SUCCESS
-        assert result.stats.total_files == 3
-        assert result.stats.files_processed == 3
+        assert result.stats.total_files == 2
+        assert result.stats.files_processed == 2
         assert result.stats.files_failed == 0
-        assert result.folder_path == "/tmp/docs"
+        assert result.folder_path == str(tmp_path)
         assert result.recursive is True
         assert result.processing_time_ms is not None
 
@@ -235,7 +237,7 @@ class TestLightRAGAdapter:
         """Should raise KeyError when calling index_folder without init_project."""
         adapter = LightRAGAdapter(llm_config, rag_config_postgres)
 
-        with pytest.raises(KeyError):
+        with pytest.raises(RuntimeError):
             await adapter.index_folder(
                 folder_path="/tmp/docs",
                 output_dir="/tmp/output",
@@ -250,7 +252,7 @@ class TestLightRAGAdapter:
         """Should raise KeyError when calling index_document without init_project."""
         adapter = LightRAGAdapter(llm_config, rag_config_postgres)
 
-        with pytest.raises(KeyError):
+        with pytest.raises(RuntimeError):
             await adapter.index_document(
                 file_path="/tmp/doc.pdf",
                 file_name="doc.pdf",
@@ -307,59 +309,69 @@ class TestLightRAGAdapter:
         """Should raise KeyError when calling query without init_project."""
         adapter = LightRAGAdapter(llm_config, rag_config_postgres)
 
-        with pytest.raises(KeyError):
+        with pytest.raises(RuntimeError):
             await adapter.query(query="anything", working_dir="missing_dir")
 
     async def test_index_folder_failure(
         self,
         llm_config: LLMConfig,
         rag_config_postgres: RAGConfig,
+        tmp_path,
     ) -> None:
-        """Should return FAILED result when process_folder_complete raises."""
+        """Should return FAILED result when all files fail to process."""
         adapter = LightRAGAdapter(llm_config, rag_config_postgres)
         mock_rag = MagicMock()
         mock_rag._ensure_lightrag_initialized = AsyncMock()
-        mock_rag.process_folder_complete = AsyncMock(
-            side_effect=OSError("Folder not found")
+        mock_rag.process_document_complete = AsyncMock(
+            side_effect=OSError("Processing failed")
         )
         adapter.rag["test_dir"] = mock_rag
 
+        (tmp_path / "a.pdf").write_text("pdf")
+
         result = await adapter.index_folder(
-            folder_path="/tmp/missing",
+            folder_path=str(tmp_path),
             output_dir="/tmp/output",
             working_dir="test_dir",
         )
 
         assert result.status == IndexingStatus.FAILED
-        assert result.error == "Folder not found"
-        assert result.folder_path == "/tmp/missing"
+        assert result.folder_path == str(tmp_path)
         assert result.processing_time_ms is not None
 
     async def test_index_folder_partial_result(
         self,
         llm_config: LLMConfig,
         rag_config_postgres: RAGConfig,
+        tmp_path,
     ) -> None:
         """Should return PARTIAL status when some files succeed and some fail."""
         adapter = LightRAGAdapter(llm_config, rag_config_postgres)
         mock_rag = MagicMock()
         mock_rag._ensure_lightrag_initialized = AsyncMock()
-        mock_rag.process_folder_complete = AsyncMock(
-            return_value={
-                "total_files": 5,
-                "successful_files": 3,
-                "failed_files": 2,
-                "skipped_files": 0,
-            }
-        )
+
+        call_count = 0
+
+        async def side_effect(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count <= 2:
+                return None
+            raise OSError("fail")
+
+        mock_rag.process_document_complete = AsyncMock(side_effect=side_effect)
         adapter.rag["test_dir"] = mock_rag
 
+        (tmp_path / "a.pdf").write_text("ok1")
+        (tmp_path / "b.pdf").write_text("ok2")
+        (tmp_path / "c.pdf").write_text("fail")
+
         result = await adapter.index_folder(
-            folder_path="/tmp/mixed",
+            folder_path=str(tmp_path),
             output_dir="/tmp/output",
             working_dir="test_dir",
         )
 
         assert result.status == IndexingStatus.PARTIAL
-        assert result.stats.files_processed == 3
-        assert result.stats.files_failed == 2
+        assert result.stats.files_processed == 2
+        assert result.stats.files_failed == 1

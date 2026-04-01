@@ -29,7 +29,7 @@ class IndexFolderUseCase:
 
     async def execute(self, request: IndexFolderRequest) -> FolderIndexingResult:
         local_folder = os.path.join(self.output_dir, request.working_dir)
-        
+
         os.makedirs(local_folder, exist_ok=True)
 
         files = await self.storage.list_objects(
@@ -52,7 +52,7 @@ class IndexFolderUseCase:
         await asyncio.gather(*[_download(f) for f in files])
 
         self.rag_engine.init_project(request.working_dir)
-        
+
         result = await self.rag_engine.index_folder(
             folder_path=local_folder,
             output_dir=self.output_dir,

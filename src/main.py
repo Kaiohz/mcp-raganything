@@ -4,7 +4,6 @@ Simplified following hexagonal architecture pattern from pickpro_indexing_api.
 
 import logging
 import threading
-from contextlib import asynccontextmanager
 
 import uvicorn
 from fastapi import FastAPI

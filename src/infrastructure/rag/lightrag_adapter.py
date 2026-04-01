@@ -1,5 +1,6 @@
 import hashlib
 import os
+import tempfile
 import time
 from typing import Literal, cast
 
@@ -61,9 +62,46 @@ class LightRAGAdapter(RAGEnginePort):
         if working_dir in self.rag:
             return self.rag[working_dir]
         workspace = self._make_workspace(working_dir)
+
+        # Capture config values as locals to avoid passing bound methods.
+        # Bound methods reference `self` which holds `self.rag` (all previous
+        # RAGAnything instances). RAGAnything/LightRAG deepcopies the callables
+        # during init, which traverses the entire object graph including asyncpg
+        # connections — and asyncpg objects are not picklable/copyable.
+        llm_config = self._llm_config
+
+        async def llm_call(prompt, system_prompt=None, history_messages=None, **kwargs):
+            if history_messages is None:
+                history_messages = []
+            return await openai_complete_if_cache(
+                llm_config.CHAT_MODEL,
+                prompt,
+                system_prompt=system_prompt,
+                history_messages=history_messages,
+                api_key=llm_config.api_key,
+                base_url=llm_config.api_base_url,
+                **kwargs,
+            )
+
+        async def vision_call(prompt, system_prompt=None, history_messages=None, image_data=None, **kwargs):
+            if history_messages is None:
+                history_messages = []
+            messages = _build_vision_messages(system_prompt, history_messages, prompt, image_data)
+            return await openai_complete_if_cache(
+                llm_config.VISION_MODEL,
+                "Image Description Task",
+                system_prompt=None,
+                history_messages=messages,
+                api_key=llm_config.api_key,
+                base_url=llm_config.api_base_url,
+                messages=messages,
+                **kwargs,
+            )
+
+        safe_working_dir = os.path.join(tempfile.gettempdir(), "raganything", working_dir.strip("/"))
         self.rag[working_dir] = RAGAnything(
             config=RAGAnythingConfig(
-                working_dir=working_dir,
+                working_dir=safe_working_dir,
                 parser="docling",
                 parse_method="txt",
                 enable_image_processing=self._rag_config.ENABLE_IMAGE_PROCESSING,
@@ -71,16 +109,16 @@ class LightRAGAdapter(RAGEnginePort):
                 enable_equation_processing=self._rag_config.ENABLE_EQUATION_PROCESSING,
                 max_concurrent_files=self._rag_config.MAX_CONCURRENT_FILES,
             ),
-            llm_model_func=self._llm_call,
-            vision_model_func=self._vision_call,
+            llm_model_func=llm_call,
+            vision_model_func=vision_call,
             embedding_func=EmbeddingFunc(
-                embedding_dim=self._llm_config.EMBEDDING_DIM,
-                max_token_size=self._llm_config.MAX_TOKEN_SIZE,
+                embedding_dim=llm_config.EMBEDDING_DIM,
+                max_token_size=llm_config.MAX_TOKEN_SIZE,
                 func=lambda texts: openai_embed(
                     texts,
-                    model=self._llm_config.EMBEDDING_MODEL,
-                    api_key=self._llm_config.api_key,
-                    base_url=self._llm_config.api_base_url,
+                    model=llm_config.EMBEDDING_MODEL,
+                    api_key=llm_config.api_key,
+                    base_url=llm_config.api_base_url,
                 ),
             ),
             lightrag_kwargs={
@@ -143,9 +181,10 @@ class LightRAGAdapter(RAGEnginePort):
     # ------------------------------------------------------------------
 
     def _ensure_initialized(self, working_dir: str) -> RAGAnything:
-        if self.rag[working_dir] is None:
-            raise RuntimeError("RAG engine not initialized. Call init_project() first.")
-        return self.rag[working_dir]
+        rag = self.rag.get(working_dir)
+        if rag is None:
+            raise RuntimeError(f"RAG engine not initialized for '{working_dir}'. Call init_project() first.")
+        return rag
 
     async def index_document(
         self, file_path: str, file_name: str, output_dir: str, working_dir: str = ""
@@ -185,35 +224,84 @@ class LightRAGAdapter(RAGEnginePort):
         file_extensions: list[str] | None = None,
         working_dir: str = "",
     ) -> FolderIndexingResult:
+        """Index a folder by processing each document sequentially.
+
+        RAGAnything's process_folder_complete uses deepcopy internally which
+        fails with asyncpg/asyncio objects. We iterate files manually and
+        call process_document_complete for each one instead.
+        """
         start_time = time.time()
         rag = self._ensure_initialized(working_dir)
         await rag._ensure_lightrag_initialized()
-        try:
-            result = await rag.process_folder_complete(
-                folder_path=folder_path,
-                output_dir=output_dir,
-                parse_method="txt",
-                file_extensions=file_extensions,
-                recursive=recursive,
-                display_stats=True,
-                max_workers=self._rag_config.MAX_WORKERS,
-            )
-            processing_time_ms = (time.time() - start_time) * 1000
-            return self._build_folder_result(
-                result, folder_path, recursive, processing_time_ms
-            )
-        except Exception as e:
-            processing_time_ms = (time.time() - start_time) * 1000
-            logger.error(f"Failed to index folder {folder_path}: {e}", exc_info=True)
-            return FolderIndexingResult(
-                status=IndexingStatus.FAILED,
-                message=f"Failed to index folder '{folder_path}'",
-                folder_path=folder_path,
-                recursive=recursive,
-                stats=FolderIndexingStats(),
-                processing_time_ms=round(processing_time_ms, 2),
-                error=str(e),
-            )
+
+        glob_pattern = "**/*" if recursive else "*"
+        from pathlib import Path
+
+        folder = Path(folder_path)
+        all_files = [f for f in folder.glob(glob_pattern) if f.is_file()]
+
+        if file_extensions:
+            exts = set(file_extensions)
+            all_files = [f for f in all_files if f.suffix in exts]
+
+        succeeded = 0
+        failed = 0
+        file_results: list[FileProcessingDetail] = []
+
+        for file_path_obj in all_files:
+            try:
+                await rag.process_document_complete(
+                    file_path=str(file_path_obj),
+                    output_dir=output_dir,
+                    parse_method="txt",
+                )
+                succeeded += 1
+                file_results.append(
+                    FileProcessingDetail(
+                        file_path=str(file_path_obj),
+                        file_name=file_path_obj.name,
+                        status=IndexingStatus.SUCCESS,
+                    )
+                )
+                logger.info(f"Indexed {file_path_obj.name} ({succeeded}/{len(all_files)})")
+            except Exception as e:
+                failed += 1
+                logger.error(f"Failed to index {file_path_obj.name}: {e}")
+                file_results.append(
+                    FileProcessingDetail(
+                        file_path=str(file_path_obj),
+                        file_name=file_path_obj.name,
+                        status=IndexingStatus.FAILED,
+                        error=str(e),
+                    )
+                )
+
+        processing_time_ms = (time.time() - start_time) * 1000
+        total = len(all_files)
+        if failed == 0 and succeeded > 0:
+            status = IndexingStatus.SUCCESS
+            message = f"Successfully indexed {succeeded} file(s) from '{folder_path}'"
+        elif succeeded > 0 and failed > 0:
+            status = IndexingStatus.PARTIAL
+            message = f"Partially indexed: {succeeded} succeeded, {failed} failed"
+        else:
+            status = IndexingStatus.FAILED
+            message = f"Failed to index folder '{folder_path}'"
+
+        return FolderIndexingResult(
+            status=status,
+            message=message,
+            folder_path=folder_path,
+            recursive=recursive,
+            stats=FolderIndexingStats(
+                total_files=total,
+                files_processed=succeeded,
+                files_failed=failed,
+                files_skipped=0,
+            ),
+            file_results=file_results,
+            processing_time_ms=round(processing_time_ms, 2),
+        )
 
     # ------------------------------------------------------------------
     # Port implementation — query
@@ -231,7 +319,11 @@ class LightRAGAdapter(RAGEnginePort):
                 "data": {},
             }
         param = QueryParam(mode=cast(QueryMode, mode), top_k=top_k, chunk_top_k=top_k)
-        return await rag.lightrag.aquery_data(query=query, param=param)
+        result = await rag.lightrag.aquery_data(query=query, param=param)
+        if isinstance(result.get("data"), dict):
+            result["data"]["entities"] = []
+            result["data"]["relationships"] = []
+        return result
 
     async def query_multimodal(
         self,
