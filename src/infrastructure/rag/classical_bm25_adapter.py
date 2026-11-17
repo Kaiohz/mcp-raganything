@@ -67,7 +67,11 @@ class ClassicalBM25Adapter(BM25EnginePort):
         return self._pool
 
     async def _check_extension(self) -> None:
-        async with self._pool.acquire() as conn:
+        # _get_pool always leaves _pool set before _check_extension is awaited.
+        pool = self._pool
+        if pool is None:
+            raise RuntimeError("BM25 connection pool is not initialized")
+        async with pool.acquire() as conn:
             try:
                 result = await conn.fetchval(
                     "SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname='pg_textsearch')"

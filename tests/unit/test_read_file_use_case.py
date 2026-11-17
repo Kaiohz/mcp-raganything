@@ -60,6 +60,7 @@ class TestReadFileUseCase:
 
         # Assert
         assert result.content == ["extracted text"]
+        assert result.metadata is not None
         assert result.metadata.format_type == "pdf"
 
     async def test_execute_calls_document_reader_with_temp_file(

@@ -176,7 +176,9 @@ class TestLangchainOpenAIAdapter:
         # Assert
         mock_chat_cls.assert_called_once()
         call_kwargs = mock_chat_cls.call_args[1]
-        assert call_kwargs["api_key"] == "my-key"
+        # The adapter wraps credentials in SecretStr before passing them to
+        # ChatOpenAI (langchain-openai accepts SecretStr | callable only).
+        assert call_kwargs["api_key"].get_secret_value() == "my-key"
         assert call_kwargs["base_url"] == "https://custom.api.com/v1"
         assert call_kwargs["model"] == "gpt-4o"
         assert call_kwargs["temperature"] == 0.7

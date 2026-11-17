@@ -16,7 +16,9 @@ from application.api.file_routes import file_router
 from application.api.health_routes import health_router
 from application.api.mcp_classical_tools import mcp_classical
 from application.api.mcp_file_tools import mcp_files
+from application.api.mcp_memory_tools import mcp_memories
 from application.api.mcp_registry_routes import mcp_registry_router
+from application.api.mcp_web_tools import mcp_web
 from application.error_handlers import (
     authentication_error_handler,
     classical_error_handler,
@@ -88,7 +90,12 @@ def _run_alembic_upgrade() -> None:
     command.upgrade(cfg, "head")
 
 
-security = ComposableAgentsSecurity(master_key=app_config.API_KEY)
+#: REST-layer security instance: master-key fallback when dual auth is not
+#: wired, dual-auth once the lifespan injects the ``AuthService``. REST routes
+#: authenticate through this instance only; the MCP tool mounts authenticate
+#: through ``mcp_middleware``. Keeping the two apart means any wiring performed
+#: on the MCP side never alters the REST credential path.
+rest_security = ComposableAgentsSecurity(master_key=app_config.API_KEY)
 
 #: asyncpg pool for the MCP registry store; created in the lifespan, closed on
 #: shutdown. None until the lifespan runs.
@@ -97,7 +104,13 @@ _mcp_pool: asyncpg.Pool | None = None
 
 @asynccontextmanager
 async def db_lifespan(_app: FastAPI):
-    """Closes connection pools and HTTP clients on shutdown."""
+    """Close process-wide resources and connection pools on shutdown.
+
+    Closes the shared web crawler (if it was lazily created), the dedicated
+    DDGS search executor and any dangling memory-store HTTP client, in
+    addition to the classical RAG adapters. Every close is idempotent so
+    repeated shutdowns are harmless.
+    """
     yield
 
     logger.info(LogMessage.APP_SHUTDOWN_INITIATED)
@@ -111,32 +124,55 @@ async def db_lifespan(_app: FastAPI):
             await classical_vector_store.close()
         except Exception:
             logger.exception(LogMessage.APP_CLASSICAL_VS_CLOSE_FAILED)
+    # The web/memory adapters are lazy singletons; access them through the
+    # dependencies module at call time so shutdown sees the built instances.
+    import dependencies as _deps
+
+    if _deps.web_crawler_adapter is not None:
+        try:
+            await _deps.web_crawler_adapter.close()
+        except Exception:
+            logger.exception(LogMessage.CRAWLER_CLOSE_FAILED)
+    if _deps.web_search_adapter is not None:
+        try:
+            _deps.web_search_adapter.close()
+        except Exception:
+            logger.exception(LogMessage.WEB_SEARCH_EXECUTOR_CLOSE_FAILED)
+    if _deps.memory_store_adapter is not None:
+        try:
+            await _deps.memory_store_adapter.close()
+        except Exception:
+            logger.exception(LogMessage.MEMORY_STORE_CLOSE_FAILED)
     logger.info(LogMessage.APP_SHUTDOWN_COMPLETE)
 
 
 mcp_middleware = McpApiKeyMiddleware(master_key=app_config.API_KEY)
 mcp_files.add_middleware(mcp_middleware)
 mcp_classical.add_middleware(mcp_middleware)
+mcp_web.add_middleware(mcp_middleware)
+mcp_memories.add_middleware(mcp_middleware)
 
 mcp_files_app = mcp_files.http_app(path="/")
 mcp_classical_app = mcp_classical.http_app(path="/")
+mcp_web_app = mcp_web.http_app(path="/")
+mcp_memories_app = mcp_memories.http_app(path="/")
 
 
-@asynccontextmanager
-async def combined_lifespan(app: FastAPI):
-    """Combine database lifecycle with MCP lifespans and registry rehydration."""
-    # --- Alembic migrations: own the mcp_servers table schema ---
-    # Runs unconditionally (the schema must exist even if the registry is
-    # disabled). Runs in a worker thread because Alembic's online mode drives
-    # an async engine via asyncio.run internally.
-    try:
-        await asyncio.to_thread(_run_alembic_upgrade)
-    except Exception:
-        logger.exception("Alembic migration failed; continuing startup.")
+async def _initialize_mcp_registry(
+    app: FastAPI,
+) -> tuple[FernetSecretCipher | None, McpRegistryStore | None]:
+    """Create the asyncpg pool + cipher and rehydrate generated MCP servers.
 
-    # --- MCP registry: build pool, store, rehydrate servers ---
+    Returns:
+        The (cipher, store) pair (either may be ``None`` when the registry is
+        disabled or initialization failed) and assigns the asyncpg pool to the
+        module-level ``_mcp_pool``.
+
+    Raises:
+        Exception: Propagates nothing — every failure is logged and reported
+            through the return values so startup can continue.
+    """
     global _mcp_pool
-    runner = getattr(app.state, "generated_mcp_runner", None)
     cipher = None
     store = None
     try:
@@ -148,6 +184,7 @@ async def combined_lifespan(app: FastAPI):
             )
             store = McpRegistryStore(pool=_mcp_pool, cipher=cipher)
             _deps.mcp_registry_store = store
+            runner = getattr(app.state, "generated_mcp_runner", None)
             if runner is not None:
                 await rehydrate_openapi_servers(
                     store=store,
@@ -160,20 +197,26 @@ async def combined_lifespan(app: FastAPI):
             )
     except Exception:
         logger.exception("MCP registry initialization failed; continuing startup.")
+    return cipher, store
 
-    # --- Dual auth: wire JwtAdapter + AsyncpgApiKeyReader + AuthService ---
-    # The JwtAdapter fetches the JWKS document from LOGTO_URL/oidc/jwks and
-    # caches it in memory; the AsyncpgApiKeyReader reads the shared
-    # ``api_keys`` table (owned by composable-agents) via the same asyncpg
-    # pool as the MCP registry store. The AuthService orchestrates JWT-first
-    # / API-key-fallback precedence. When LOGTO_URL is empty, JWT verification
-    # is disabled and only per-user API keys are accepted.
+
+def _initialize_dual_auth() -> None:
+    """Wire JWT + per-user API-key authentication into the wired security.
+
+    The JwtAdapter fetches the JWKS document from LOGTO_URL/oidc/jwks and
+    caches it in memory; the AsyncpgApiKeyReader reads the shared ``api_keys``
+    table (owned by composable-agents) via the shared asyncpg pool. The
+    :class:`AuthService` orchestrates JWT-first / API-key-fallback precedence
+    and is injected into the REST security instance and the MCP middleware.
+    When LOGTO_URL is empty, JWT verification is disabled and only per-user
+    API keys are accepted.
+    """
     try:
         if _mcp_pool is not None:
             jwt_adapter = JwtAdapter(
-                jwks_url=f"{app_config.LOGTO_URL}/oidc/jwks"
-                if app_config.LOGTO_URL
-                else "",
+                jwks_url=(
+                    f"{app_config.LOGTO_URL}/oidc/jwks" if app_config.LOGTO_URL else ""
+                ),
                 audience=app_config.JWT_AUDIENCE,
             )
             api_key_reader = AsyncpgApiKeyReader(pool=_mcp_pool)
@@ -183,7 +226,7 @@ async def combined_lifespan(app: FastAPI):
                 jwt_port=jwt_adapter,
                 api_key_repo=api_key_reader,
             )
-            security.set_auth_service(_deps.auth_service)
+            rest_security.set_auth_service(_deps.auth_service)
             mcp_middleware.set_auth_service(_deps.auth_service)
             logger.info(
                 "Dual auth wired: jwt=%s api_key_reader=asyncpg",
@@ -197,11 +240,15 @@ async def combined_lifespan(app: FastAPI):
     except Exception:
         logger.exception("Dual auth initialization failed; continuing startup.")
 
-    # --- Per-user LLM credentials: wire AsyncpgUserLlmReader ---
-    # The reader resolves per-user ``(base_url, api_key)`` from the shared
-    # ``user_llm_settings`` table (owned by composable-agents, read-only here)
-    # so the per-user LLM/embeddings factories can build per-request clients.
-    # Reuses the same asyncpg pool + Fernet cipher as the MCP registry store.
+
+def _initialize_user_llm_reader(cipher: FernetSecretCipher | None) -> None:
+    """Wire the per-user LLM credentials reader from the shared asyncpg pool.
+
+    The reader resolves per-user ``(base_url, api_key)`` from the shared
+    ``user_llm_settings`` table (owned by composable-agents, read-only here)
+    so the per-user LLM/embeddings factories can build per-request clients.
+    Reuses the same asyncpg pool + Fernet cipher as the MCP registry store.
+    """
     try:
         if _mcp_pool is not None and cipher is not None:
             _deps.user_llm_reader = AsyncpgUserLlmReader(pool=_mcp_pool, cipher=cipher)
@@ -217,17 +264,12 @@ async def combined_lifespan(app: FastAPI):
             "Per-user LLM reader initialization failed; continuing startup."
         )
 
-    async with (
-        db_lifespan(app),
-        mcp_files_app.lifespan(app),
-        mcp_classical_app.lifespan(app),
-    ):
-        yield
 
-    # --- Shutdown: close generated MCP runner, JwtAdapter and the registry pool ---
-    if runner is not None:
+async def _close_startup_resources() -> None:
+    """Close generated MCP runner, JwtAdapter and the registry pool."""
+    if _deps.generated_mcp_runner is not None:
         try:
-            await runner.close()
+            await _deps.generated_mcp_runner.close()
         except Exception:
             logger.exception("Failed to close generated MCP runner.")
     if _deps.jwt_adapter is not None:
@@ -237,6 +279,40 @@ async def combined_lifespan(app: FastAPI):
             logger.exception("Failed to close JWT adapter HTTP client.")
     if _mcp_pool is not None:
         await _mcp_pool.close()
+
+
+@asynccontextmanager
+async def combined_lifespan(app: FastAPI):
+    """Combine database lifecycle with MCP lifespans and registry rehydration."""
+    # --- Alembic migrations: own the mcp_servers table schema ---
+    # Runs unconditionally (the schema must exist even if the registry is
+    # disabled). Runs in a worker thread because Alembic's online mode drives
+    # an async engine via asyncio.run internally.
+    try:
+        await asyncio.to_thread(_run_alembic_upgrade)
+    except Exception:
+        logger.exception("Alembic migration failed; continuing startup.")
+
+    # --- MCP registry: build pool, store, rehydrate servers ---
+    cipher, _store_unused = await _initialize_mcp_registry(app)
+
+    # --- Dual auth: REST security + MCP middleware (see helper docstring) ---
+    _initialize_dual_auth()
+
+    # --- Per-user LLM credentials (see helper docstring) ---
+    _initialize_user_llm_reader(cipher)
+
+    async with (
+        db_lifespan(app),
+        mcp_files_app.lifespan(app),
+        mcp_classical_app.lifespan(app),
+        mcp_web_app.lifespan(app),
+        mcp_memories_app.lifespan(app),
+    ):
+        yield
+
+    # --- Shutdown ---
+    await _close_startup_resources()
 
 
 app = FastAPI(
@@ -277,7 +353,7 @@ app.include_router(health_router, prefix=REST_PATH)
 # lifespan runs), ``verify_credentials`` falls back to the legacy master-key
 # ``verify_api_key`` check on the ``X-API-Key`` header, so the REST routers
 # keep working in dev/test and during the startup window.
-_auth_dep = [Depends(security.verify_credentials)]
+_auth_dep = [Depends(rest_security.verify_credentials)]
 app.include_router(file_router, prefix=REST_PATH, dependencies=_auth_dep)
 app.include_router(classical_indexing_router, prefix=REST_PATH, dependencies=_auth_dep)
 app.include_router(classical_query_router, prefix=REST_PATH, dependencies=_auth_dep)
@@ -287,6 +363,8 @@ app.include_router(mcp_registry_router, dependencies=_auth_dep)
 
 app.mount("/files/mcp", mcp_files_app)
 app.mount("/classical/mcp", mcp_classical_app)
+app.mount("/web/mcp", mcp_web_app)
+app.mount("/memories/mcp", mcp_memories_app)
 
 app.add_exception_handler(StorageNotFoundError, storage_not_found_handler)
 app.add_exception_handler(StorageError, storage_error_handler)
@@ -310,9 +388,21 @@ app.add_exception_handler(DomainError, domain_error_handler)
 
 
 def run_fastapi():
-    """Run FastAPI server with uvicorn."""
+    """Run the already-built FastAPI application with uvicorn.
+
+    Serves the in-process ``app`` object (not the import string
+    ``"main:app"``): the container entrypoint already executes this module as
+    ``__main__``, and an import string would make uvicorn import and execute
+    ``main`` a SECOND time in the same process. That second execution stacks
+    another unwired ``McpApiKeyMiddleware`` on the shared FastMCP servers
+    (``FastMCP.add_middleware`` only appends), so an unwired guard ends up in
+    front of the wired one and — once the legacy master key is non-empty —
+    rejects every legitimate credential (BUG-005). Passing the object keeps
+    exactly one application import, one middleware per mount, and one lifespan
+    wiring it.
+    """
     uvicorn.run(
-        "main:app",
+        app,
         host=app_config.HOST,
         port=app_config.PORT,
         ws="none",

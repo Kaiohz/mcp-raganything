@@ -17,6 +17,7 @@ The credential resolver and ``FernetSecretCipher`` are mocked so no database
 or real keys are needed.
 """
 
+from typing import Any, cast
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -67,9 +68,9 @@ class TestGetEmbeddingForUser:
                 assert embedding is not None
                 # OpenAIEmbeddings stores api_key / base_url; check via the
                 # underlying client or openai_api_key attribute.
-                assert (
-                    embedding.openai_api_key.get_secret_value() == "sk-user-secret-key"
-                )
+                key_field = embedding.openai_api_key
+                assert key_field is not None
+                assert key_field.get_secret_value() == "sk-user-secret-key"
                 assert embedding.openai_api_base == "https://user.example/api/v1"
         finally:
             current_user_id.reset(token)
@@ -135,8 +136,12 @@ class TestGetChatLlmForUser:
 
                     # Assert — LangchainOpenAIAdapter wrapping ChatOpenAI with user creds
                     assert llm is not None
-                    inner = llm._llm
+                    # ``_llm`` is the concrete adapter's internal ChatOpenAI
+                    # wrapper; ``LLMPort`` does not declare implementation
+                    # attributes, so the introspection is typed as Any.
+                    inner = cast("Any", llm)._llm
                     assert inner.openai_api_key.get_secret_value() == "sk-user-chat-key"
+                    assert inner.openai_api_base == "https://user.example/api/v1"
                     assert inner.openai_api_base == "https://user.example/api/v1"
         finally:
             current_user_id.reset(token)

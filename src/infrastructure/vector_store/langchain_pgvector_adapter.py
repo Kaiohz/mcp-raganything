@@ -1,8 +1,10 @@
 import hashlib
 import logging
 import uuid
+from typing import cast
 
 from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings
 from langchain_postgres import PGEngine, PGVectorStore
 from sqlalchemy import text
 
@@ -26,8 +28,8 @@ class LangchainPgvectorAdapter(VectorStorePort):
         connection_string: str,
         table_prefix: str,
         embedding_dimension: int,
-        embedding_service=None,
-        engine=None,
+        embedding_service: Embeddings | None = None,
+        engine: PGEngine | None = None,
     ):
         self._connection_string = connection_string
         self._table_prefix = table_prefix
@@ -47,18 +49,30 @@ class LangchainPgvectorAdapter(VectorStorePort):
         table_name = self._get_table_name(working_dir)
 
         if working_dir not in self._stores:
+            engine = self._engine
+            if engine is None:
+                raise VectorStoreConfigError(
+                    ErrorMessage.VECTOR_STORE_NOT_INITIALIZED.format(
+                        working_dir=working_dir
+                    )
+                )
             try:
-                await self._engine.ainit_vectorstore_table(
+                await engine.ainit_vectorstore_table(
                     table_name=table_name,
                     vector_size=self._embedding_dimension,
                 )
             except Exception as e:
                 if "already exists" not in str(e).lower():
                     raise
+            # langchain-postgres requires ``Embeddings`` at this call; the
+            # adapter historically forwards exactly what was configured (the
+            # production wiring always provides embeddings — see
+            # ``dependencies.py``). The cast documents that contract without
+            # changing the historically forwarded value.
             store = await PGVectorStore.create(
-                engine=self._engine,
+                engine=engine,
                 table_name=table_name,
-                embedding_service=self._embedding_service,
+                embedding_service=cast("Embeddings", self._embedding_service),
             )
             self._stores[working_dir] = store
 
@@ -146,15 +160,23 @@ class LangchainPgvectorAdapter(VectorStorePort):
             file_path,
         )
 
+        engine = self._engine
+        if engine is None:
+            raise VectorStoreConfigError(
+                ErrorMessage.VECTOR_STORE_NOT_INITIALIZED.format(
+                    working_dir=working_dir
+                )
+            )
+
         # langchain-postgres PGEngine._pool and _run_as_async are private but
         # the only way to execute raw SQL. Pin langchain-postgres in pyproject.toml.
         async def _delete() -> int:
-            async with self._engine._pool.connect() as conn:
+            async with engine._pool.connect() as conn:
                 result = await conn.execute(stmt, {"file_path": file_path})
                 await conn.commit()
                 return result.rowcount
 
-        count = await self._engine._run_as_async(_delete())
+        count = await engine._run_as_async(_delete())
         logger.info(
             "Vectors deleted by file_path: table=%s count=%d", table_name, count
         )
@@ -175,13 +197,21 @@ class LangchainPgvectorAdapter(VectorStorePort):
             file_path_prefix,
         )
 
+        engine = self._engine
+        if engine is None:
+            raise VectorStoreConfigError(
+                ErrorMessage.VECTOR_STORE_NOT_INITIALIZED.format(
+                    working_dir=working_dir
+                )
+            )
+
         async def _delete() -> int:
-            async with self._engine._pool.connect() as conn:
+            async with engine._pool.connect() as conn:
                 result = await conn.execute(stmt, {"prefix": file_path_prefix})
                 await conn.commit()
                 return result.rowcount
 
-        count = await self._engine._run_as_async(_delete())
+        count = await engine._run_as_async(_delete())
         logger.info("Vectors deleted by prefix: table=%s count=%d", table_name, count)
         return count
 

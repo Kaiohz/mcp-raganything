@@ -1,7 +1,8 @@
-"""Tests for FastMcpOpenApiFactory (httpx fetch + FastMCP.from_openapi build).
+"""Tests for FastMcpOpenApiFactory (async httpx fetch + FastMCP.from_openapi build).
 
 This adapter:
-1. fetches an OpenAPI spec from a URL via httpx (timeout, 5MB max, OpenAPI 3.x);
+1. fetches an OpenAPI spec from a URL via an async httpx ``AsyncClient`` GET
+   (timeout, 5MB max, OpenAPI 3.x);
 2. builds a FastMCP server from the spec via ``FastMCP.from_openapi`` using an
    ``httpx.AsyncClient`` configured with the upstream base URL + headers;
 3. exposes ``count_tools`` to validate the built server (used by the dry-run
@@ -31,11 +32,35 @@ def _valid_spec() -> dict:
     }
 
 
+def _response_mock(spec=None, status_code: int = 200, content: bytes = b"x" * 10):
+    """Build an httpx response double for the async client mock."""
+    response = MagicMock()
+    if spec is None:
+        response.json.side_effect = ValueError("no json")
+    else:
+        response.json.return_value = spec
+    response.status_code = status_code
+    response.content = content
+    return response
+
+
+def _async_client_mock(response=None, side_effect=None) -> MagicMock:
+    """Build an ``httpx.AsyncClient`` double usable as an async context."""
+    client = MagicMock()
+    if side_effect is not None:
+        client.get = AsyncMock(side_effect=side_effect)
+    else:
+        client.get = AsyncMock(return_value=response)
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+    return client
+
+
 # -- fetch_spec ----------------------------------------------------------------
 
 
 class TestFetchSpec:
-    """Tests for OpenApiMcpFactory.fetch_spec (httpx GET)."""
+    """Tests for OpenApiMcpFactory.fetch_spec (async httpx GET)."""
 
     @pytest.fixture
     def factory(self) -> FastMcpOpenApiFactory:
@@ -46,15 +71,13 @@ class TestFetchSpec:
     ):
         # Arrange
         spec = _valid_spec()
-        mock_response = MagicMock()
-        mock_response.json.return_value = spec
-        mock_response.content = b"x" * 10
-        mock_response.status_code = 2000
-        mock_response.status_code = 200
+        mock_response = _response_mock(spec=spec)
 
-        with patch.object(
-            httpx, "get", new=MagicMock(return_value=mock_response)
-        ) as mock_get:
+        mock_client = _async_client_mock(response=mock_response)
+        with patch(
+            "infrastructure.openapi_mcp.adapter.httpx.AsyncClient",
+            MagicMock(return_value=mock_client),
+        ) as mock_client_cls:
             # Act
             result = await factory.fetch_spec(
                 "https://petstore.example.com/openapi.json", headers={}
@@ -62,48 +85,61 @@ class TestFetchSpec:
 
         # Assert
         assert result == spec
-        mock_get.assert_called_once()
+        mock_client_cls.assert_called_once()
+        mock_client.get.assert_awaited_once()
 
     async def test_raises_openapi_fetch_error_on_connection_error(
         self, factory: FastMcpOpenApiFactory
     ):
         # Arrange
-        with patch.object(
-            httpx, "get", new=MagicMock(side_effect=httpx.ConnectError("refused"))
+        mock_client = _async_client_mock(side_effect=httpx.ConnectError("refused"))
+        with (
+            patch(
+                "infrastructure.openapi_mcp.adapter.httpx.AsyncClient",
+                MagicMock(return_value=mock_client),
+            ),
+            pytest.raises(OpenApiFetchError),
         ):
             # Act & Assert
-            with pytest.raises(OpenApiFetchError):
-                await factory.fetch_spec(
-                    "https://unreachable.example.com/openapi.json", headers={}
-                )
+            await factory.fetch_spec(
+                "https://unreachable.example.com/openapi.json", headers={}
+            )
 
     async def test_raises_openapi_fetch_error_on_timeout(
         self, factory: FastMcpOpenApiFactory
     ):
         # Arrange
-        with patch.object(
-            httpx, "get", new=MagicMock(side_effect=httpx.TimeoutException("timeout"))
+        mock_client = _async_client_mock(side_effect=httpx.TimeoutException("timeout"))
+        with (
+            patch(
+                "infrastructure.openapi_mcp.adapter.httpx.AsyncClient",
+                MagicMock(return_value=mock_client),
+            ),
+            pytest.raises(OpenApiFetchError),
         ):
             # Act & Assert
-            with pytest.raises(OpenApiFetchError):
-                await factory.fetch_spec(
-                    "https://slow.example.com/openapi.json", headers={}
-                )
+            await factory.fetch_spec(
+                "https://slow.example.com/openapi.json", headers={}
+            )
 
     async def test_raises_openapi_invalid_spec_error_when_openapi_key_missing(
         self, factory: FastMcpOpenApiFactory
     ):
         # Arrange — a doc with neither 'openapi' nor 'swagger: 2.0' version key
-        bad_spec = {"info": {"title": "x", "version": "1"}, "paths": {}}
-        mock_response = MagicMock()
-        mock_response.json.return_value = bad_spec
-        mock_response.content = b"x" * 10
-        mock_response.status_code = 200
+        mock_response = _response_mock(
+            spec={"info": {"title": "x", "version": "1"}, "paths": {}}
+        )
 
-        with patch.object(httpx, "get", new=MagicMock(return_value=mock_response)):
+        mock_client = _async_client_mock(response=mock_response)
+        with (
+            patch(
+                "infrastructure.openapi_mcp.adapter.httpx.AsyncClient",
+                MagicMock(return_value=mock_client),
+            ),
+            pytest.raises(OpenApiInvalidSpecError),
+        ):
             # Act & Assert
-            with pytest.raises(OpenApiInvalidSpecError):
-                await factory.fetch_spec("https://example.com/openapi.json", headers={})
+            await factory.fetch_spec("https://example.com/openapi.json", headers={})
 
     async def test_converts_swagger2_spec_to_openapi3(
         self, factory: FastMcpOpenApiFactory
@@ -134,12 +170,13 @@ class TestFetchSpec:
                 "Pet": {"type": "object", "properties": {"id": {"type": "integer"}}}
             },
         }
-        mock_response = MagicMock()
-        mock_response.json.return_value = swagger2_spec
-        mock_response.content = b"x" * 10
-        mock_response.status_code = 200
+        mock_response = _response_mock(spec=swagger2_spec)
 
-        with patch.object(httpx, "get", new=MagicMock(return_value=mock_response)):
+        mock_client = _async_client_mock(response=mock_response)
+        with patch(
+            "infrastructure.openapi_mcp.adapter.httpx.AsyncClient",
+            MagicMock(return_value=mock_client),
+        ):
             # Act
             result = await factory.fetch_spec(
                 "https://petstore.example.com/v2/swagger.json", headers={}
@@ -160,47 +197,56 @@ class TestFetchSpec:
         self, factory: FastMcpOpenApiFactory
     ):
         # Arrange — fake "openapi" key but a 2.x version
-        bad_spec = {
-            "openapi": "2.0.0",
-            "info": {"title": "x", "version": "1"},
-            "paths": {},
-        }
-        mock_response = MagicMock()
-        mock_response.json.return_value = bad_spec
-        mock_response.content = b"x" * 10
-        mock_response.status_code = 200
-
-        with patch.object(httpx, "get", new=MagicMock(return_value=mock_response)):
+        mock_response = _response_mock(
+            spec={
+                "openapi": "2.0.0",
+                "info": {"title": "x", "version": "1"},
+                "paths": {},
+            }
+        )
+        mock_client = _async_client_mock(response=mock_response)
+        with (
+            patch(
+                "infrastructure.openapi_mcp.adapter.httpx.AsyncClient",
+                MagicMock(return_value=mock_client),
+            ),
+            pytest.raises(OpenApiInvalidSpecError),
+        ):
             # Act & Assert
-            with pytest.raises(OpenApiInvalidSpecError):
-                await factory.fetch_spec("https://example.com/openapi.json", headers={})
+            await factory.fetch_spec("https://example.com/openapi.json", headers={})
 
     async def test_raises_openapi_invalid_spec_error_when_spec_exceeds_5mb(
         self, factory: FastMcpOpenApiFactory
     ):
         # Arrange — content > default 5MB cap
-        mock_response = MagicMock()
-        mock_response.json.return_value = _valid_spec()
-        mock_response.status_code = 200
-        mock_response.content = b"x" * (5 * 1024 * 1024 + 1)
+        mock_response = _response_mock(
+            spec=_valid_spec(), content=b"x" * (5 * 1024 * 1024 + 1)
+        )
 
-        with patch.object(httpx, "get", new=MagicMock(return_value=mock_response)):
+        mock_client = _async_client_mock(response=mock_response)
+        with (
+            patch(
+                "infrastructure.openapi_mcp.adapter.httpx.AsyncClient",
+                MagicMock(return_value=mock_client),
+            ),
+            pytest.raises(OpenApiInvalidSpecError),
+        ):
             # Act & Assert
-            with pytest.raises(OpenApiInvalidSpecError):
-                await factory.fetch_spec(
-                    "https://huge.example.com/openapi.json", headers={}
-                )
+            await factory.fetch_spec(
+                "https://huge.example.com/openapi.json", headers={}
+            )
 
     async def test_max_spec_bytes_is_configurable(self):
         # Arrange — a factory with a tiny cap rejects content just above it.
         factory = FastMcpOpenApiFactory(max_spec_bytes=128)
-        mock_response = MagicMock()
-        mock_response.json.return_value = _valid_spec()
-        mock_response.status_code = 200
-        mock_response.content = b"x" * 129
+        mock_response = _response_mock(spec=_valid_spec(), content=b"x" * 129)
 
+        mock_client = _async_client_mock(response=mock_response)
         with (
-            patch.object(httpx, "get", new=MagicMock(return_value=mock_response)),
+            patch(
+                "infrastructure.openapi_mcp.adapter.httpx.AsyncClient",
+                MagicMock(return_value=mock_client),
+            ),
             pytest.raises(OpenApiInvalidSpecError),
         ):
             await factory.fetch_spec(
@@ -209,24 +255,22 @@ class TestFetchSpec:
 
     async def test_passes_headers_to_httpx_get(self, factory: FastMcpOpenApiFactory):
         # Arrange
-        spec = _valid_spec()
-        mock_response = MagicMock()
-        mock_response.json.return_value = spec
-        mock_response.content = b"x" * 10
-        mock_response.status_code = 200
         upstream_headers = {"Authorization": "Bearer upstream-token"}
+        mock_client = _async_client_mock(response=_response_mock(spec=_valid_spec()))
 
-        with patch.object(
-            httpx, "get", new=MagicMock(return_value=mock_response)
-        ) as mock_get:
+        with patch(
+            "infrastructure.openapi_mcp.adapter.httpx.AsyncClient",
+            MagicMock(return_value=mock_client),
+        ):
             # Act
             await factory.fetch_spec(
                 "https://petstore.example.com/openapi.json", headers=upstream_headers
             )
 
         # Assert
-        _, kwargs = mock_get.call_args
-        assert kwargs.get("headers") == upstream_headers
+        mock_client.get.assert_awaited_once_with(
+            "https://petstore.example.com/openapi.json", headers=upstream_headers
+        )
 
 
 # -- build_mcp -----------------------------------------------------------------
@@ -312,10 +356,10 @@ class TestBuildMcp:
         with (
             patch("fastmcp.FastMCP.from_openapi", new=MagicMock()),
             patch.object(httpx, "AsyncClient", new=MagicMock()),
+            pytest.raises(OpenApiInvalidSpecError),
         ):
             # Act & Assert
-            with pytest.raises(OpenApiInvalidSpecError):
-                await factory.build_mcp(spec, "https://fallback.example.com", {})
+            await factory.build_mcp(spec, "https://fallback.example.com", {})
 
 
 # -- count_tools ----------------------------------------------------------------

@@ -18,17 +18,14 @@ The service also hosts the **MCP server registry** — a CRUD API for registerin
                                |
                +---------------+---------------+
                |                               |
-        Application Layer            MCP Servers (FastMCP)
-        +------------------------------+       |
-        | api/                         |   +---+--------+  +--+-----------+  +--+-------------+  +--+----------+
-        |   indexing_routes.py         |   | RAGAnything |  | RAGAnything |  | RAGAnything    |  | RAGAnything |
-        |   query_routes.py            |   | Query       |  | Files       |  | Classical      |  | Bricks     |
-        |   file_routes.py             |   |  /rag/mcp   |  |  /files/mcp |  |  /classical/mcp|  | /bricks/mcp|
-        |   health_routes.py           |   +---+--------+  +--+-----------+  +--+-------------+  +--+----------+
-        |   classical_indexing_routes   |       |               |                 |                  |
-        |   classical_query_routes      |       |               |         classical_index_file   list_bricks_documents
-        | use_cases/                   |       |               |         classical_index_folder  read_bricks_document
-        |   IndexFileUseCase           |       |               |         classical_query         publish_section_version
+        Application Layer            Built-in MCP Servers (FastMCP)
+        +------------------------------+       +---------------+
+        | api/ + use_cases/            |       | Files           | /files/mcp
+        |   files + classical RAG      |       | ClassicalRAG    | /classical/mcp
+        |   registry + health          |       | Web             | /web/mcp
+        |   web_search_use_case        |       | Memories        | /memories/mcp
+        |   save_memory_use_case       |       +---------------+
+        +------------------------------+
         |   IndexFolderUseCase         |
         |   QueryUseCase               |
         |   ClassicalIndexFileUseCase   |
@@ -94,8 +91,10 @@ Production runs from the shared compose stack at `soludev-compose-apps/bricks/`.
 ### Local development
 
 ```bash
-# 1. Install dependencies
+# 1. Install dependencies and the Crawl4AI Chromium runtime
 uv sync
+uv run python -m playwright install --with-deps chromium
+uv run crawl4ai-setup
 
 # 2. Start PostgreSQL and MinIO (docker-compose.yml provides Postgres;
 #    MinIO must be available separately or added to the compose file)
@@ -176,12 +175,18 @@ The `McpApiKeyMiddleware` accepts both `X-API-Key` and `Authorization: Bearer` v
 
 ```yaml
 mcp_servers:
-  - name: bricks
+  - name: web
     transport: http
-    url: https://raganything.soludev.tech/bricks/mcp
+    url: https://raganything.soludev.tech/web/mcp
     headers:
-      Authorization: "Bearer ${LOGTO_USER_TOKEN}"   # or
-      # X-API-Key: "${MCP_RAGANYTHING_API_KEY}"
+      Authorization: "Bearer ${USER_JWT}"
+      X-API-Key: "${USER_API_KEY}"
+  - name: memories
+    transport: http
+    url: https://raganything.soludev.tech/memories/mcp
+    headers:
+      Authorization: "Bearer ${USER_JWT}"
+      X-API-Key: "${USER_API_KEY}"
   - name: files
     transport: http
     url: https://raganything.soludev.tech/files/mcp
@@ -832,9 +837,66 @@ If BM25 is unavailable (`BM25_ENABLED=false` or pg_textsearch extension missing)
 
 The service exposes **four MCP servers**, all using streamable HTTP transport:
 
-### RAGAnythingQuery — `/rag/mcp`
+### Web — `/web/mcp`
 
-Query-focused tools for searching the indexed knowledge base.
+The `Web` server exposes exactly one tool:
+
+```python
+web_search(query: str, max_results: int = 5, explore_top_n: int = 3)
+```
+
+- `query` is required and must be non-blank; `max_results` is `1..10` and `explore_top_n` is `0..5`.
+- DuckDuckGo is selected explicitly with `ddgs==9.16.1` (`backend="duckduckgo"`). Synchronous provider work runs in a dedicated bounded executor, never on the event loop.
+- Up to `explore_top_n` safe results are crawled concurrently through streaming `AsyncWebCrawler.arun_many()` with `crawl4ai==0.9.5`.
+- Each batch uses a fresh `MemoryAdaptiveDispatcher`, a shared `RateLimiter`, process-wide concurrency limits, robots.txt checks, `CacheMode.BYPASS`, and finite page/overall timeouts.
+- Only public HTTP/HTTPS destinations are eligible. Credentials, non-global DNS results, private/loopback/link-local/metadata targets, and unsafe final redirects are rejected.
+- Crawled content is untrusted input and is never indexed into RAG or automatically saved as memory.
+
+Each result contains `title`, `url`, `snippet`, and `crawl:{status,final_url,markdown,error}`. Status is `not_explored`, `success`, or `failed`. Successful pages return the **complete Crawl4AI Markdown**; there are no character limits, slicing, `chars`, or `truncated` fields. A failed page does not discard other results.
+
+```bash
+# MCP tools/call (streamable HTTP). The same headers work for tools/list.
+curl -X POST http://localhost:8000/web/mcp \
+  -H "Authorization: Bearer ${JWT}" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"web_search","arguments":{"query":"Crawl4AI documentation","max_results":3,"explore_top_n":1}}}'
+```
+
+The provider may return no results during an anti-bot/network challenge; this is logged distinctly for operators without changing the genuine empty-result contract.
+
+### Memories — `/memories/mcp`
+
+The `Memories` server exposes exactly one tool:
+
+```python
+save_memory(
+    name: str,
+    content: str,
+    if_exists: Literal["fail", "append", "replace"] = "fail",
+)
+```
+
+The tool normalizes `name` to `/memories/<name>.md` and writes through composable-agents' existing `GET`/`PUT /api/v1/store/files/memories/{name}.md` API. It never accepts `user_id`, tenant, or namespace arguments. The caller must have a resolved user identity and a forwardable JWT or per-user API key; legacy/unauthenticated modes fail closed with zero upstream requests.
+
+- `fail` (default) creates a missing memory but never overwrites an existing one.
+- `append` preserves existing content and appends with exactly one blank Markdown separator where needed.
+- `replace` replaces only with explicit user intent; when absent it creates the file.
+- The response contains `{path, action, chars}`, where `action` is `created`, `appended`, or `replaced` and `chars` is the final content length.
+
+```bash
+curl -X POST http://localhost:8000/memories/mcp \
+  -H "X-API-Key: ${USER_API_KEY}" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"save_memory","arguments":{"name":"preferences","content":"I prefer concise answers.","if_exists":"append"}}}'
+```
+
+Saved memories appear on the existing composable-ui `/memories` page on the next load/refetch. Store File GET→PUT is not atomic across concurrent writers. Selected memories are copied into agent namespaces when runners are built; saving a global memory does not refresh an already-built runner automatically. composable-agents' `InMemoryStore` fallback is process-local and non-durable; production persistence requires its PostgreSQL store.
+
+### Removed: RAGAnythingQuery — `/rag/mcp`
+
+**This mount and its tools are not present in the current application.** The section below is retained only as historical reference and must not be used for client configuration.
 
 #### Tool: `query_knowledge_base`
 
@@ -866,6 +928,12 @@ File browsing tools for listing and reading files from MinIO storage.
 | `prefix` | string | `""` | MinIO prefix to filter files by |
 | `recursive` | boolean | `true` | List files in subdirectories |
 
+#### Tool: `list_folders`
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `prefix` | string | `""` | MinIO prefix to filter folder markers by |
+
 #### Tool: `read_file`
 
 | Parameter | Type | Default | Description |
@@ -874,9 +942,9 @@ File browsing tools for listing and reading files from MinIO storage.
 
 Downloads the file from MinIO, extracts its text content using Kreuzberg, and returns the extracted text along with metadata and any detected tables.
 
-### RAGAnythingBricks — `/bricks/mcp`
+### Removed: RAGAnythingBricks — `/bricks/mcp`
 
-Bricks integration tools for accessing project documents from the Bricks platform and publishing structured section versions.
+**This mount and its tools are not present in the current application.** The section below is retained only as historical reference and must not be used for client configuration.
 
 #### Tool: `list_bricks_documents`
 
@@ -927,7 +995,7 @@ Publishes a structured section version back to the Bricks platform. When `BRICKS
 
 ### RAGAnythingClassical — `/classical/mcp`
 
-Classical RAG tools for indexing and querying without a knowledge graph.
+The current `/classical/mcp` server exposes **only `classical_query`**. The indexing helpers listed below are REST/use-case functionality, not tools advertised by this MCP mount.
 
 #### Tool: `classical_index_file`
 
@@ -964,10 +1032,10 @@ Classical RAG tools for indexing and querying without a knowledge graph.
 All MCP servers use **streamable HTTP** transport exclusively. Connect MCP clients to the mount paths:
 
 ```
-http://localhost:8000/rag/mcp          # RAGAnythingQuery
-http://localhost:8000/files/mcp        # RAGAnythingFiles
-http://localhost:8000/classical/mcp    # RAGAnythingClassical
-http://localhost:8000/bricks/mcp       # RAGAnythingBricks
+http://localhost:8000/files/mcp        # Files: list_files, list_folders, read_file
+http://localhost:8000/classical/mcp    # ClassicalRAG: classical_query
+http://localhost:8000/web/mcp          # Web: web_search
+http://localhost:8000/memories/mcp     # Memories: save_memory
 ```
 
 ---
@@ -1148,6 +1216,24 @@ All configuration is via environment variables, loaded through Pydantic Settings
 | `GENERATED_MCP_BASE_URL` | `http://localhost:8020` | Absolute base URL of this service, used to build the public URL returned for generated (`openapi`) MCP servers mounted under `/generated/{name}/mcp`. Set to `http://raganything-api:8000` for Docker, or to your public ingress URL for external clients |
 | `MCP_TOOL_TIMEOUT` | `60.0` | Timeout (seconds) for connecting to external MCP servers and listing their tools via the `FastMcpToolLoader` (used by the external-path create/update/validate flows). Increase for slow remote servers |
 
+### Web search and memory (`WebSearchConfig`, `CrawlConfig`, `MemoryStoreConfig`)
+
+| Variable | Default | Description |
+|---|---:|---|
+| `WEB_SEARCH_EXECUTOR_WORKERS` | `4` | Dedicated DDGS executor workers |
+| `WEB_SEARCH_MAX_CONCURRENCY` | `4` | Process-wide active DDGS calls |
+| `WEB_SEARCH_TIMEOUT_SECONDS` | `10` | Outer DDGS timeout |
+| `CRAWL_MAX_CONCURRENT_BATCHES` | `2` | Process-wide concurrent crawl batches |
+| `CRAWL_MAX_SESSIONS_PER_BATCH` | `2` | Dispatcher page sessions per batch |
+| `CRAWL_MEMORY_THRESHOLD_PERCENT` | `80` | MemoryAdaptiveDispatcher threshold |
+| `CRAWL_PAGE_TIMEOUT_SECONDS` | `20` | Per-page timeout |
+| `CRAWL_OVERALL_TIMEOUT_SECONDS` | `45` | Whole exploration deadline, below the 60-second MCP caller timeout |
+| `CRAWL_RATE_LIMIT_MIN_DELAY_SECONDS` / `CRAWL_RATE_LIMIT_MAX_DELAY_SECONDS` | `1` / `2` | Shared per-domain base-delay range |
+| `COMPOSABLE_AGENTS_BASE_URL` | `http://localhost:8010` | Store File API base URL; scheme+host only, no path |
+| `MEMORY_STORE_TIMEOUT_SECONDS` | `15` | Memory upstream GET/PUT timeout |
+
+All concurrency settings are process-local. No web character/output-size setting exists. The Compose example uses `http://composable-agents:8000` and documents all required dual-auth placeholders. Replace the non-empty `API_KEY=<operator-provided-legacy-master-key>` placeholder with a strong secret: anyone copying the public placeholder verbatim would otherwise know the degraded-mode fallback credential.
+
 ### Database (`DatabaseConfig`)
 
 | Variable | Default | Description |
@@ -1157,6 +1243,8 @@ All configuration is via environment variables, loaded through Pydantic Settings
 | `POSTGRES_DATABASE` | `raganything` | PostgreSQL database name |
 | `POSTGRES_HOST` | `localhost` | PostgreSQL host |
 | `POSTGRES_PORT` | `5432` | PostgreSQL port |
+
+**TLS health-probe note:** `verify-ca` and `verify-full` both use Python's strict default context, including hostname verification. A certificate/hostname mismatch makes the health probe fail. `require`/`prefer` retain PostgreSQL's unverified-encryption behavior and emit an operator warning recommending `verify-full`.
 
 ### LLM (`LLMConfig`)
 
@@ -1246,11 +1334,11 @@ The classical RAG adapters resolve LLM/embeddings **per user** via `get_chat_llm
 
 ```bash
 uv sync                          # Install all dependencies (including dev)
-uv run python src/main.py        # Run the server locally
-uv run pytest tests/unit -q      # Run unit tests (557 pass on feat/dual-auth-rls-llm-peruser)
-uv run ruff check src/           # Lint
-uv run ruff format src/          # Format
-uv run mypy src/                 # Type checking
+uv run python src/main.py        # Run the server locally (single app import)
+uv run pytest tests/ -q          # Full suite (720 tests for the web/memory feature)
+uv run ruff check .              # Lint all source and tests
+uv run ruff format --check .     # Verify formatting
+uv run pyright                   # Type checking (pyrightconfig.json)
 ```
 
 ### QA via docker stack
@@ -1302,7 +1390,7 @@ The PostgreSQL server must have the `pg_textsearch` extension installed and load
 
 ```
 src/
-  main.py                           -- FastAPI app, triple MCP mounts, entry point
+  main.py                           -- FastAPI app, four built-in MCP mounts, single-import entry point
   config.py                         -- Pydantic Settings config classes
   dependencies.py                   -- Dependency injection wiring
   domain/
@@ -1324,10 +1412,11 @@ src/
       file_routes.py                  -- GET /files/list, GET /files/folders, POST /files/read, POST /files/upload, POST /files/folders, DELETE /files, DELETE /files/folders
       classical_indexing_routes.py   -- POST /classical/file/index, /classical/folder/index
       classical_query_routes.py      -- POST /classical/query
-      mcp_query_tools.py              -- MCP tools: query_knowledge_base, query_knowledge_base_multimodal
-      mcp_file_tools.py               -- MCP tools: list_files, read_file
-      mcp_classical_tools.py          -- MCP tools: classical_index_file, classical_index_folder, classical_query
-      mcp_bricks_tools.py             -- MCP tools: list_bricks_documents, read_bricks_document, publish_section_version
+      mcp_file_tools.py               -- MCP tools: list_files, list_folders, read_file
+      mcp_classical_tools.py          -- MCP tool: classical_query
+      mcp_web_tools.py                -- MCP tool: web_search
+      mcp_memory_tools.py             -- MCP tool: save_memory
+      mcp_registry_routes.py          -- Protected MCP registry CRUD/validation routes
     requests/
       indexing_request.py            -- IndexFileRequest, IndexFolderRequest
       classical_indexing_request.py  -- ClassicalIndexFileRequest, ClassicalIndexFolderRequest
@@ -1345,6 +1434,8 @@ src/
       classical_index_file_use_case.py  -- Classical: download → Kreuzberg chunk → PGVector
       classical_index_folder_use_case.py -- Classical: folder batch index
       classical_query_use_case.py    -- Classical: multi-query + LLM judge + hybrid BM25
+      web_search_use_case.py         -- DuckDuckGo result orchestration + safe Crawl4AI exploration
+      save_memory_use_case.py        -- Per-user memory validation + fail/append/replace policy
       _classical_helpers.py          -- validate_path, build_documents_from_extraction
       list_files_use_case.py          -- Lists files with metadata from MinIO
       list_folders_use_case.py        -- Lists folder prefixes from MinIO
@@ -1357,6 +1448,8 @@ src/
       read_bricks_document_use_case.py    -- Downloads Bricks document via presigned URL, extracts via Kreuzberg
       publish_section_version_use_case.py -- Publishes section version (dry-run aware)
   infrastructure/
+    web_search/                        -- DDGS, Crawl4AI and public-URL safety adapters
+    memory/                            -- composable-agents Store File API adapter
     rag/
       lightrag_adapter.py            -- LightRAGAdapter (RAGAnything/LightRAG)
       kreuzberg_raganything_parser.py -- KreuzbergRAGAnythingParser (kreuzberg, custom parser for RAGAnything)

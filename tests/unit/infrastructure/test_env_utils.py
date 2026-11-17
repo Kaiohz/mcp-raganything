@@ -13,14 +13,15 @@ import pytest
 
 from infrastructure.env_utils import resolve_env_vars, resolve_env_vars_in_dict
 
-
 # -- resolve_env_vars ----------------------------------------------------------
 
 
 class TestResolveEnvVars:
     """Tests for resolve_env_vars."""
 
-    def test_resolve_env_vars_replaces_known_var(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_resolve_env_vars_replaces_known_var(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         # Arrange
         monkeypatch.setenv("MY_VAR", "my-value")
 
@@ -30,7 +31,9 @@ class TestResolveEnvVars:
         # Assert
         assert result == "token-my-value-suffix"
 
-    def test_resolve_env_vars_keeps_unknown_placeholder(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_resolve_env_vars_keeps_unknown_placeholder(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         # Arrange — ensure the var is unset
         monkeypatch.delenv("MISSING_VAR", raising=False)
 
@@ -42,9 +45,14 @@ class TestResolveEnvVars:
 
     def test_resolve_env_vars_no_placeholder_returns_unchanged(self) -> None:
         # Act / Assert
-        assert resolve_env_vars("plain-string-no-placeholder") == "plain-string-no-placeholder"
+        assert (
+            resolve_env_vars("plain-string-no-placeholder")
+            == "plain-string-no-placeholder"
+        )
 
-    def test_resolve_env_vars_multiple_placeholders(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_resolve_env_vars_multiple_placeholders(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         # Arrange
         monkeypatch.setenv("A", "alpha")
         monkeypatch.setenv("B", "beta")
@@ -62,7 +70,9 @@ class TestResolveEnvVars:
 class TestResolveEnvVarsInDict:
     """Tests for resolve_env_vars_in_dict."""
 
-    def test_resolve_env_vars_in_dict_resolves_string_values(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_resolve_env_vars_in_dict_resolves_string_values(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         # Arrange
         monkeypatch.setenv("TOK", "secret-token")
         mapping = {"Authorization": "Bearer ${TOK}", "X-Other": "static"}
@@ -73,7 +83,9 @@ class TestResolveEnvVarsInDict:
         # Assert
         assert result == {"Authorization": "Bearer secret-token", "X-Other": "static"}
 
-    def test_resolve_env_vars_in_dict_passes_non_string_values(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_resolve_env_vars_in_dict_passes_non_string_values(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         # Arrange — an int value and a list value must pass through unchanged
         monkeypatch.setenv("X", "ignored")
         mapping = {"count": 42, "enabled": True, "items": [1, 2, 3]}

@@ -55,6 +55,11 @@ class LogMessage(StrEnum):
 
     # --- Database health (asyncpg) ---
     POSTGRES_HEALTH_CHECK_FAILED = "PostgreSQL health check failed"
+    POSTGRES_HEALTH_TLS_NO_VERIFY = (
+        "SSL mode '%s' disables certificate and hostname verification for "
+        "PostgreSQL health check; use 'verify-full' in production to prevent "
+        "MITM attacks."
+    )
 
     # --- Document reader (Kreuzberg) ---
     KREUZBERG_EXTRACTION_FAILED_FOR = "Kreuzberg extraction failed for %s: %s"
@@ -188,3 +193,38 @@ class LogMessage(StrEnum):
         "Rehydration skipped %d generated MCP server(s) due to mount failures; "
         "they will be retried on the next startup."
     )
+
+    # --- Web search tool (DDGS + Crawl4AI) ---
+    # No query, URL or crawled content is interpolated (untrusted external data).
+    WEB_SEARCH_EXECUTOR_CLOSED = "Web search executor closed"
+    WEB_SEARCH_EXECUTOR_CLOSE_FAILED = "Web search executor shutdown failed"
+    WEB_SEARCH_COMPLETED = (
+        "Web search completed: results=%d explored=%d duration_ms=%.1f"
+    )
+    WEB_SEARCH_VALIDATION_REJECTED = "Web search validation rejected the arguments"
+    WEB_SEARCH_PROVIDER_FAILED = "Web search provider call failed"
+    WEB_SEARCH_PROVIDER_NO_RESULTS = (
+        "Provider returned no results (max_results=%d): this may be either a "
+        "genuinely empty result set or an anti-bot challenge / network block "
+        "(ddgs collapses both into 'No results found.'), retry or verify "
+        "outbound access to the DuckDuckGo html endpoint."
+    )
+    WEB_SEARCH_UNEXPECTED = "Unexpected web search failure"
+    WEB_SEARCH_TIMED_OUT = "Web search timed out after %.2fs"
+    URL_SAFETY_REJECTED = "Unsafe URL rejected before crawling: reason=%s"
+    CRAWLER_STARTED = "Shared web crawler started"
+    CRAWLER_START_FAILED = "Shared web crawler failed to start"
+    CRAWLER_CLOSED = "Shared web crawler closed"
+    CRAWLER_CLOSE_FAILED = "Shared web crawler close failed"
+    CRAWL_BATCH_STARTED = "Crawl batch started: pages=%d"
+    CRAWL_BATCH_COMPLETED = (
+        "Crawl batch completed: success=%d failed=%d duration_ms=%.1f"
+    )
+    CRAWL_BATCH_TIMEOUT = "Crawl batch timed out after %.2fs: unfinished=%d"
+    CRAWL_CLOSE_FAILED = "Crawl stream close failed"
+    MEMORY_SAVE_COMPLETED = "Memory saved: action=%s chars=%d duration_ms=%.1f"
+    MEMORY_STORE_REQUEST_FAILED = "Memory store %s request failed: category=%s"
+    MEMORY_STORE_CLOSED = "Memory store HTTP client closed"
+    MEMORY_STORE_CLOSE_FAILED = "Memory store HTTP client close failed"
+    MEMORY_IDENTITY_MISSING = "Memory save rejected: no user identity or credential"
+    MEMORY_SAVE_UNEXPECTED = "Unexpected memory save failure"

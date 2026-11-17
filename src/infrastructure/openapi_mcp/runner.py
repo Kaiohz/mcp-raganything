@@ -140,7 +140,8 @@ class GeneratedMcpRunner(GeneratedMcpRunnerPort):
 
     async def close(self) -> None:
         """Close all mounted servers and release their resources at shutdown."""
-        for name in list(self._mounts.keys()):
+        # ``unmount`` pops from ``_mounts``, so iterate over a snapshot copy.
+        for name in self._mounts.copy():
             await self.unmount(name)
 
 

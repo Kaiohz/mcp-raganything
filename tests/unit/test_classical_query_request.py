@@ -1,5 +1,7 @@
 """Tests for ClassicalQueryRequest model."""
 
+from typing import Any
+
 import pytest
 from pydantic import ValidationError
 
@@ -29,12 +31,14 @@ class TestClassicalQueryRequest:
         assert req.mode == "hybrid"
 
     def test_mode_rejects_invalid_value(self) -> None:
-        # Act & Assert
+        # Act & Assert — the invalid value is exercised at runtime; an Any
+        # typed local keeps the deliberate Literal rejection for pytest only.
+        invalid_mode: Any = "bm25"
         with pytest.raises(ValidationError):
             ClassicalQueryRequest(
                 working_dir="/tmp/rag/project",
                 query="test query",
-                mode="bm25",
+                mode=invalid_mode,
             )
 
     def test_mode_accepts_explicit_vector(self) -> None:

@@ -237,6 +237,7 @@ class TestReadFile:
 
         # Assert
         assert result.content == ["Extracted text from the document."]
+        assert result.metadata is not None
         assert result.metadata.mime_type == "application/pdf"
 
     async def test_raises_tool_error_for_file_not_found(self) -> None:

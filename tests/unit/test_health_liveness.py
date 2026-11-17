@@ -221,10 +221,17 @@ class TestAsyncpgHealthAdapter:
         mock_warning.assert_called()
 
     @patch("infrastructure.database.asyncpg_health_adapter.asyncpg")
-    async def test_ssl_verify_ca_mode_keeps_cert_required(
+    async def test_ssl_verify_ca_mode_uses_strict_verification(
         self, mock_asyncpg: MagicMock
     ) -> None:
-        """sslmode=verify-ca should produce an SSL context with CERT_REQUIRED and check_hostname=False."""
+        """sslmode=verify-ca is held to strict verification for the probe.
+
+        python's ``ssl`` module cannot express PostgreSQL's ``verify-ca``
+        ("chain verified, hostname not matched") without disabling hostname
+        validation (Sonar python:S5527); the probe therefore uses the strict
+        default context, so a certificate/hostname mismatch fails ``ping``
+        instead of being accepted — strictly safer than the PostgreSQL mode.
+        """
         # Arrange
         from config import DatabaseConfig
         from infrastructure.database.asyncpg_health_adapter import AsyncpgHealthAdapter
@@ -246,7 +253,7 @@ class TestAsyncpgHealthAdapter:
         ctx = mock_asyncpg.connect.call_args.kwargs["ssl"]
         assert isinstance(ctx, ssl.SSLContext)
         assert ctx.verify_mode == ssl.CERT_REQUIRED
-        assert ctx.check_hostname is False
+        assert ctx.check_hostname is True
 
     @patch("infrastructure.database.asyncpg_health_adapter.asyncpg")
     async def test_ssl_verify_full_mode_keeps_full_verification(

@@ -201,7 +201,7 @@ class TestLangchainPgvectorAdapter:
         await adapter.ensure_table(working_dir="/tmp/rag/project_1")
 
         # Arrange
-        documents = [
+        documents: list[tuple[str, str, dict[str, str | int | None]]] = [
             ("chunk text 1", "/docs/report.pdf", {"page": 1}),
             ("chunk text 2", "/docs/report.pdf", {"page": 2}),
         ]
