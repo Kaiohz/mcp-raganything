@@ -234,8 +234,12 @@ class TestJwtAdapter:
             await adapter.decode_token("some-token")
             await adapter.decode_token("some-token")
 
+        # The fixture replaces ``_jwks_http_client`` with an ``AsyncMock``;
+        # narrow it before introspecting mock bookkeeping.
+        jwks_client = adapter._jwks_http_client
+        assert isinstance(jwks_client, AsyncMock)
         # Assert — JWKS fetched only once; second call uses the in-memory TTLCache
-        assert adapter._jwks_http_client.get.await_count == 1
+        assert jwks_client.get.await_count == 1
 
     @pytest.mark.usefixtures("_stub_signing_key")
     async def test_cache_reset_between_decodes_refetches(
@@ -253,8 +257,10 @@ class TestJwtAdapter:
             adapter._jwks_cache.clear()  # type: ignore[attr-defined]
             await adapter.decode_token("some-token")
 
+        jwks_client = adapter._jwks_http_client
+        assert isinstance(jwks_client, AsyncMock)
         # Assert — two fetches because the cache was cleared between calls
-        assert adapter._jwks_http_client.get.await_count == 2
+        assert jwks_client.get.await_count == 2
 
     # -- PII / logging ----------------------------------------------------------
 

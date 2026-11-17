@@ -70,10 +70,13 @@ class DatabaseConfig(BaseSettings):
     """Database connection configuration."""
 
     DATABASE_URL: str = Field(
-        default="postgresql://raganything:raganything@localhost:5432/raganything",
+        default="postgresql://localhost:5432/raganything",
         description="Full PostgreSQL connection URL. Accepted schemes: "
         "postgresql://, postgres://, postgresql+asyncpg://. "
-        "Normalized to postgresql+asyncpg:// for SQLAlchemy async.",
+        "Normalized to postgresql+asyncpg:// for SQLAlchemy async. "
+        "Credentials are intentionally NOT part of the source default — "
+        "provide them through the environment (e.g. DATABASE_URL in .env "
+        "or Docker secrets).",
     )
     POSTGRES_STATEMENT_CACHE_SIZE: int | None = Field(
         default=None,
@@ -261,3 +264,123 @@ class MinioConfig(BaseSettings):
     MINIO_SECRET: str = Field(default="minioadmin")
     MINIO_BUCKET: str = Field(default="raganything")
     MINIO_SECURE: bool = Field(default=False)
+
+
+class WebSearchConfig(BaseSettings):
+    """Bounded DuckDuckGo (DDGS) execution limits.
+
+    All values are per-Python-process; they do not coordinate across Uvicorn
+    workers or replicas. No character/output-size setting exists here or
+    anywhere in the web-search configuration by design.
+    """
+
+    WEB_SEARCH_EXECUTOR_WORKERS: int = Field(
+        default=4,
+        ge=1,
+        description="Dedicated ThreadPoolExecutor workers for synchronous "
+        "DDGS calls (never the default executor).",
+    )
+    WEB_SEARCH_MAX_CONCURRENCY: int = Field(
+        default=4,
+        ge=1,
+        description="Process-wide cap on active DDGS calls in flight; timed-out "
+        "calls keep their capacity until their worker thread finishes.",
+    )
+    WEB_SEARCH_TIMEOUT_SECONDS: float = Field(
+        default=10.0,
+        gt=0,
+        description="Outer asyncio timeout (seconds) around the complete "
+        "search operation (capacity wait included).",
+    )
+
+
+class CrawlConfig(BaseSettings):
+    """Bounded Crawl4AI browser exploration limits (process-local)."""
+
+    CRAWL_MAX_CONCURRENT_BATCHES: int = Field(
+        default=2,
+        ge=1,
+        description="Process-wide cap on concurrent crawl batches (semaphore "
+        "held across batch startup and full stream consumption).",
+    )
+    CRAWL_MAX_SESSIONS_PER_BATCH: int = Field(
+        default=2,
+        ge=1,
+        description="MemoryAdaptiveDispatcher max_session_permit per batch.",
+    )
+    CRAWL_MEMORY_THRESHOLD_PERCENT: int = Field(
+        default=80,
+        ge=1,
+        le=90,
+        description="MemoryAdaptiveDispatcher memory threshold percent (kept "
+        "below the dispatcher's default 95% critical threshold).",
+    )
+    CRAWL_PAGE_TIMEOUT_SECONDS: float = Field(
+        default=20.0,
+        gt=0,
+        description="Finite per-page timeout (seconds), converted to "
+        "milliseconds for CrawlerRunConfig.page_timeout.",
+    )
+    CRAWL_OVERALL_TIMEOUT_SECONDS: float = Field(
+        default=45.0,
+        gt=0,
+        description="Whole exploration deadline (seconds) covering batch "
+        "startup and complete streaming consumption; kept below "
+        "composable-agents' 60s MCP tool timeout. Completed pages survive it.",
+    )
+    CRAWL_RATE_LIMIT_MIN_DELAY_SECONDS: float = Field(
+        default=1.0,
+        gt=0,
+        description="Shared RateLimiter base delay lower bound (seconds).",
+    )
+    CRAWL_RATE_LIMIT_MAX_DELAY_SECONDS: float = Field(
+        default=2.0,
+        gt=0,
+        description="Shared RateLimiter base delay upper bound (seconds).",
+    )
+
+    @model_validator(mode="after")
+    def validate_rate_limit_bounds(self) -> "CrawlConfig":
+        """Ensure the minimum rate-limit delay does not exceed the maximum."""
+        if (
+            self.CRAWL_RATE_LIMIT_MIN_DELAY_SECONDS
+            > self.CRAWL_RATE_LIMIT_MAX_DELAY_SECONDS
+        ):
+            raise ValueError(
+                "CRAWL_RATE_LIMIT_MIN_DELAY_SECONDS must not exceed "
+                "CRAWL_RATE_LIMIT_MAX_DELAY_SECONDS"
+            )
+        return self
+
+
+class MemoryStoreConfig(BaseSettings):
+    """composable-agents Store File API client configuration."""
+
+    COMPOSABLE_AGENTS_BASE_URL: str = Field(
+        default="http://localhost:8010",
+        description="Base URL of the composable-agents Store File API used to "
+        "persist per-user memories (e.g. http://composable-agents:8000 in "
+        "Compose deployments).",
+    )
+    MEMORY_STORE_TIMEOUT_SECONDS: float = Field(
+        default=15.0,
+        gt=0,
+        description="Upstream Store File API request timeout (seconds).",
+    )
+
+    @model_validator(mode="after")
+    def validate_base_url(self) -> "MemoryStoreConfig":
+        """Require a valid absolute HTTP/HTTPS base scheme+host URL."""
+        parsed = urlsplit(self.COMPOSABLE_AGENTS_BASE_URL)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError(
+                "COMPOSABLE_AGENTS_BASE_URL must be a valid absolute http(s) URL"
+            )
+        if parsed.path not in ("", "/"):
+            # httpx concatenates a base URL path with relative request paths,
+            # which would corrupt the Store File API route — reject it early.
+            raise ValueError(
+                "COMPOSABLE_AGENTS_BASE_URL must not include a path; only "
+                "scheme and host are supported (e.g. http://composable-agents:8000)"
+            )
+        return self

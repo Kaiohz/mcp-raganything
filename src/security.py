@@ -210,9 +210,13 @@ class McpApiKeyMiddleware(Middleware):
         2. Else (legacy master-key mode) → if master key empty, bypass; else
            require the ``X-API-Key`` header to match the master key.
         """
-        headers = get_http_headers() or {}
+        headers: dict[str, str] = get_http_headers(include_all=True) or {}
         authorization = headers.get("authorization")
         api_key = headers.get("x-api-key")
+
+        # NOTE: ``get_http_headers()`` (default) strips ``authorization``; the
+        # dual-auth middleware must see the raw ``Authorization: Bearer`` and
+        # ``X-API-Key`` headers, hence ``include_all=True``.
 
         # 1. Dual-auth path (JWT + per-user API key).
         if self._auth_service is not None:

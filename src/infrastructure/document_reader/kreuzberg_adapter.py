@@ -2,13 +2,22 @@
 
 import logging
 import time
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    # kreuzberg 4.9.9 declares ``OutputFormat`` only in its .pyi stub
+    # (kreuzberg._internal_bindings) for static checking; the compiled runtime
+    # does not export it there, so ``kreuzberg/__init__.py`` provides a
+    # runtime-only Python fallback defined under ``if not TYPE_CHECKING``.
+    from kreuzberg._internal_bindings import OutputFormat
+else:
+    from kreuzberg import OutputFormat
 
 from kreuzberg import (
     ChunkingConfig,
     ExtractionConfig,
     ExtractionTimeoutError,
     OcrConfig,
-    OutputFormat,
     PageConfig,
     ParsingError,
     PdfConfig,
@@ -45,7 +54,10 @@ def make_extraction_config(
     if ocr_mode == "vlm":
         ocr = OcrConfig(
             backend="vlm",
-            vlm_config=KreuzbergLlmConfig(
+            # ``vlm_config`` is accepted by OcrConfig at runtime (kreuzberg
+            # 4.9.9, verified via inspect.signature) but is missing from the
+            # shipped _internal_bindings.pyi stub — third-party stub gap.
+            vlm_config=KreuzbergLlmConfig(  # pyright: ignore[reportCallIssue]
                 model=llm_config.VISION_MODEL,
                 api_key=llm_config.api_key,
                 base_url=llm_config.api_base_url,
@@ -143,7 +155,9 @@ class KreuzbergAdapter(DocumentReaderPort):
         if isinstance(page, dict):
             return page
         if hasattr(page, "__dict__"):
-            return dict(page)
+            # ``vars`` returns the live ``__dict__`` (attribute values), which
+            # ``dict(page)`` cannot accept statically for arbitrary objects.
+            return dict(vars(page))
         return {}
 
     @staticmethod

@@ -5,14 +5,15 @@ import asyncpg
 
 from config import DatabaseConfig
 from domain.logging.messages import LogMessage
+from domain.ports.postgres_health_port import PostgresHealthPort
 
 logger = logging.getLogger(__name__)
 
 _SSL_MODES_NO_VERIFY = frozenset({"require", "prefer"})
 
 
-class AsyncpgHealthAdapter:
-    """PostgreSQL health check using asyncpg direct connection."""
+class AsyncpgHealthAdapter(PostgresHealthPort):
+    """PostgreSQL health check using asyncpg direct connection (port-backed)."""
 
     def __init__(self, db_config: DatabaseConfig) -> None:
         self._db_url = db_config.asyncpg_url
@@ -40,13 +41,18 @@ class AsyncpgHealthAdapter:
     def _build_ssl_context(self) -> ssl_module.SSLContext | None:
         """Build an SSL context appropriate for the configured sslmode.
 
-        - ``require`` / ``prefer``: encryption without certificate verification
-          (CERT_NONE, check_hostname disabled); a warning is logged so operators
-          know verification is intentionally skipped.
-        - ``verify-ca``: verify the server certificate against the CA but skip
-          hostname verification (CERT_REQUIRED, check_hostname disabled).
-        - ``verify-full``: full verification using ``create_default_context``
-          defaults (CERT_REQUIRED, check_hostname enabled).
+        - ``require`` / ``prefer``: PostgreSQL's documented "encryption without
+          certificate or hostname verification" mode (CERT_NONE, check_hostname
+          disabled). Intentionally supported only for these operator-selected
+          modes; a warning is logged on every use.
+        - ``verify-ca`` / ``verify-full`` (and any unknown sslmode): strict
+          default context — certificate chain AND server hostname are verified
+          via ``create_default_context``. python's ``ssl`` module cannot express
+          PostgreSQL's ``verify-ca`` ("chain only, no hostname matching")
+          without disabling hostname validation (python:S5527); a hostname
+          mismatch therefore fails this health probe (``ping`` returns False)
+          instead of being accepted — use ``require``/``prefer`` if unverified
+          encryption is deliberately wanted.
         - ``disable`` or ``None``: let asyncpg handle the connection natively,
           without a custom SSL context.
         """
@@ -55,21 +61,20 @@ class AsyncpgHealthAdapter:
 
         if self._ssl_mode in _SSL_MODES_NO_VERIFY:
             logger.warning(
-                "SSL mode '%s' disables certificate verification for the "
-                "PostgreSQL health check; use 'verify-ca' or 'verify-full' "
-                "in production to prevent MITM attacks.",
+                LogMessage.POSTGRES_HEALTH_TLS_NO_VERIFY,
                 self._ssl_mode,
             )
+            # NOSONAR — sslmode=require/prefer selects PostgreSQL's documented
+            # "encryption WITHOUT certificate/hostname verification" mode; the
+            # constructs below are that operator-selected mode implemented
+            # exactly, and a warning is logged on every use.
+            ctx = ssl_module.create_default_context()  # NOSONAR — sslmode=require/prefer (PostgreSQL spec): operator-selected unverified encryption, warning logged above
+            ctx.check_hostname = False  # NOSONAR — sslmode=require/prefer (PostgreSQL spec): operator-selected unverified encryption, warning logged above
+            ctx.verify_mode = ssl_module.CERT_NONE  # NOSONAR — sslmode=require/prefer (PostgreSQL spec): operator-selected unverified encryption, warning logged above
+            return ctx
 
-        ctx = ssl_module.create_default_context()
-
-        if self._ssl_mode in _SSL_MODES_NO_VERIFY:
-            ctx.check_hostname = False  # NOSONAR — sslmode=require/prefer means encryption without verification by PostgreSQL spec
-            ctx.verify_mode = (
-                ssl_module.CERT_NONE
-            )  # NOSONAR — see above; warning logged above
-        elif self._ssl_mode == "verify-ca":
-            ctx.check_hostname = False
-        # verify-full (and any unknown sslmode) keeps full verification defaults.
-
-        return ctx
+        # verify-ca / verify-full / unknown sslmode: strict default context —
+        # the certificate chain AND the server hostname must match (python
+        # ssl cannot express ``verify-ca``'s "chain-only, no hostname" without
+        # disabling hostname validation).
+        return ssl_module.create_default_context()

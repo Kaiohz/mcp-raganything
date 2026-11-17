@@ -42,10 +42,10 @@ _FETCH_TIMEOUT = 15.0
 class FastMcpOpenApiFactory(OpenApiMcpFactory):
     """Build in-process FastMCP servers from remote OpenAPI documents.
 
-    Uses ``httpx.get`` to fetch the spec and ``httpx.AsyncClient`` +
-    ``FastMCP.from_openapi`` to build the server. All HTTP errors are wrapped
-    into domain errors (:class:`OpenApiFetchError` /
-    :class:`OpenApiInvalidSpecError`) so callers never see httpx exceptions.
+    Uses an async ``httpx.AsyncClient`` to fetch the spec and to build the
+    server through ``FastMCP.from_openapi``. All HTTP errors are wrapped into
+    domain errors (:class:`OpenApiFetchError` / :class:`OpenApiInvalidSpecError`)
+    so callers never see httpx exceptions.
 
     Attributes:
         _max_spec_bytes: Maximum accepted spec size in bytes. Specs larger than
@@ -72,9 +72,10 @@ class FastMcpOpenApiFactory(OpenApiMcpFactory):
                 max spec size.
         """
         try:
-            response = httpx.get(
-                spec_url, headers=headers, timeout=_FETCH_TIMEOUT, follow_redirects=True
-            )
+            async with httpx.AsyncClient(
+                timeout=_FETCH_TIMEOUT, follow_redirects=True
+            ) as client:
+                response = await client.get(spec_url, headers=headers)
         except httpx.HTTPError as e:
             logger.warning(LogMessage.MCP_OPENAPI_SPEC_FETCH_FAILED, spec_url, e)
             raise OpenApiFetchError(

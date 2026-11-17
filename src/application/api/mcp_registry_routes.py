@@ -132,9 +132,7 @@ def _mask(entry: RegisteredMcpServer) -> RegisteredMcpServer:
     return entry.model_copy(update={"auth_token": None, "headers": {}, "env": {}})
 
 
-@mcp_registry_router.post(
-    "", response_model=RegisteredMcpServer, status_code=status.HTTP_201_CREATED
-)
+@mcp_registry_router.post("", status_code=status.HTTP_201_CREATED)
 async def create_mcp_server(
     body: McpServerCreateRequest,
     use_case: Annotated[
@@ -167,11 +165,7 @@ async def create_mcp_server(
     return _mask(created)
 
 
-@mcp_registry_router.post(
-    "/validate",
-    response_model=McpServerValidateResponse,
-    status_code=status.HTTP_200_OK,
-)
+@mcp_registry_router.post("/validate", status_code=status.HTTP_200_OK)
 async def validate_mcp_server(
     body: McpServerValidateRequest,
     use_case: Annotated[
@@ -209,9 +203,7 @@ async def validate_mcp_server(
     return McpServerValidateResponse(tool_count=tool_count)
 
 
-@mcp_registry_router.get(
-    "", response_model=list[RegisteredMcpServer], status_code=status.HTTP_200_OK
-)
+@mcp_registry_router.get("", status_code=status.HTTP_200_OK)
 async def list_mcp_servers(
     use_case: Annotated[ListMcpServersUseCase, Depends(get_list_mcp_servers_use_case)],
 ) -> list[RegisteredMcpServer]:
@@ -227,9 +219,7 @@ async def list_mcp_servers(
     return [_mask(e) for e in entries]
 
 
-@mcp_registry_router.get(
-    "/{name}", response_model=RegisteredMcpServer, status_code=status.HTTP_200_OK
-)
+@mcp_registry_router.get("/{name}", status_code=status.HTTP_200_OK)
 async def get_mcp_server(
     name: str,
     use_case: Annotated[GetMcpServerUseCase, Depends(get_get_mcp_server_use_case)],
@@ -247,9 +237,7 @@ async def get_mcp_server(
     return _mask(entry)
 
 
-@mcp_registry_router.get(
-    "/{name}/reveal", response_model=RegisteredMcpServer, status_code=status.HTTP_200_OK
-)
+@mcp_registry_router.get("/{name}/reveal", status_code=status.HTTP_200_OK)
 async def reveal_mcp_server(
     name: str,
     use_case: Annotated[GetMcpServerUseCase, Depends(get_get_mcp_server_use_case)],
@@ -266,9 +254,7 @@ async def reveal_mcp_server(
     return await use_case.execute(name)
 
 
-@mcp_registry_router.put(
-    "/{name}", response_model=RegisteredMcpServer, status_code=status.HTTP_200_OK
-)
+@mcp_registry_router.put("/{name}", status_code=status.HTTP_200_OK)
 async def update_mcp_server(
     name: str,
     body: McpServerUpdateRequest,

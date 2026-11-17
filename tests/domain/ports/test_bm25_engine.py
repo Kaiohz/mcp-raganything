@@ -7,9 +7,13 @@ from domain.ports.bm25_engine import BM25EnginePort, BM25SearchResult
 
 def test_bm25_engine_port_is_abstract():
     """BM25EnginePort should be abstract and not instantiable."""
+    # The test intentionally EXECUTES the abstract instantiation error at
+    # runtime; referencing the class through a ``type`` alias is what makes
+    # that call legitimate (rather than a type error) to static checkers.
+    abstract_base: type = BM25EnginePort
     # Act & Assert
     with pytest.raises(TypeError, match="Can't instantiate abstract class"):
-        BM25EnginePort()
+        abstract_base()
 
 
 def test_bm25_engine_port_has_required_methods():

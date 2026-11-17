@@ -19,7 +19,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 from fastmcp.exceptions import ToolError
-from fastmcp.server.dependencies import _current_http_request
+
+# fastmcp's HTTP-request contextvar is a private (underscore) symbol — the only
+# seam for simulating an HTTP request in middleware unit tests; fastmcp itself
+# re-imports it across modules, so the targeted ignore documents intended use.
+from fastmcp.server.dependencies import (
+    _current_http_request,  # pyright: ignore[reportPrivateImportUsage]
+)
 from fastmcp.server.middleware import MiddlewareContext
 from mcp.types import CallToolRequest, CallToolRequestParams, ListToolsRequest
 from starlette.requests import Request
@@ -200,10 +206,10 @@ class TestMount:
                 "fastmcp.FastMCP.from_openapi", new=MagicMock(return_value=_fake_mcp())
             ),
             patch.object(httpx, "AsyncClient", new=MagicMock()),
+            pytest.raises(OpenApiInvalidSpecError),
         ):
             # Act & Assert
-            with pytest.raises(OpenApiInvalidSpecError):
-                await runner.mount("petstore", spec, headers={})
+            await runner.mount("petstore", spec, headers={})
 
     async def test_applies_middleware_to_built_mcp(
         self, runner: GeneratedMcpRunner, mock_app: MagicMock

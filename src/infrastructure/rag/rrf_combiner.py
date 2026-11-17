@@ -58,7 +58,11 @@ class RRFCombiner:
     def _resolve_chunk_id(self, chunk: dict[str, Any]) -> tuple[str, str | None]:
         raw_chunk_id = chunk.get("chunk_id")
         raw_ref_id = chunk.get("reference_id")
-        return raw_chunk_id or raw_ref_id, raw_ref_id
+        # Both may be missing/None on malformed vector rows; the caller
+        # treats an empty resolved id as "droppable".
+        chunk_id = str(raw_chunk_id or raw_ref_id or "")
+        reference_id = str(raw_ref_id) if raw_ref_id is not None else None
+        return chunk_id, reference_id
 
     def _add_vector_result(
         self, scores: dict[str, dict[str, Any]], rank: int, chunk: dict[str, Any]

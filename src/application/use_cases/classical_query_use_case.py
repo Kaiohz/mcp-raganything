@@ -214,6 +214,22 @@ class ClassicalQueryUseCase:
         )
         queries = [query] + variations
 
+        bm25_engine = self.bm25_engine
+        if bm25_engine is None:
+            # Defensive: hybrid mode is only entered with BM25 wired (see the
+            # caller guard); fall back to vector mode to keep behavior.
+            logger.warning(LogMessage.CLASSICAL_BM25_UNAVAILABLE_FALLBACK)
+            return await self._execute_vector(
+                working_dir=working_dir,
+                query=query,
+                top_k=top_k,
+                num_variations=num_variations,
+                relevance_threshold=relevance_threshold,
+                vector_distance_threshold=vector_distance_threshold,
+                enable_llm_judge=enable_llm_judge,
+                metadata_filter=metadata_filter,
+            )
+
         search_tasks = [
             self.vector_store.similarity_search(
                 working_dir=working_dir,
@@ -225,7 +241,7 @@ class ClassicalQueryUseCase:
             for q in queries
         ]
 
-        bm25_coro = self.bm25_engine.search(query, working_dir, top_k=top_k * 2)
+        bm25_coro = bm25_engine.search(query, working_dir, top_k=top_k * 2)
         vector_coro = asyncio.gather(*search_tasks)
 
         gather_results = await asyncio.gather(

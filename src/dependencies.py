@@ -16,6 +16,8 @@ existing tests keep passing.
 import logging
 import os
 
+from pydantic import SecretStr
+
 from application.use_cases.classical_index_file_use_case import (
     ClassicalIndexFileUseCase,
 )
@@ -34,17 +36,23 @@ from application.use_cases.list_folders_use_case import ListFoldersUseCase
 from application.use_cases.list_mcp_servers import ListMcpServersUseCase
 from application.use_cases.liveness_check_use_case import LivenessCheckUseCase
 from application.use_cases.read_file_use_case import ReadFileUseCase
+from application.use_cases.save_memory_use_case import SaveMemoryUseCase
 from application.use_cases.update_mcp_server import UpdateMcpServerUseCase
 from application.use_cases.upload_file_use_case import UploadFileUseCase
 from application.use_cases.validate_mcp_server import ValidateMcpServerUseCase
+from application.use_cases.web_search_use_case import WebSearchUseCase
 from config import (
     AppConfig,
     BM25Config,
     ClassicalRAGConfig,
+    CrawlConfig,
     DatabaseConfig,
     LLMConfig,
+    MemoryStoreConfig,
     MinioConfig,
+    WebSearchConfig,
 )
+from domain.entities.memory import MemoryCredential
 from domain.errors.config import DependencyNotInitializedError
 from domain.errors.llm import LlmNotConfiguredError
 from domain.errors.messages import ErrorMessage
@@ -61,13 +69,23 @@ from domain.ports.vector_store_port import VectorStorePort
 from domain.services.auth.auth_service import AuthService
 from domain.services.llm.credential_resolver import UserLlmCredentialResolver
 from infrastructure.database.asyncpg_health_adapter import AsyncpgHealthAdapter
-from infrastructure.database.rls_context import current_user_id
+from infrastructure.database.rls_context import (
+    current_auth_method,
+    current_credential,
+    current_user_id,
+)
 from infrastructure.document_reader.kreuzberg_adapter import KreuzbergAdapter
 from infrastructure.mcp.tool_loader import FastMcpToolLoader
+from infrastructure.memory.composable_agents_store_adapter.adapter import (
+    ComposableAgentsMemoryStoreAdapter,
+)
 from infrastructure.openapi_mcp.adapter import FastMcpOpenApiFactory
 from infrastructure.rag.classical_bm25_adapter import ClassicalBM25Adapter
 from infrastructure.security.crypto import FernetSecretCipher
 from infrastructure.storage.minio_adapter import MinioAdapter
+from infrastructure.web_search.crawl4ai_adapter import Crawl4AIWebCrawlerAdapter
+from infrastructure.web_search.ddgs_adapter import DDGSSearchAdapter
+from infrastructure.web_search.url_safety.adapter import UrlSafetyAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +108,110 @@ kreuzberg_adapter = KreuzbergAdapter()
 postgres_health_adapter = AsyncpgHealthAdapter(db_config)
 
 classical_rag_config = ClassicalRAGConfig()
+
+# --- Web search + memory tools (bounded process-local adapters) ---------------
+#
+# These adapters are process-wide singletons, but they are built LAZILY on
+# first use instead of at import time: their bounds (timeouts, concurrency,
+# worker counts) are read from validated settings, and deferring construction
+# — including the settings objects themselves — guarantees those settings were
+# resolved in the environment the application actually starts in. The DDGS
+# adapter owns its dedicated executor + semaphore (shut down at application
+# shutdown), the crawl adapter lazily starts the shared crawler on first crawl
+# (never at import/startup), and the memory adapter speaks async HTTP to the
+# composable-agents Store File API.
+url_safety_adapter = UrlSafetyAdapter()
+
+web_search_adapter: DDGSSearchAdapter | None = None
+web_crawler_adapter: Crawl4AIWebCrawlerAdapter | None = None
+memory_store_adapter: ComposableAgentsMemoryStoreAdapter | None = None
+
+
+def _build_web_search_adapter() -> DDGSSearchAdapter:
+    """Create the web-search adapter from validated settings (lazy singleton)."""
+    config = WebSearchConfig()  # type: ignore
+    return DDGSSearchAdapter(
+        timeout_seconds=config.WEB_SEARCH_TIMEOUT_SECONDS,
+        max_concurrency=config.WEB_SEARCH_MAX_CONCURRENCY,
+        executor_workers=config.WEB_SEARCH_EXECUTOR_WORKERS,
+    )
+
+
+def _build_web_crawler_adapter() -> Crawl4AIWebCrawlerAdapter:
+    """Create the crawl adapter from validated settings (lazy singleton)."""
+    config = CrawlConfig()  # type: ignore
+    return Crawl4AIWebCrawlerAdapter(
+        max_concurrent_batches=config.CRAWL_MAX_CONCURRENT_BATCHES,
+        max_sessions_per_batch=config.CRAWL_MAX_SESSIONS_PER_BATCH,
+        memory_threshold_percent=config.CRAWL_MEMORY_THRESHOLD_PERCENT,
+        page_timeout_ms=round(config.CRAWL_PAGE_TIMEOUT_SECONDS * 1000),
+        overall_timeout_seconds=config.CRAWL_OVERALL_TIMEOUT_SECONDS,
+        rate_limit_min_delay_seconds=config.CRAWL_RATE_LIMIT_MIN_DELAY_SECONDS,
+        rate_limit_max_delay_seconds=config.CRAWL_RATE_LIMIT_MAX_DELAY_SECONDS,
+        url_safety=url_safety_adapter,
+    )
+
+
+def _build_memory_store_adapter() -> ComposableAgentsMemoryStoreAdapter:
+    """Create the memory-store adapter from validated settings (lazy singleton)."""
+    config = MemoryStoreConfig()  # type: ignore
+    return ComposableAgentsMemoryStoreAdapter(
+        base_url=config.COMPOSABLE_AGENTS_BASE_URL,
+        timeout_seconds=config.MEMORY_STORE_TIMEOUT_SECONDS,
+    )
+
+
+def get_web_search_adapter() -> DDGSSearchAdapter:
+    """Return the web-search adapter singleton (built on first use)."""
+    global web_search_adapter
+    if web_search_adapter is None:
+        web_search_adapter = _build_web_search_adapter()
+    return web_search_adapter
+
+
+def get_web_crawler_adapter() -> Crawl4AIWebCrawlerAdapter:
+    """Return the crawl adapter singleton (built on first use)."""
+    global web_crawler_adapter
+    if web_crawler_adapter is None:
+        web_crawler_adapter = _build_web_crawler_adapter()
+    return web_crawler_adapter
+
+
+def get_memory_store_adapter() -> ComposableAgentsMemoryStoreAdapter:
+    """Return the memory-store adapter singleton (built on first use)."""
+    global memory_store_adapter
+    if memory_store_adapter is None:
+        memory_store_adapter = _build_memory_store_adapter()
+    return memory_store_adapter
+
+
+def get_web_search_use_case() -> WebSearchUseCase:
+    """Return the web-search use case (ports wired to their adapters)."""
+    return WebSearchUseCase(
+        search=get_web_search_adapter(),
+        crawler=get_web_crawler_adapter(),
+        url_safety=url_safety_adapter,
+    )
+
+
+def get_memory_identity() -> tuple[str, MemoryCredential]:
+    """Read the authenticated caller identity from the RLS contextvars.
+
+    Returns:
+        The (possibly empty) user id and the caller credential as received by
+        the middleware ("" values mean no identity — the use case fails
+        closed on those without any upstream request).
+    """
+    return current_user_id.get() or "", MemoryCredential(
+        method=current_auth_method.get() or "",
+        credential=current_credential.get() or "",
+    )
+
+
+def get_save_memory_use_case() -> SaveMemoryUseCase:
+    """Return the save-memory use case (MemoryStorePort wired)."""
+    return SaveMemoryUseCase(store=get_memory_store_adapter())
+
 
 classical_bm25_adapter: BM25EnginePort | None = None
 if bm25_config.BM25_ENABLED:
@@ -118,7 +240,7 @@ try:
 
     _legacy_embedding = OpenAIEmbeddings(
         model=llm_config.EMBEDDING_MODEL,
-        api_key=llm_config.api_key,
+        api_key=SecretStr(llm_config.api_key),
         base_url=llm_config.api_base_url,
     )
     from infrastructure.vector_store.langchain_pgvector_adapter import (
@@ -209,7 +331,7 @@ async def get_embedding_for_user():
     base_url, api_key = creds
     return OpenAIEmbeddings(
         model=llm_config.EMBEDDING_MODEL,
-        api_key=api_key,
+        api_key=SecretStr(api_key),
         base_url=base_url,
     )
 
@@ -282,8 +404,13 @@ async def get_vector_store_for_user() -> VectorStorePort:
     # Per-user path: reuse the shared PGEngine from the legacy singleton so we
     # don't create a connection pool per request. The embeddings are per-user.
     embedding = await get_embedding_for_user()
+    # ``_engine`` is the legacy adapter's internal shared PGEngine; the port
+    # does not declare it, so access it defensively (None falls back to a new
+    # engine built inside the adapter).
     shared_engine = (
-        classical_vector_store._engine if classical_vector_store is not None else None
+        getattr(classical_vector_store, "_engine", None)
+        if classical_vector_store is not None
+        else None
     )
     return LangchainPgvectorAdapter(
         connection_string=db_config.DATABASE_URL,

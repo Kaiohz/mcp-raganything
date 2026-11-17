@@ -40,7 +40,9 @@ class _FakeClientAsyncCM:
     tests can both configure return values and assert on close calls.
     """
 
-    def __init__(self, tools: list[Any], aenter_side_effect: BaseException | None = None) -> None:
+    def __init__(
+        self, tools: list[Any], aenter_side_effect: BaseException | None = None
+    ) -> None:
         self._tools = tools
         self._aenter_side_effect = aenter_side_effect
         self.client = MagicMock()
@@ -100,7 +102,9 @@ def _patched_loader(
 
     cm_iter = iter(fake_cms)
 
-    def _client_factory(transport: Any, timeout: float | None = None) -> _FakeClientAsyncCM:
+    def _client_factory(
+        transport: Any, timeout: float | None = None
+    ) -> _FakeClientAsyncCM:
         cm = next(cm_iter)
         cm.transport = transport
         cm.timeout = timeout
@@ -123,9 +127,14 @@ class TestLoadToolsHttp:
     def loader(self) -> FastMcpToolLoader:
         return FastMcpToolLoader(tool_timeout=60.0)
 
-    async def test_load_tools_http_returns_aggregated_tools(self, loader: FastMcpToolLoader) -> None:
+    async def test_load_tools_http_returns_aggregated_tools(
+        self, loader: FastMcpToolLoader
+    ) -> None:
         # Arrange — two HTTP configs; mocked clients return 2 and 3 tools.
-        cms = [_FakeClientAsyncCM(tools=["t1", "t2"]), _FakeClientAsyncCM(tools=["t3", "t4", "t5"])]
+        cms = [
+            _FakeClientAsyncCM(tools=["t1", "t2"]),
+            _FakeClientAsyncCM(tools=["t3", "t4", "t5"]),
+        ]
         client_p, http_p, stdio_p = _patched_loader(cms)
 
         # Act
@@ -138,7 +147,9 @@ class TestLoadToolsHttp:
         assert _mock_stdio.call_count == 0
         assert mock_client.call_count == 2
 
-    async def test_load_tools_http_no_auth_token_passes_none(self, loader: FastMcpToolLoader) -> None:
+    async def test_load_tools_http_no_auth_token_passes_none(
+        self, loader: FastMcpToolLoader
+    ) -> None:
         # Arrange — config without auth_token
         cms = [_FakeClientAsyncCM(tools=["t1"])]
         client_p, http_p, stdio_p = _patched_loader(cms)
@@ -212,7 +223,9 @@ class TestLoadToolsHttp:
         monkeypatch.setenv("TOK", "resolved-token")
         cms = [_FakeClientAsyncCM(tools=["t1"])]
         client_p, http_p, stdio_p = _patched_loader(cms)
-        config = _http_config(headers={"Authorization": "Bearer ${TOK}"}, auth_token=None)
+        config = _http_config(
+            headers={"Authorization": "Bearer ${TOK}"}, auth_token=None
+        )
 
         # Act
         with client_p, http_p as mock_http, stdio_p:
@@ -264,7 +277,11 @@ class TestLoadToolsStdio:
 
         # Assert
         args, kwargs = mock_stdio.call_args
-        command = kwargs.get("command") if "command" in kwargs else (args[0] if args else None)
+        command = (
+            kwargs.get("command")
+            if "command" in kwargs
+            else (args[0] if args else None)
+        )
         assert command == "python"
         passed_args = kwargs.get("args")
         assert passed_args == ["-m", "server"]
@@ -297,7 +314,9 @@ class TestLoadToolsMixedAndEdgeCases:
     def loader(self) -> FastMcpToolLoader:
         return FastMcpToolLoader(tool_timeout=60.0)
 
-    async def test_load_tools_mixed_http_and_stdio_configs(self, loader: FastMcpToolLoader) -> None:
+    async def test_load_tools_mixed_http_and_stdio_configs(
+        self, loader: FastMcpToolLoader
+    ) -> None:
         # Arrange — first config HTTP, second STDIO
         cms = [_FakeClientAsyncCM(tools=["h1"]), _FakeClientAsyncCM(tools=["s1", "s2"])]
         client_p, http_p, stdio_p = _patched_loader(cms)
@@ -311,7 +330,9 @@ class TestLoadToolsMixedAndEdgeCases:
         assert mock_stdio.call_count == 1
         assert result == ["h1", "s1", "s2"]
 
-    async def test_load_tools_empty_configs_returns_empty_list(self, loader: FastMcpToolLoader) -> None:
+    async def test_load_tools_empty_configs_returns_empty_list(
+        self, loader: FastMcpToolLoader
+    ) -> None:
         # Arrange / Act
         result = await loader.load_tools([])
 
@@ -353,7 +374,11 @@ class TestLoadToolsMixedAndEdgeCases:
 
         # Assert — Client constructed with timeout=12.5.
         args, kwargs = mock_client.call_args
-        timeout = kwargs.get("timeout") if "timeout" in kwargs else (args[1] if len(args) > 1 else None)
+        timeout = (
+            kwargs.get("timeout")
+            if "timeout" in kwargs
+            else (args[1] if len(args) > 1 else None)
+        )
         assert timeout == 12.5
 
 

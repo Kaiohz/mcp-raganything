@@ -75,3 +75,58 @@ class ErrorMessage(StrEnum):
     MCP_ALREADY_MOUNTED = "MCP server already mounted: {name}"
     MCP_CONNECTION_ERROR = "MCP server connection failed: {error}"
     MCP_TOOL_LOAD_ERROR = "MCP tool loading failed: {error}"
+
+    # --- Web search (DDGS + Crawl4AI) ---
+    WEB_SEARCH_INVALID_QUERY = "The search query must contain visible characters."
+    WEB_SEARCH_INVALID_MAX_RESULTS = "max_results must be an integer between 1 and 10."
+    WEB_SEARCH_INVALID_EXPLORE_TOP_N = (
+        "explore_top_n must be an integer between 0 and 5."
+    )
+    WEB_SEARCH_TIMED_OUT = "The web search did not complete in time. Try again later."
+    WEB_SEARCH_PROVIDER_UNAVAILABLE = (
+        "The web search provider is temporarily unavailable."
+    )
+    WEB_SEARCH_UNEXPECTED_ERROR = "The web search failed unexpectedly."
+    WEB_SEARCH_FAILED = "The web search failed. Try again later."
+    WEB_SEARCH_UNSAFE_URL = "The page was skipped: URL rejected ({reason})"
+    WEB_SEARCH_SCHEME_NOT_ALLOWED = (
+        "URL scheme is not allowed: only http and https URLs can be explored."
+    )
+    WEB_SEARCH_HOST_MISSING = "URL host is missing or invalid."
+    WEB_SEARCH_URL_CREDENTIALS = "URLs containing embedded credentials are not allowed."
+    WEB_SEARCH_PORT_INVALID = "URL port is invalid."
+    WEB_SEARCH_LOCAL_HOST = "URL resolves to a local host and cannot be explored."
+    WEB_SEARCH_NON_PUBLIC_ADDRESS = (
+        "URL points to a non-public address and cannot be explored."
+    )
+    WEB_SEARCH_DNS_FAILED = "URL host could not be resolved safely."
+    WEB_SEARCH_DNS_TIMEOUT = "URL host resolution timed out."
+    WEB_SEARCH_CRAWL_FAILED = "Page crawl failed."
+    WEB_SEARCH_CRAWL_TIMED_OUT = "Page crawl timed out."
+    WEB_SEARCH_CRAWL_ROBOTS = "Page crawl was blocked by robots.txt."
+    WEB_SEARCH_CRAWL_REDIRECTED = "Page was redirected to a disallowed destination."
+    WEB_SEARCH_CRAWL_BATCH_FAILED = "The page exploration did not complete in time."
+
+    # --- Memory store (composable-agents Store File API) ---
+    MEMORY_IDENTITY_REQUIRED = (
+        "Saving memories requires an authenticated user identity with a "
+        "forwardable JWT or API key credential."
+    )
+    MEMORY_NAME_INVALID = (
+        "Invalid memory name: use letters, digits, dots, hyphens or "
+        "underscores without paths or separators."
+    )
+    MEMORY_CONTENT_REQUIRED = "Memory content must not be empty."
+    MEMORY_EXISTS = "A memory with this name already exists (if_exists='fail')."
+    MEMORY_MODE_INVALID = "if_exists must be one of: fail, append, replace."
+    MEMORY_STORE_TIMEOUT = "The memory service did not respond in time."
+    MEMORY_STORE_UNAVAILABLE = "The memory service is temporarily unavailable."
+    MEMORY_STORE_REJECTED = "The memory service rejected the memory save request."
+    MEMORY_STORE_UNEXPECTED = "The memory service request failed unexpectedly."
+    MEMORY_STORE_FORBIDDEN = (
+        "The memory request was rejected by the upstream service: authentication "
+        "or permission failure."
+    )
+    MEMORY_STORE_INVALID_RESPONSE = "The memory service returned an invalid response."
+    MEMORY_STORE_PATH_ESCAPE = "Memory storage path must stay inside /memories/."
+    MEMORY_SAVE_FAILED = "Saving the memory failed. Try again later."

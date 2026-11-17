@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 
 import aiofiles
-from kreuzberg import extract_file
+from kreuzberg import ExtractionConfig, extract_file
 
 from application.use_cases._user_id_tag import tag_documents_with_user_id
 from domain.entities.indexing_result import (
@@ -44,6 +44,85 @@ class ClassicalIndexFolderUseCase:
         self.storage = storage
         self.bucket = bucket
         self.output_dir = output_dir
+
+    async def _process_file(
+        self,
+        working_dir: str,
+        file_name: str,
+        *,
+        index: int,
+        total: int,
+        config: ExtractionConfig,
+    ) -> FileProcessingDetail:
+        """Extract, chunk and index one storage object; never raises.
+
+        Args:
+            working_dir: Storage prefix / vector store namespace.
+            file_name: The storage object being processed.
+            index: Zero-based position of this file (logs use ``index + 1``,
+                matching the historical ``processed + failed`` counters).
+            total: Total number of files in this batch.
+            config: Kreuzberg extraction configuration.
+
+        Returns:
+            :class:`FileProcessingDetail` for this file (SUCCESS or FAILED).
+        """
+        local_path: str | None = None
+        try:
+            logger.info(
+                LogMessage.CLASSICAL_FOLDER_INDEX_FILE_START,
+                index + 1,
+                total,
+                file_name,
+            )
+            data = await self.storage.get_object(self.bucket, file_name)
+
+            local_path = validate_path(self.output_dir, file_name)
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            async with aiofiles.open(local_path, "wb") as f:
+                await f.write(data)
+
+            result = await extract_file(local_path, config=config)
+
+            documents = build_documents_from_extraction(result, file_name)
+
+            documents = tag_documents_with_user_id(documents)
+
+            if documents:
+                await self.vector_store.add_documents(
+                    working_dir=working_dir, documents=documents
+                )
+
+            logger.info(
+                LogMessage.CLASSICAL_FOLDER_INDEX_FILE_DONE,
+                index + 1,
+                total,
+                file_name,
+                len(documents),
+            )
+            return FileProcessingDetail(
+                file_path=file_name,
+                file_name=os.path.basename(file_name),
+                status=IndexingStatus.SUCCESS,
+            )
+        except Exception as exc:
+            logger.error(
+                LogMessage.CLASSICAL_FOLDER_INDEX_FILE_FAILED,
+                index + 1,
+                total,
+                file_name,
+                str(exc),
+            )
+            return FileProcessingDetail(
+                file_path=file_name,
+                file_name=os.path.basename(file_name),
+                status=IndexingStatus.FAILED,
+                error=str(exc),
+            )
+        finally:
+            if local_path and os.path.exists(local_path):
+                with contextlib.suppress(OSError):
+                    os.remove(local_path)
 
     async def execute(
         self,
@@ -90,69 +169,19 @@ class ClassicalIndexFolderUseCase:
             chunk_size=chunk_size, chunk_overlap=chunk_overlap
         )
 
-        for file_name in files:
-            local_path = None
-            try:
-                logger.info(
-                    LogMessage.CLASSICAL_FOLDER_INDEX_FILE_START,
-                    processed + failed + 1,
-                    len(files),
-                    file_name,
-                )
-                data = await self.storage.get_object(self.bucket, file_name)
-
-                local_path = validate_path(self.output_dir, file_name)
-                os.makedirs(os.path.dirname(local_path), exist_ok=True)
-                async with aiofiles.open(local_path, "wb") as f:
-                    await f.write(data)
-
-                result = await extract_file(local_path, config=config)
-
-                documents = build_documents_from_extraction(result, file_name)
-
-                documents = tag_documents_with_user_id(documents)
-
-                if documents:
-                    await self.vector_store.add_documents(
-                        working_dir=working_dir, documents=documents
-                    )
-
+        for index, file_name in enumerate(files):
+            detail = await self._process_file(
+                working_dir,
+                file_name,
+                index=index,
+                total=len(files),
+                config=config,
+            )
+            if detail.status is IndexingStatus.SUCCESS:
                 processed += 1
-                logger.info(
-                    LogMessage.CLASSICAL_FOLDER_INDEX_FILE_DONE,
-                    processed + failed,
-                    len(files),
-                    file_name,
-                    len(documents),
-                )
-                file_results.append(
-                    FileProcessingDetail(
-                        file_path=file_name,
-                        file_name=os.path.basename(file_name),
-                        status=IndexingStatus.SUCCESS,
-                    )
-                )
-            except Exception as exc:
+            else:
                 failed += 1
-                logger.error(
-                    LogMessage.CLASSICAL_FOLDER_INDEX_FILE_FAILED,
-                    processed + failed,
-                    len(files),
-                    file_name,
-                    str(exc),
-                )
-                file_results.append(
-                    FileProcessingDetail(
-                        file_path=file_name,
-                        file_name=os.path.basename(file_name),
-                        status=IndexingStatus.FAILED,
-                        error=str(exc),
-                    )
-                )
-            finally:
-                if local_path and os.path.exists(local_path):
-                    with contextlib.suppress(OSError):
-                        os.remove(local_path)
+            file_results.append(detail)
 
         if failed > 0 and processed > 0:
             status = IndexingStatus.PARTIAL
