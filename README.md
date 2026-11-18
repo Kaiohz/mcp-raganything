@@ -942,6 +942,40 @@ File browsing tools for listing and reading files from MinIO storage.
 
 Downloads the file from MinIO, extracts its text content using Kreuzberg, and returns the extracted text along with metadata and any detected tables.
 
+#### Tool: `temporary_upload_file` — technical (backend-only)
+
+Used directly by composable-agents to park a chat-attachment document under a
+temporary, user-isolated namespace. **Never exposed to the LLM** (composable-agents'
+MCP tool loader filters it out) and never RAG-indexed.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `file_name` | string | required | Attachment basename (plain single segment) |
+| `content_base64` | string | required | Strictly decodable base64 payload |
+| `content_type` | string | required | Attachment MIME type (REST upload families apply) |
+| `prefix` | string | required | MUST match `chat_tmp/<current_user_id>/...` |
+
+Validation: strict base64 decode, basename + traversal guards, existing
+extension/MIME rules, `FILES_MAX_UPLOAD_SIZE` limit (default 52428800 = 50 MiB).
+Returns `{"object_name", "size", "content_type"}`. Reuses `UploadFileUseCase`
+and the existing RustFS storage.
+
+#### Tool: `temporary_delete_file` — technical (backend-only)
+
+Deletes one temporary object from RustFS **only**: plain `StoragePort.remove_object`,
+NO pgvector cascade, NO working_dir involvement. Paths outside the caller's own
+`chat_tmp/<current_user_id>/` are refused. Idempotent: an already-absent object is
+a logged no-op.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `object_path` | string | required | Path under `chat_tmp/<current_user_id>/...` |
+
+Returns `{"deleted": <object_path>, "present": <bool>}`: `true` for an actual
+deletion, `false` for the idempotent already-absent case (logged INFO). A REAL
+storage failure is logged ERROR and raises `ToolError` so the calling backend
+retries exactly once (REQ-046).
+
 ### Removed: RAGAnythingBricks — `/bricks/mcp`
 
 **This mount and its tools are not present in the current application.** The section below is retained only as historical reference and must not be used for client configuration.

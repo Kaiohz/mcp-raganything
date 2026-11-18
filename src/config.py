@@ -264,6 +264,14 @@ class MinioConfig(BaseSettings):
     MINIO_SECRET: str = Field(default="minioadmin")
     MINIO_BUCKET: str = Field(default="raganything")
     MINIO_SECURE: bool = Field(default=False)
+    # chat-pdf-attachments spec §5.3/REQ-092 (MCP side): maximum decoded size of
+    # a temporary upload accepted by ``temporary_upload_file`` (50 MiB default).
+    FILES_MAX_UPLOAD_SIZE: int = Field(
+        default=52_428_800,
+        ge=1,
+        description="Maximum decoded size (bytes) accepted by the temporary-file "
+        "MCP tool temporary_upload_file. Defaults to 52428800 (50 MiB).",
+    )
 
 
 class WebSearchConfig(BaseSettings):
