@@ -72,7 +72,7 @@ def _decode_strict_base64(content_base64: str) -> bytes:
         raise ToolError("content_base64 is required")
     try:
         return base64.b64decode(content_base64, validate=True)
-    except (binascii.Error, ValueError) as exc:
+    except binascii.Error as exc:
         raise ToolError("content_base64 must be strictly decodable base64") from exc
 
 
