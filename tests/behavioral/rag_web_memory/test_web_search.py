@@ -47,7 +47,14 @@ def _response_value(value):
     return value
 
 
-async def wait_until(predicate, timeout: float = 0.12) -> None:
+async def wait_until(predicate, timeout: float = 2.0) -> None:
+    """Poll ``predicate`` until truthy, within ``timeout`` seconds.
+
+    The ceiling is deliberately set above CI-runner scheduling jitter (0.12s
+    failed twice on ubuntu runners while passing locally in < 1s). The spec
+    assertions themselves (ceiling ≤ 2, fresh dispatchers, shared limiter)
+    remain unchanged; the poll exits as soon as the predicate is satisfied.
+    """
     async with asyncio.timeout(timeout):
         while not predicate():
             await asyncio.sleep(0.005)
