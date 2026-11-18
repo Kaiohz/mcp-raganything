@@ -144,6 +144,18 @@ class LogMessage(StrEnum):
     # --- MCP file tools ---
     MCP_READ_FILE_UNEXPECTED_ERROR = "Unexpected error reading file: %s"
 
+    # --- Temporary-file MCP tools (chat-pdf-attachments spec §5.3) ---
+    TEMP_UPLOAD_REJECTED = "temporary_upload_file rejected (user=%s): %s"
+    TEMP_UPLOAD_COMPLETED = "temporary_upload_file completed: object=%s size=%d"
+    TEMP_DELETE_REJECTED = "temporary_delete_file rejected (user=%s): %s"
+    TEMP_DELETE_COMPLETED = "temporary_delete_file completed: object=%s"
+    TEMP_DELETE_FAILED = "temporary_delete_file failed (object=%s): %s"
+    # NOTE: read at import time like the other singletons — FILES_MAX_UPLOAD_SIZE
+    # must be set in the environment BEFORE the process boots.
+    TEMP_DELETE_ABSENT = (
+        "temporary_delete_file target already absent (idempotent no-op): object=%s (%s)"
+    )
+
     # --- Exception handler log lines (main.py) ---
     LOG_STORAGE_ERROR = "Storage error: %s"
     LOG_RAG_ERROR = "RAG error: %s"
