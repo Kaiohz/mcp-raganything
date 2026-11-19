@@ -1114,6 +1114,12 @@ All registry endpoints live under `/api/v1/mcp/servers` and are protected by the
 
 A `GET`/`PUT`/`DELETE` on a `{name}` that exists but is owned by **another user** returns `404 Not Found` (RLS hides the row). A `POST` with a `name` already used by the **same user** returns `409 Conflict`.
 
+### Partial update semantics (`PUT`)
+
+`PUT /{name}` is a true **partial merge**, not a full replacement. Only explicitly provided body fields are replaced; every omitted field — including the stored auth token, headers, and environment variables — is preserved from the existing decrypted entry. The response remains masked. `tool_count` is preserved unless the URL changes, in which case the upstream server is re-validated and recounted.
+
+This makes partial tool updates safe for trusted MCP control-plane clients while preserving secrets that were intentionally kept out of masked projections. A body that is empty or incoherent after merging returns `422` with a stable, non-sensitive validation message.
+
 The request body for `POST` and `PUT` extends the `McpServerConfig` shape with two fields:
 
 | Field | Type | Default | Description |
