@@ -27,7 +27,7 @@ import logging
 from datetime import UTC, datetime
 from typing import Annotated, Self
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field, model_validator
 
 from application.use_cases.create_mcp_server import CreateMcpServerUseCase
@@ -103,17 +103,72 @@ class McpServerValidateRequest(_McpServerBaseRequest):
     """Request body for dry-run validation of an MCP server config."""
 
 
-class McpServerUpdateRequest(_McpServerBaseRequest):
-    """Request body for updating a registered MCP server.
+class McpServerUpdateRequest(BaseModel):
+    """Request body for updating a registered MCP server (PARTIAL update).
+
+    Every field is optional; ONLY the explicitly provided fields are applied
+    (BUG-001) — the unprovided secret and configuration fields are preserved
+    by the route's server-side merge, since the registry owns the decrypted
+    storage. An empty body is rejected. Coherence (per-source-type required
+    fields) is validated on the MERGED entity server-side, after the merge —
+    not on the partial body alone.
 
     The server ``name`` is taken from the URL path, not the body.
     """
+
+    url: str | None = None
+    headers: dict[str, str] | None = None
+    env: dict[str, str] | None = None
+    auth_token: str | None = None
+    source_type: str | None = None
+    openapi_url: str | None = None
+
+    @model_validator(mode="after")
+    def _at_least_one_field(self) -> Self:
+        """Reject a genuinely empty update body.
+
+        Raises:
+            ValueError: If no editable field was provided.
+        """
+        if not self.model_fields_set:
+            raise ValueError("provide at least one editable field")
+        return self
 
 
 class McpServerValidateResponse(BaseModel):
     """Response body for the validate endpoint."""
 
     tool_count: int
+
+
+#: Controlled coherence messages (stable, non-sensitive — safe to surface to
+#: REST and MCP clients; never embed request payloads or secrets).
+_COHERENCE_EXTERNAL_URL_REQUIRED = "'url' is required when source_type='external'"
+_COHERENCE_OPENAPI_URL_REQUIRED = "'openapi_url' is required when source_type='openapi'"
+
+
+def _validate_merged_spec(
+    *, url: str | None, openapi_url: str | None, source_type: str
+) -> None:
+    """Validate per-source-type coherence on the MERGED server spec.
+
+    Raises:
+        HTTPException: 422 with the controlled coherence message — the same
+            wording as the create validator, always non-sensitive.
+    """
+    invalid = source_type == "openapi" and not openapi_url
+    invalid = invalid or (source_type != "openapi" and not url)
+    if invalid:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=[
+                {
+                    "type": "value_error",
+                    "loc": ["body"],
+                    "msg": f"Value error, {_COHERENCE_OPENAPI_URL_REQUIRED if source_type == 'openapi' else _COHERENCE_EXTERNAL_URL_REQUIRED}",
+                }
+            ],
+        )
 
 
 def _mask(entry: RegisteredMcpServer) -> RegisteredMcpServer:
@@ -258,34 +313,43 @@ async def reveal_mcp_server(
 async def update_mcp_server(
     name: str,
     body: McpServerUpdateRequest,
+    get_use_case: Annotated[
+        GetMcpServerUseCase, Depends(get_get_mcp_server_use_case)
+    ],
     use_case: Annotated[
         UpdateMcpServerUseCase, Depends(get_update_mcp_server_use_case)
     ],
 ) -> RegisteredMcpServer:
-    """Update an existing registered MCP server (secrets masked in response).
+    """Update an existing registered MCP server (PARTIAL, secrets masked in response).
+
+    Only the explicitly provided fields change; every unprovided field
+    (including the stored ``auth_token``, ``headers`` and ``env``) is
+    preserved from the existing entry — the registry is the single owner of
+    the decrypted storage and the only place where a secret-preserving merge
+    is possible (BUG-001). ``tool_count`` is inherited from the existing entry
+    and refreshed by the update use case when it re-validates (BUG-003).
 
     Args:
         name: The unique server name (from the URL path).
-        body: The request body with updated server configuration.
+        body: The PARTIAL request body (provided fields only).
+        get_use_case: Injected get use case (reads the decrypted entry).
         use_case: Injected update use case.
 
     Returns:
         The updated registered server entry with secrets stripped.
+
+    Raises:
+        HTTPException: 404 when the entry does not exist; 422 when the merged
+            specification is incoherent (controlled, non-sensitive detail).
     """
-    now = datetime.now(UTC)
-    entry = RegisteredMcpServer(
-        name=name,
-        transport=McpTransportType.HTTP,
-        url=body.url,
-        headers=body.headers,
-        env=body.env,
-        auth_token=body.auth_token,
-        source_type=body.source_type,
-        openapi_url=body.openapi_url,
-        created_at=now,
-        updated_at=now,
+    existing = await get_use_case.execute(name)
+    merged = existing.model_copy(update=body.model_dump(exclude_unset=True))
+    _validate_merged_spec(
+        url=merged.url,
+        openapi_url=merged.openapi_url,
+        source_type=str(merged.source_type),
     )
-    updated = await use_case.execute(name, entry)
+    updated = await use_case.execute(name, merged)
     return _mask(updated)
 
 

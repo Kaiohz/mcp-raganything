@@ -710,3 +710,97 @@ class TestDeleteMcpServerRoute:
 
         # Assert
         assert resp.status_code == 404
+
+
+class TestPartialUpdateMergeContract:
+    """BUG-001/BUG-002/BUG-003 regression tests: PUT /{name} is a PARTIAL update.
+
+    Only the provided fields change; unprovided secrets/configuration are
+    preserved from the decrypted existing entry (the registry owns the merge),
+    and ``tool_count`` is inherited instead of being reset to 0.
+    """
+
+    async def test_partial_update_preserves_unspecified_secret_fields(
+        self, client: AsyncClient, mock_get_use_case: AsyncMock, mock_update_use_case: AsyncMock
+    ):
+        # Arrange — the existing entry carries secrets; the body sends ONLY url
+        existing = _entry("web-search", auth_token="keep-secret-token")
+        existing = existing.model_copy(
+            update={"headers": {"X-K": "keep-v"}, "env": {"E": "keep-v"}, "tool_count": 4}
+        )
+        mock_get_use_case.execute = AsyncMock(return_value=existing)
+        body = {"url": "http://new:3001/mcp"}
+
+        # Act
+        resp = await client.put(f"{BASE_URL}/web-search", json=body)
+
+        # Assert — the merged entity handed to the update use case preserves
+        # every unprovided field, including the plaintext secrets.
+        assert resp.status_code == 200
+        merged = mock_update_use_case.execute.call_args.args[1]
+        assert merged.url == "http://new:3001/mcp"
+        assert merged.auth_token == "keep-secret-token"
+        assert merged.headers == {"X-K": "keep-v"}
+        assert merged.env == {"E": "keep-v"}
+        assert merged.tool_count == 4
+
+    async def test_tool_count_is_not_reset_to_zero(self, client, mock_get_use_case: AsyncMock, mock_update_use_case: AsyncMock):
+        # Arrange — url UNCHANGED (no re-validation): tool_count must be inherited
+        existing = _entry("web-search", tool_count=6)
+        mock_get_use_case.execute = AsyncMock(return_value=existing)
+        body = {"headers": {"X-Updated": "v"}}
+
+        # Act
+        resp = await client.put(f"{BASE_URL}/web-search", json=body)
+
+        # Assert
+        assert resp.status_code == 200
+        merged = mock_update_use_case.execute.call_args.args[1]
+        assert merged.tool_count == 6, "an unchanged-url update must not reset tool_count"
+
+    async def test_provided_map_fields_replace_the_stored_maps(
+        self, client, mock_get_use_case: AsyncMock, mock_update_use_case: AsyncMock
+    ):
+        # Arrange — headers/env provided in the body REPLACE the stored maps
+        existing = _entry("web-search")
+        existing = existing.model_copy(
+            update={"headers": {"X-Old": "old"}, "env": {"OLD": "old"}, "tool_count": 2}
+        )
+        mock_get_use_case.execute = AsyncMock(return_value=existing)
+        body = {"headers": {"X-New": "new"}, "env": {"NEW": "new"}}
+
+        # Act
+        resp = await client.put(f"{BASE_URL}/web-search", json=body)
+
+        # Assert
+        assert resp.status_code == 200
+        merged = mock_update_use_case.execute.call_args.args[1]
+        assert merged.headers == {"X-New": "new"}
+        assert merged.env == {"NEW": "new"}
+
+    async def test_incoherent_merged_body_returns_422_with_actionable_message(
+        self, client, mock_get_use_case: AsyncMock, mock_update_use_case: AsyncMock
+    ):
+        # Arrange — the merged result loses its url for an external server
+        existing = _entry("web-search")
+        mock_get_use_case.execute = AsyncMock(return_value=existing)
+        mock_update_use_case.execute = AsyncMock(return_value=existing)
+
+        # Act
+        resp = await client.put(f"{BASE_URL}/web-search", json={"headers": {"X-Only": "v"}, "url": None})
+
+        # Assert — stable, actionable, non-sensitive message (BUG-002)
+        assert resp.status_code == 422
+        messages = {issue.get("msg", "") for issue in resp.json()["detail"]}
+        assert any("'url' is required when source_type='external'" in msg for msg in messages)
+        mock_update_use_case.execute.assert_not_awaited()
+
+    async def test_empty_body_is_rejected_422(self, client, mock_get_use_case: AsyncMock):
+        # Arrange
+        body: dict = {}
+
+        # Act
+        resp = await client.put(f"{BASE_URL}/web-search", json=body)
+
+        # Assert
+        assert resp.status_code == 422
