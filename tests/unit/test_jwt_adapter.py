@@ -377,3 +377,36 @@ class TestJwtAdapter:
 
         # Assert
         assert result is None
+
+
+class TestJwtAudiencesMerge:
+    """REQ-003-equivalent: ``JWT_AUDIENCES`` is merged into the legacy single
+    ``JWT_AUDIENCE`` (deduplicated, legacy value first) by ``_merge_audiences``
+    — the parity contract the behavioral suite pins end-to-end, pinned here
+    directly so the merge order can never regress."""
+
+    def test_legacy_value_comes_first_and_duplicates_are_dropped(self) -> None:
+        merged = JwtAdapter._merge_audiences(
+            "aud-a", ["aud-b", "aud-a", "aud-c", "aud-a"]
+        )
+        assert merged == ["aud-a", "aud-b", "aud-c"]
+
+    def test_blank_entries_are_dropped(self) -> None:
+        """The empty string is dropped; whitespace entries stay (the CSV
+        env parsing strips them before the adapter ever sees them)."""
+        assert JwtAdapter._merge_audiences("aud-a", ["", "aud-b", "aud-b"]) == [
+            "aud-a",
+            "aud-b",
+        ]
+
+    def test_audiences_only(self) -> None:
+        assert JwtAdapter._merge_audiences("", ["aud-b", "aud-c"]) == [
+            "aud-b",
+            "aud-c",
+        ]
+
+    def test_audiences_none_falls_back_to_legacy_only(self) -> None:
+        assert JwtAdapter._merge_audiences("aud-a", None) == ["aud-a"]
+
+    def test_neither_value_gives_the_empty_list(self) -> None:
+        assert JwtAdapter._merge_audiences("", []) == []

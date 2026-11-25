@@ -372,3 +372,126 @@ class TestVerifyApiKeyBackwardCompat:
         assert security.verify_api_key(api_key_header=_MASTER_KEY) == _MASTER_KEY
         with pytest.raises(InvalidApiKeyError):
             security.verify_api_key(api_key_header="wrong")
+
+
+# ---------------------------------------------------------------------------
+# 5. Defense-in-depth handshake (code-review M-2): the middleware reuses the
+#    guard's verified principal for the SAME request's credential instead of
+#    re-deriving it — one DB lookup / one JWT verification per HTTP request.
+# ---------------------------------------------------------------------------
+
+
+class TestCachedAuthHandshake:
+    """The request-scoped cache written by ``authenticate_headers`` (the
+    seam the HTTP-level guard calls) lets ``_check_api_key`` short-circuit
+    when the presented credential is the one the guard already verified; a
+    DIFFERENT credential never short-circuits (defense-in-depth preserved)."""
+
+    def _middleware(self, auth_service: AsyncMock) -> "McpApiKeyMiddleware":
+        from security import McpApiKeyMiddleware
+
+        middleware = McpApiKeyMiddleware(master_key=_MASTER_KEY)
+        middleware.set_auth_service(auth_service)  # type: ignore[arg-type]
+        return middleware
+
+    def _tool_context(self):
+        from fastmcp.server.middleware import MiddlewareContext
+        from mcp.types import CallToolRequest, CallToolRequestParams
+
+        message = CallToolRequest(params=CallToolRequestParams(name="t", arguments={}))
+        return MiddlewareContext(message=message, method="tools/call")
+
+    async def _run_call_tool(self, middleware, call_next=None):
+        from fastapi import Request as FastAPIRequest
+        from fastmcp.server.dependencies import (
+            _current_http_request,  # pyright: ignore[reportPrivateImportUsage]
+        )
+
+        async def _next(_ctx):
+            return "ok"
+
+        scope = {"type": "http", "method": "POST", "headers": [], "path": "/"}
+        token = _current_http_request.set(FastAPIRequest(scope))
+        try:
+            return await middleware(self._tool_context(), call_next or _next)
+        finally:
+            _current_http_request.reset(token)
+
+    async def test_skips_reverification_when_the_guard_cached_the_same_credential(self):
+        svc = _make_auth_service_mock(api_key_user_id="user-alice")
+        mw = self._middleware(svc)
+
+        # The HTTP guard's pass: authenticates + caches the verified context.
+        ctx = await mw.authenticate_headers(None, "key-alice")
+        assert ctx is not None and ctx.user_id == "user-alice"
+        svc.authenticate.reset_mock()
+
+        # The middleware's defense-in-depth pass on the SAME request.
+        with patch(
+            "security.get_http_headers", return_value={"x-api-key": "key-alice"}
+        ):
+            result = await self._run_call_tool(mw)
+
+        assert result == "ok"
+        assert svc.authenticate.await_count == 0, (
+            "the middleware must NOT re-verify a credential the guard already "
+            "verified on this request (single authentication per request)"
+        )
+
+    async def test_foreign_credential_is_never_short_circuited(self):
+        """A credential different from the cached one keeps the FULL
+        re-verification: cross-request/session staleness can never be
+        short-circuited into another user's principal."""
+        svc = _make_auth_service_mock(
+            jwt_user_id="user-bob", api_key_user_id="user-alice"
+        )
+        mw = self._middleware(svc)
+
+        # The guard verified ALICE's API key on her request (cached).
+        ctx = await mw.authenticate_headers(None, "key-alice")
+        assert ctx is not None
+        svc.authenticate.reset_mock()
+
+        # BOB's tool call presents a DIFFERENT credential.
+        with patch(
+            "security.get_http_headers",
+            return_value={"authorization": "Bearer jwt-bob"},
+        ):
+            result = await self._run_call_tool(mw)
+
+        assert result == "ok"
+        svc.authenticate.assert_awaited_once()
+
+    async def test_no_cached_context_keeps_the_full_verification(self):
+        """A path NOT covered by the HTTP guard (no cached context yet) keeps
+        the middleware as the authenticator exactly as before."""
+        svc = _make_auth_service_mock(api_key_user_id="user-api-2")
+        mw = self._middleware(svc)
+        svc.authenticate.reset_mock()
+
+        with patch("security.get_http_headers", return_value={"x-api-key": "cpk_yyy"}):
+            result = await self._run_call_tool(mw)
+
+        assert result == "ok"
+        svc.authenticate.assert_awaited_once()
+
+    async def test_bearer_takes_precedence_for_the_cached_match(self):
+        """The presented-credential extraction mirrors the AuthService
+        precedence: a Bearer token wins over a colliding X-API-Key."""
+        svc = _make_auth_service_mock(jwt_user_id="user-jwt")
+        mw = self._middleware(svc)
+
+        await mw.authenticate_headers("Bearer my-jwt", "key-alice")
+        svc.authenticate.reset_mock()
+
+        with patch(
+            "security.get_http_headers",
+            return_value={"authorization": "Bearer my-jwt", "x-api-key": "key-bob"},
+        ):
+            result = await self._run_call_tool(mw)
+
+        assert result == "ok"
+        assert svc.authenticate.await_count == 0, (
+            "the Bearer token is the presented credential in the AuthService "
+            "order — a matching cached context short-circuits"
+        )

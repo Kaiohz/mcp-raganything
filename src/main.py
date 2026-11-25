@@ -167,10 +167,19 @@ mcp_classical.add_middleware(mcp_middleware)
 mcp_web.add_middleware(mcp_middleware)
 mcp_memories.add_middleware(mcp_middleware)
 
-mcp_files_app = mcp_files.http_app(path="/")
-mcp_classical_app = mcp_classical.http_app(path="/")
-mcp_web_app = mcp_web.http_app(path="/")
-mcp_memories_app = mcp_memories.http_app(path="/")
+# STATELESS transport (CRITICAL fix, code-review C-1): each HTTP request — and
+# the MCP tool task it dispatches — runs under its OWN task context, so the
+# RLS contextvars the HTTP guard sets on the ACCEPTED request's principal are
+# the ones the tool sees. In the fastmcp-default STATEFUL mode the tool task
+# inherits the SESSION CREATOR's context instead (a stale principal from an
+# earlier request — an actual cross-user isolation hazard when the
+# method-level middleware is not re-deriving it). Do NOT rely on the global
+# FASTMCP_STATELESS_HTTP env var: the fastmcp default is stateful, and the
+# prod configmap only sets it incidentally.
+mcp_files_app = mcp_files.http_app(path="/", stateless_http=True)
+mcp_classical_app = mcp_classical.http_app(path="/", stateless_http=True)
+mcp_web_app = mcp_web.http_app(path="/", stateless_http=True)
+mcp_memories_app = mcp_memories.http_app(path="/", stateless_http=True)
 
 
 def build_mcp_guard_stack(inner_app: ASGIApp, mount_path: str) -> ASGIApp:
@@ -180,14 +189,18 @@ def build_mcp_guard_stack(inner_app: ASGIApp, mount_path: str) -> ASGIApp:
     delegating to the wired dual-auth wiring (Bearer JWT + X-API-Key, RLS
     contextvars) and answering unauthenticated requests with HTTP 401 + the
     OAuth2 discovery challenge BEFORE any MCP method runs — then
-    ``McpTransportSecurityGuard`` — the explicit
-    ``TransportSecuritySettings`` host/origin validation (foreign Host → 421,
-    DNS-rebinding protection ENABLED) — then the FastMCP ``http_app``.
+    ``McpTransportSecurityGuard`` — the explicit ``TransportSecuritySettings``
+    validation (Host allow-list — foreign Host → 421 — plus the Origin
+    allow-list mirroring the app's CORS policy, M-1) — then the FastMCP
+    ``http_app`` (STATELESS, so the guard's per-request RLS principal is the
+    one the tool task inherits, code-review C-1).
 
     Host/origin lists are read from ``app_config`` at REQUEST time so the
     configmap stays authoritative without a rebuild. The inner
     ``McpApiKeyMiddleware`` (already mounted on every FastMCP server) stays
-    as defense-in-depth behind the HTTP guard.
+    as defense-in-depth behind the HTTP guard: it reuses the guard's
+    verified principal for the same request's credential instead of
+    re-deriving it (single authentication per HTTP request, M-2).
 
     Args:
         inner_app: The FastMCP ``http_app`` to guard.
@@ -330,9 +343,40 @@ async def _close_startup_resources() -> None:
         await _mcp_pool.close()
 
 
+def _log_mcp_discovery_shape_warnings() -> None:
+    """Log (non-fatal) the MCP OAuth2 discovery-configuration shape.
+
+    Mirrors composable-agents' ``_log_mcp_discovery_shape_warnings`` (M-3):
+    a silent misconfiguration becomes a visible startup warning. The
+    metadata document only advertises an issuer/origin a PUBLIC MCP client
+    can reach: NOTHING advertised (both ``MCP_AUTHORIZATION_SERVER`` and
+    ``LOGTO_URL`` empty — this repo resolves the issuer inline at the
+    well-known route instead of a config model-validator) and a non-https
+    authorization server are warned for QA BUG-003; a non-https
+    ``MCP_PUBLIC_BASE_URL`` origin is warned for NEW-1 (a scheme-less value
+    already REFUSES startup in ``AppConfig._validate_mcp_public_base_url``).
+    """
+    if not app_config.MCP_AUTHORIZATION_SERVER and not app_config.LOGTO_URL:
+        logger.warning(LogMessage.MCP_AUTHORIZATION_SERVER_NOT_ADVERTISED)
+    elif app_config.MCP_AUTHORIZATION_SERVER and not (
+        app_config.MCP_AUTHORIZATION_SERVER.startswith("https://")
+    ):
+        logger.warning(
+            LogMessage.MCP_AUTHORIZATION_SERVER_NOT_HTTPS,
+            app_config.MCP_AUTHORIZATION_SERVER,
+        )
+    if app_config.MCP_PUBLIC_BASE_URL and not (
+        app_config.MCP_PUBLIC_BASE_URL.startswith("https://")
+    ):
+        logger.warning(LogMessage.MCP_PUBLIC_BASE_URL_NOT_HTTPS)
+
+
 @asynccontextmanager
 async def combined_lifespan(app: FastAPI):
     """Combine database lifecycle with MCP lifespans and registry rehydration."""
+    # --- MCP OAuth2 discovery config shape warnings (M-3/QA BUG-003) ---
+    _log_mcp_discovery_shape_warnings()
+
     # --- Alembic migrations: own the mcp_servers table schema ---
     # Runs unconditionally (the schema must exist even if the registry is
     # disabled). Runs in a worker thread because Alembic's online mode drives
@@ -473,6 +517,20 @@ async def oauth_protected_resource(request: Request) -> Response:
 
 
 # --- Protected MCP mounts (feat-mcp-oauth2-dual-auth) --------------------------
+#
+# PRODUCTION PREREQUISITE (code-review M-4, deliberately DEFERRED to the flux
+# wave-4 slice — no repo code change here): for this feature to be ALIVE in
+# production, `flux/prd/composables/raganything/configmap.yaml` MUST carry
+#   MCP_ALLOWED_HOSTS: "raganything.soludev.tech,127.0.0.1:*,localhost:*,[::1]:*"
+#   MCP_PUBLIC_BASE_URL: "https://raganything.soludev.tech"
+#   MCP_AUTHORIZATION_SERVER: "https://logto.soludev.tech/oidc"
+#   JWT_AUDIENCES: "<logto-opencode-app-id>"
+# and `flux/prd/composables/raganything/ingressroute.yaml` MUST add the
+# `PathPrefix(/.well-known)` public route (no forwardAuth) and the
+# `HeaderRegexp(Authorization, ^Bearer )` direct-backend route (priority 90),
+# mirroring the composable-agents slice. Without them every MCP request
+# answers 421 (localhost-only default list) and the 401 carries no
+# WWW-Authenticate challenge — see the review addendum.
 #
 # The HTTP-level guard stack (auth 401 + discovery challenge, then explicit
 # transport security) authenticates EVERY request — including ``initialize`` —

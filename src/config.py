@@ -5,7 +5,7 @@ from typing import Annotated
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
 from dotenv import load_dotenv
-from pydantic import Field, PrivateAttr, ValidationInfo, model_validator
+from pydantic import Field, PrivateAttr, model_validator
 from pydantic import field_validator as pydantic_field_validator
 from pydantic_settings import BaseSettings, NoDecode
 
@@ -38,6 +38,22 @@ def _is_json_style_list_value(stripped: str) -> bool:
     return '"' in stripped or "'" in stripped or stripped.startswith("{")
 
 
+def _json_punctuated_entry(part: str) -> bool:
+    """Whether ONE split CSV entry still carries JSON punctuation.
+
+    Review rule (C-2 hardening): a partially-JSON value like ``'[a, b]'``
+    carries no quote/brace on the WHOLE string, so the pre-split check passes
+    and the split produces entries that match nothing (silent outage). A
+    post-split entry is refused when it still carries a quote character
+    anywhere, a ``{`` at its start, or a ``[`` at its start WITHOUT a colon
+    (the only bracket-wrapped values a host list may contain are the
+    ``[...:...]`` IPv6 literals — a JSON array fragment never has the colon).
+    """
+    if '"' in part or "'" in part or part.startswith("{"):
+        return True
+    return part.startswith("[") and ":" not in part
+
+
 def _json_style_list_error(field_name: str, value: str) -> str:
     """Build the refusal message for a JSON-style CSV env value."""
     return (
@@ -47,6 +63,59 @@ def _json_style_list_error(field_name: str, value: str) -> str:
         "JSON-written value stays ONE entry that matches nothing (silent auth "
         "failures; HTTP 421 for every MCP request)"
     )
+
+
+def _coerce_csv_list_value(
+    value: object, *, field_name: str, refuse_empty: bool
+) -> object:
+    """Coerce one comma-separated env-string setting into a list.
+
+    Already-parsed lists pass through; absent values keep the field default
+    (handled before the validators run — a ``None`` never reaches here).
+
+    Args:
+        value: The raw value (env string, Python list, or anything else that
+            passes through unchanged).
+        field_name: The setting name used in the refusal messages.
+        refuse_empty: ``True`` for ``MCP_ALLOWED_HOSTS`` (an empty allow-list
+            421s every MCP request with DNS-rebinding protection ENABLED —
+            fail fast at startup instead); ``False`` for the list settings
+            that tolerate empty (``JWT_AUDIENCES``, ``MCP_ALLOWED_ORIGINS``).
+
+    Returns:
+        The parsed list of stripped entries, or the value unchanged.
+    """
+    if isinstance(value, list):
+        if not value and refuse_empty:
+            raise ValueError(_EMPTY_MCP_ALLOWED_HOSTS_MESSAGE)
+        return value
+    if isinstance(value, str):
+        return _coerce_csv_string_value(
+            value, field_name=field_name, refuse_empty=refuse_empty
+        )
+    return value
+
+
+def _coerce_csv_string_value(
+    value: str, *, field_name: str, refuse_empty: bool
+) -> list[str]:
+    """Coerce one CSV string into stripped, non-blank entries.
+
+    Refusals (fail fast at startup instead of a silent outage):
+    * a JSON-style WHOLE value (see :func:`_is_json_style_list_value`);
+    * an entry still carrying JSON punctuation after the split (a partially
+      JSON value like ``'[a, b]'`` also matches nothing silently).
+    """
+    stripped = value.strip()
+    if _is_json_style_list_value(stripped):
+        raise ValueError(_json_style_list_error(field_name, stripped))
+    parts = [part.strip() for part in value.split(",") if part.strip()]
+    if not parts and refuse_empty:
+        raise ValueError(_EMPTY_MCP_ALLOWED_HOSTS_MESSAGE)
+    punctuated = [part for part in parts if _json_punctuated_entry(part)]
+    if punctuated:
+        raise ValueError(_json_style_list_error(field_name, value))
+    return parts
 
 
 class AppConfig(BaseSettings):
@@ -146,36 +215,100 @@ class AppConfig(BaseSettings):
         "issuer advertised by the protected-resource metadata. Falls back to "
         "<LOGTO_URL>/oidc when unset.",
     )
+    # MCP transport-security Origin allow-list (comma-separated env var
+    # ``MCP_ALLOWED_ORIGINS``). The ``mcp`` SDK matches an Origin EXACTLY (no
+    # global wildcard): an empty SDK list rejects EVERY browser Origin. The
+    # MCP policy therefore defaults to the app CORS policy: an UNSET value
+    # inherits ``ALLOWED_ORIGINS``, and the CORS ``*`` wildcard is mirrored by
+    # not validating the Origin at all (M-1, browser-origin MCP clients).
+    MCP_ALLOWED_ORIGINS: Annotated[list[str], NoDecode] = Field(
+        default_factory=list,
+        description="MCP transport-security Origin allow-list, comma-separated "
+        "(M-1). Unset/empty → inherits ALLOWED_ORIGINS; a '*' entry mirrors the "
+        "CORS wildcard (Origin not validated); other entries are matched "
+        "exactly by the mcp SDK (an 'origin:*' port wildcard is also honoured).",
+    )
 
-    @pydantic_field_validator("JWT_AUDIENCES", "MCP_ALLOWED_HOSTS", mode="before")
+    @pydantic_field_validator("MCP_ALLOWED_HOSTS", mode="before")
     @classmethod
-    def _coerce_csv_list(cls, value: object, info: ValidationInfo) -> object:
-        """Coerce a comma-separated env string into a list (REQ-003/REQ-014).
+    def _coerce_host_list(cls, value: object) -> object:
+        """Coerce the ``MCP_ALLOWED_HOSTS`` CSV env value (REQ-014).
 
-        ``JWT_AUDIENCES`` / ``MCP_ALLOWED_HOSTS`` are authored as
-        comma-separated env values (never JSON); an already-parsed list passes
-        through unchanged and absent values fall back to the field default.
-
-        Refusals (fail fast at startup instead of a silent outage):
-        * a JSON-STYLE value (see :func:`_is_json_style_list_value`);
-        * an empty ``MCP_ALLOWED_HOSTS`` (env string or Python list) — with
-          DNS-rebinding protection ENABLED an empty allow-list 421s every MCP
-          request; ``JWT_AUDIENCES`` tolerates empty (legacy-only).
+        A present-but-empty allow-list REFUSES startup — with DNS-rebinding
+        protection ENABLED it would 421 every MCP request (silent outage).
         """
-        if isinstance(value, list):
-            if not value and info.field_name == "MCP_ALLOWED_HOSTS":
-                raise ValueError(_EMPTY_MCP_ALLOWED_HOSTS_MESSAGE)
-            return value
+        return _coerce_csv_list_value(
+            value, field_name="MCP_ALLOWED_HOSTS", refuse_empty=True
+        )
+
+    @pydantic_field_validator("JWT_AUDIENCES", mode="before")
+    @classmethod
+    def _coerce_audience_list(cls, value: object) -> object:
+        """Coerce the ``JWT_AUDIENCES`` CSV env value (REQ-003-equivalent).
+
+        Empty tolerates (legacy single-audience contract preserved).
+        """
+        return _coerce_csv_list_value(
+            value, field_name="JWT_AUDIENCES", refuse_empty=False
+        )
+
+    @pydantic_field_validator("MCP_ALLOWED_ORIGINS", mode="before")
+    @classmethod
+    def _coerce_origin_list(cls, value: object) -> object:
+        """Coerce the ``MCP_ALLOWED_ORIGINS`` CSV env value (M-1).
+
+        Empty tolerates (the field then inherits ``ALLOWED_ORIGINS``).
+        """
+        return _coerce_csv_list_value(
+            value, field_name="MCP_ALLOWED_ORIGINS", refuse_empty=False
+        )
+
+    @pydantic_field_validator("MCP_PUBLIC_BASE_URL", mode="before")
+    @classmethod
+    def _validate_mcp_public_base_url(cls, value: object) -> object:
+        """Validate + normalize ``MCP_PUBLIC_BASE_URL`` (M-3, mirrors the
+        composable-agents iter-4 validator).
+
+        The advertised origin is the pointer the whole OAuth2 discovery chain
+        starts from: a scheme-less value would publish a malformed
+        ``resource_metadata`` URL no MCP client can fetch (the chain breaks
+        SILENTLY), so a present value without an absolute ``http(s)://``
+        scheme REFUSES startup — the same present-but-invalid ⇒ refuse rule
+        as the sibling ``MCP_AUTHORIZATION_SERVER`` validator. Surrounding
+        whitespace and a trailing slash are stripped here (single
+        normalization source); a present ``http://`` value stays dev/QA-legal
+        and is warned at startup (``MCP_PUBLIC_BASE_URL_NOT_HTTPS``).
+        """
         if isinstance(value, str):
             stripped = value.strip()
-            if _is_json_style_list_value(stripped):
+            if stripped and not stripped.startswith(("http://", "https://")):
                 raise ValueError(
-                    _json_style_list_error(info.field_name or "", stripped)
+                    "MCP_PUBLIC_BASE_URL must be an absolute URL starting with "
+                    "https:// (e.g. 'https://raganything.soludev.tech') — a "
+                    "scheme-less value would advertise a malformed "
+                    "resource_metadata URL no MCP client can fetch"
                 )
-            parts = [part.strip() for part in value.split(",") if part.strip()]
-            if not parts and info.field_name == "MCP_ALLOWED_HOSTS":
-                raise ValueError(_EMPTY_MCP_ALLOWED_HOSTS_MESSAGE)
-            return parts
+            return stripped.rstrip("/")
+        return value
+
+    @pydantic_field_validator("MCP_AUTHORIZATION_SERVER", mode="before")
+    @classmethod
+    def _validate_mcp_authorization_server(cls, value: object) -> object:
+        """Reject a malformed explicit ``MCP_AUTHORIZATION_SERVER`` (M-3).
+
+        A blank value means "unset" (the logto-issuer fallback applies); a
+        present-but-NON-absolute value would advertise the malformed
+        ``["/oidc"]``-shaped issuer an MCP client cannot fetch — the same
+        present-but-invalid ⇒ refuse-startup rule as the other configuration
+        validators.
+        """
+        if isinstance(value, str):
+            value = value.strip()
+            if value and not value.startswith(("http://", "https://")):
+                raise ValueError(
+                    "MCP_AUTHORIZATION_SERVER must be an absolute URL starting "
+                    "with https:// (e.g. 'https://logto.soludev.tech/oidc')"
+                )
         return value
 
 

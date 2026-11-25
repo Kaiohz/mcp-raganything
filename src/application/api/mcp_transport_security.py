@@ -1,4 +1,4 @@
-"""Pure-ASGI MCP transport-security guard (REQ-014).
+"""Pure-ASGI MCP transport-security guard (REQ-014 / M-1).
 
 Applies an explicit ``mcp``-SDK
 :class:`~mcp.server.transport_security.TransportSecuritySettings` to each
@@ -6,17 +6,25 @@ FastMCP ``http_app`` — fastmcp 3.3.1 constructs its streamable transports
 WITHOUT any security settings (the SDK then disables DNS-rebinding
 protection by default), which let every non-localhost request Host through.
 This wrapper keeps DNS-rebinding protection ENABLED and lets only the
-configured allow-list through:
+configured allow-lists through:
 
 * a request Host in ``MCP_ALLOWED_HOSTS`` (exact, default-port ``:443`` /
   ``:80`` sibling, or ``host:*`` wildcard) passes;
 * a foreign Host is rejected with the SDK's own ``421 Invalid Host header``;
 * a POST without an ``application/json`` content type is rejected with the
   SDK's ``400 Invalid Content-Type header``;
-* an Origin header outside the allowed origin list is rejected with the
-  SDK's ``403``.
+* an Origin header outside the Origin allow-list is rejected with the SDK's
+  ``403 Invalid Origin header``.
 
-The host list is read from ``settings`` at REQUEST time (per-request
+Origin policy (M-1 — the SDK matches an Origin EXACTLY and has no global
+wildcard, so an empty ``allowed_origins`` rejects EVERY browser Origin,
+30/403-ing every browser-origin MCP client): the Origin allow-list comes
+from ``MCP_ALLOWED_ORIGINS`` falling back to the app's CORS policy
+(``ALLOWED_ORIGINS``). The CORS ``*`` wildcard cannot be expressed to the
+SDK, so it is translated into "do not validate the Origin" — the same
+semantic the CORS middleware applies.
+
+Both allow-lists are read from ``settings`` at REQUEST time (per-request
 ``TransportSecuritySettings`` construction is negligible and keeps the
 configmap authoritative), and plain-hostname entries are expanded with their
 default-port siblings so the SDK's exact Host matcher accepts
@@ -48,6 +56,10 @@ logger = logging.getLogger(__name__)
 #: siblings for (QA BUG-002).
 _PLAIN_HOSTNAME = re.compile(r"^[A-Za-z0-9._-]+$")
 
+#: The CORS-style wildcard: translated into "Origin not validated" (the SDK
+#: has no wildcard — see the module docstring).
+_ORIGIN_WILDCARD = "*"
+
 
 def _rejection_reason(response: Response) -> str:
     """Return a short, non-sensitive reason snippet from the SDK's response."""
@@ -55,13 +67,30 @@ def _rejection_reason(response: Response) -> str:
     return body.decode("latin-1", "replace").strip()[:120]
 
 
+def _scope_without_origin(scope: Scope) -> Scope:
+    """Return a copy of ``scope`` WITHOUT the ``Origin`` header.
+
+    The SDK's matcher has no wildcard mode: an empty ``allowed_origins``
+    rejects EVERY Origin, and a missing Origin is treated as same-origin and
+    always passes. Mirrors the app's own CORS policy ("*" = any origin).
+    """
+    copied = dict(scope)
+    copied["headers"] = [
+        (key, value)
+        for key, value in scope.get("headers", [])
+        if key.decode("latin-1").lower() != "origin"
+    ]
+    return copied
+
+
 class McpTransportSecurityGuard:
     """ASGI wrapper applying the SDK transport security to one FastMCP app.
 
     Args:
         app: The inner ASGI app (the FastMCP ``http_app``).
-        settings: The ``AppConfig`` instance; its ``MCP_ALLOWED_HOSTS``
-            attribute is read per request.
+        settings: The ``AppConfig`` instance; its ``MCP_ALLOWED_HOSTS``,
+            ``MCP_ALLOWED_ORIGINS`` and ``ALLOWED_ORIGINS`` attributes are
+            read per request.
     """
 
     def __init__(self, app: ASGIApp, settings: "AppConfig") -> None:
@@ -79,21 +108,39 @@ class McpTransportSecurityGuard:
         logger.warning(LogMessage.MCP_TRANSPORT_REJECTED, _rejection_reason(rejection))
         await rejection(scope, receive, send)
 
+    def _origin_wildcard(self, origins: list[str]) -> bool:
+        """Whether the configured Origin policy allows ANY browser origin.
+
+        A ``*`` entry (either in ``MCP_ALLOWED_ORIGINS`` or in the inherited
+        ``ALLOWED_ORIGINS`` CORS policy) mirrors the CORS wildcard semantics.
+        """
+        return _ORIGIN_WILDCARD in origins
+
     async def _validate(self, scope: Scope) -> Response | None:
         """Run the SDK's header validation; return the rejection or ``None``.
 
         A fresh ``TransportSecurityMiddleware`` per request keeps the
-        ``MCP_ALLOWED_HOSTS`` configmap authoritative at all times.
+        ``MCP_ALLOWED_HOSTS`` configmap authoritative at all times. The
+        Origin policy inherits the app CORS policy when the dedicated
+        ``MCP_ALLOWED_ORIGINS`` setting is unset (M-1).
         """
+        origins = list(
+            self._settings.MCP_ALLOWED_ORIGINS or self._settings.ALLOWED_ORIGINS
+        )
+        wildcard = self._origin_wildcard(origins)
         middleware = TransportSecurityMiddleware(
             TransportSecuritySettings(
                 enable_dns_rebinding_protection=True,
                 allowed_hosts=transport_allowed_hosts(
                     list(self._settings.MCP_ALLOWED_HOSTS)
                 ),
+                allowed_origins=[origin for origin in origins if origin],
             )
         )
-        request = Request(scope)
+        # A wildcard Origin policy is translated by stripping the Origin
+        # header before validation: the SDK treats a missing Origin as
+        # same-origin (always allowed) — the "*" semantic.
+        request = Request(_scope_without_origin(scope) if wildcard else scope)
         is_post = scope.get("method", "").upper() == "POST"
         return await middleware.validate_request(request, is_post=is_post)
 

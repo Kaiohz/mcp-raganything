@@ -42,11 +42,15 @@ API_KEY_KEY_ALICE = "key-alice"
 
 class TestHostAllowListEnforcement:
     @pytest.mark.parametrize("mount", MCP_MOUNTS)
-    async def test_production_host_is_accepted_no_421(self, http_client, mount, mcp_post):
+    async def test_production_host_is_accepted_no_421(
+        self, http_client, mount, mcp_post
+    ):
         """Host `raganything.soludev.tech` (in MCP_ALLOWED_HOSTS) reaches the
         MCP handshake — never 421."""
         resp = await mcp_post(
-            http_client, f"http://{PROD_HOST}{mount}/", headers={"X-API-Key": API_KEY_KEY_ALICE}
+            http_client,
+            f"http://{PROD_HOST}{mount}/",
+            headers={"X-API-Key": API_KEY_KEY_ALICE},
         )
         assert resp.status_code != 421, (
             f"Host {PROD_HOST} must be in MCP_ALLOWED_HOSTS — got 421: {resp.text!r}"
@@ -57,7 +61,9 @@ class TestHostAllowListEnforcement:
         )
 
     @pytest.mark.parametrize("mount", MCP_MOUNTS)
-    async def test_foreign_host_is_rejected_with_421(self, http_client, mount, mcp_post):
+    async def test_foreign_host_is_rejected_with_421(
+        self, http_client, mount, mcp_post
+    ):
         """DNS-rebinding protection stays ENABLED: an unknown Host → 421."""
         resp = await mcp_post(
             http_client,
@@ -75,7 +81,9 @@ class TestDefaultPortHostForms:
     matcher must still accept the DEFAULT-port suffixes for an allow-listed
     host while a foreign Host stays foreign."""
 
-    async def test_allowed_host_with_https_default_port_is_accepted(self, http_client, mcp_post):
+    async def test_allowed_host_with_https_default_port_is_accepted(
+        self, http_client, mcp_post
+    ):
         resp = await mcp_post(
             http_client,
             f"http://{PROD_HOST}:443/memories/mcp/",
@@ -86,7 +94,9 @@ class TestDefaultPortHostForms:
             f"proxy — got {resp.status_code}: {resp.text!r}"
         )
 
-    async def test_allowed_host_with_http_default_port_is_accepted(self, http_client, mcp_post):
+    async def test_allowed_host_with_http_default_port_is_accepted(
+        self, http_client, mcp_post
+    ):
         resp = await mcp_post(
             http_client,
             f"http://{PROD_HOST}:80/memories/mcp/",
@@ -108,4 +118,85 @@ class TestDefaultPortHostForms:
         assert resp.status_code == 421, (
             f"a foreign Host stays foreign with an explicit port — got "
             f"{resp.status_code}: {resp.text!r}"
+        )
+
+
+class TestOriginAllowList:
+    """code-review M-1 (regression): the SDK's Origin matcher is EXACT and
+    has no global wildcard — without the ``allowed_origins`` wiring, EVERY
+    browser-origin MCP request was 403'd. The Origin policy is
+    ``MCP_ALLOWED_ORIGINS`` falling back to the app CORS policy
+    (``ALLOWED_ORIGINS``); the CORS ``*`` wildcard is mirrored as "Origin
+    not validated" (the SDK treats a missing Origin as same-origin)."""
+
+    async def test_browser_origin_request_is_not_403ed(self, http_client, mcp_post):
+        """The deployed config shape (``ALLOWED_ORIGINS='["*"]'`` and no
+        dedicated MCP list): an Origin-bearing request must be ACCEPTED —
+        exactly what the app's own CORS policy allows. (Test env: both
+        settings unset/unpatched → the wildcard default.)"""
+        resp = await mcp_post(
+            http_client,
+            "/files/mcp/",
+            headers={
+                "X-API-Key": API_KEY_KEY_ALICE,
+                "Origin": "http://localhost:5173",
+            },
+        )
+        assert resp.status_code != 403, (
+            f"a browser-origin MCP request was rejected by the transport "
+            f"security: {resp.text!r}"
+        )
+        assert resp.status_code == 200, (
+            f"the Origin-bearing request must reach the MCP handshake, got "
+            f"{resp.status_code}: {resp.text!r}"
+        )
+
+    async def test_explicit_mcp_allowed_origins_accept_the_configured_origin(
+        self, http_client, mcp_post, monkeypatch
+    ):
+        """An explicit (non-wildcard) ``MCP_ALLOWED_ORIGINS`` list: the
+        configured Origin passes the SDK's exact matcher."""
+        import main
+
+        monkeypatch.setattr(
+            main.app_config,
+            "MCP_ALLOWED_ORIGINS",
+            ["http://composable-ui.soludev.tech"],
+        )
+        resp = await mcp_post(
+            http_client,
+            "/files/mcp/",
+            headers={
+                "X-API-Key": API_KEY_KEY_ALICE,
+                "Origin": "http://composable-ui.soludev.tech",
+            },
+        )
+        assert resp.status_code == 200, (
+            f"the configured Origin must be accepted (SDK exact match), got "
+            f"{resp.status_code}: {resp.text!r}"
+        )
+
+    async def test_explicit_mcp_allowed_origins_reject_a_foreign_origin(
+        self, http_client, mcp_post, monkeypatch
+    ):
+        """SDK semantics with an explicit list: a foreign Origin → 403
+        (DNS-rebinding protection covers browser-side rebinding too)."""
+        import main
+
+        monkeypatch.setattr(
+            main.app_config,
+            "MCP_ALLOWED_ORIGINS",
+            ["http://composable-ui.soludev.tech"],
+        )
+        resp = await mcp_post(
+            http_client,
+            "/files/mcp/",
+            headers={
+                "X-API-Key": API_KEY_KEY_ALICE,
+                "Origin": "http://evil-rebinder.example",
+            },
+        )
+        assert resp.status_code == 403, (
+            f"a foreign Origin must be rejected per the SDK semantics with an "
+            f"allow-listed Origin policy, got {resp.status_code}: {resp.text!r}"
         )

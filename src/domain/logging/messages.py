@@ -189,6 +189,34 @@ class LogMessage(StrEnum):
         "the request Host is not in MCP_ALLOWED_HOSTS — no discovery URL is advertised"
     )
     MCP_TRANSPORT_REJECTED = "MCP request rejected by transport security: %s"
+    # --- MCP OAuth2 discovery configuration shape (startup warnings, M-3 —
+    # mirrors the composable-agents QA BUG-003 / code-review NEW-1 pattern).
+    # The non-https messages deliberately do NOT interpolate the configured
+    # value: an operator may embed credentials in the URL.
+    MCP_AUTHORIZATION_SERVER_NOT_ADVERTISED = (
+        "MCP protected-resource metadata advertises NO authorization server: both "
+        "MCP_AUTHORIZATION_SERVER and LOGTO_URL are empty — MCP clients cannot complete "
+        "the OAuth2 discovery chain (REQ-002)"
+    )
+    MCP_AUTHORIZATION_SERVER_NOT_HTTPS = (
+        "MCP protected-resource metadata advertises the non-https authorization server '%s' "
+        "— a PUBLIC MCP client may not reach it (a container-internal LOGTO_URL fallback or "
+        "an explicit http value); set MCP_AUTHORIZATION_SERVER to the publicly reachable "
+        "issuer, e.g. https://logto.soludev.tech/oidc (QA BUG-003)"
+    )
+    MCP_PUBLIC_BASE_URL_NOT_HTTPS = (
+        "MCP discovery documents advertise a non-https public origin: MCP_PUBLIC_BASE_URL is an "
+        "http:// value — public MCP clients reach the resource over TLS; set the https:// public "
+        "origin, e.g. https://raganything.soludev.tech (a SCHEME-LESS value already refuses "
+        "startup). The configured value is never interpolated here on purpose: "
+        "an operator may embed credentials in the URL."
+    )
+
+    # --- Generated MCP runner (openapi_mcp) ---
+    MCP_EXACT_PATH_ROUTE_UNAVAILABLE = (
+        "MCP exact-path route unavailable for %s: the host app has no "
+        "router.routes list; the Mount-only 307 behavior applies"
+    )
 
     # --- MCP server registry (use cases / store / factory / runner) ---
     MCP_SERVER_CREATED_UC = "MCP server created (use case): name=%s tool_count=%d"

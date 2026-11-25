@@ -106,12 +106,15 @@ class GeneratedMcpRunner(GeneratedMcpRunnerPort):
         for mw in self._middleware:
             mcp.add_middleware(mw)
 
-        http_app = mcp.http_app(path="/")
+        http_app = mcp.http_app(path="/", stateless_http=True)
         # Apply the shared HTTP-level guard stack (auth + transport security)
         # when one is wired — the generated mounts get the SAME treatment as
         # the static /files, /classical, /web and /memories servers
         # (feat-mcp-oauth2-dual-auth, REQ-017). The FastMCP middleware stay
-        # mounted as defense-in-depth behind the HTTP guard.
+        # mounted as defense-in-depth behind the HTTP guard. STATELESS
+        # transport too (code-review C-1): the tool task inherits the
+        # per-request context, so the guard's RLS principal — not a stale
+        # session-creator principal — reaches the tool.
         mount_target = (
             self._guard_factory(http_app, f"/generated/{name}/mcp")
             if self._guard_factory is not None
@@ -186,9 +189,7 @@ class GeneratedMcpRunner(GeneratedMcpRunnerPort):
         routes = getattr(router, "routes", None) if router is not None else None
         if not isinstance(routes, list):
             logger.warning(
-                "Cannot add the exact-path route for %s: host app has no "
-                "router.routes list; the Mount-only 307 behavior applies.",
-                mount_path,
+                LogMessage.MCP_EXACT_PATH_ROUTE_UNAVAILABLE, mount_path
             )
             return
         routes.append(
