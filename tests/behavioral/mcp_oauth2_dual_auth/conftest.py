@@ -32,10 +32,25 @@ MCP_MOUNTS = ("/files/mcp", "/classical/mcp", "/web/mcp", "/memories/mcp")
 WELL_KNOWN_PATH = "/.well-known/oauth-protected-resource"
 LOGTO_ISSUER = "https://logto.soludev.tech/oidc"
 
-#: The expected 401 discovery challenge for the production Host.
-EXPECTED_WWW_AUTHENTICATE = (
-    f'Bearer resource_metadata="https://{PROD_HOST}{WELL_KNOWN_PATH}"'
-)
+
+def expected_www_authenticate_for(mount_path: str) -> str:
+    """The 401 discovery challenge pointing at ONE mount's own document.
+
+    QA BUG-002: each mount advertises its OWN per-mount
+    protected-resource document (``.well-known/oauth-protected-resource
+    <mount_path>``), never the canonical ``/files/mcp`` one.
+
+    Args:
+        mount_path: The mount path (e.g. ``/files/mcp`` or
+            ``/generated/{name}/mcp``).
+
+    Returns:
+        The expected ``WWW-Authenticate`` header value for the production Host.
+    """
+    return (
+        f'Bearer resource_metadata="https://{PROD_HOST}{WELL_KNOWN_PATH}{mount_path}"'
+    )
+
 
 #: The existing generic, non-enumerating 401 body (AuthenticationError →
 #: ErrorMessage.AUTH_INVALID_CREDENTIALS), unchanged by the feature.

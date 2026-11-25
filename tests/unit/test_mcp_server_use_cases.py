@@ -363,6 +363,30 @@ class TestCreateMcpServerUseCaseOpenApi:
         assert result.tool_count == 7
         mock_runner.count_tools.assert_awaited_once_with("petstore")
 
+    async def test_count_failure_falls_back_to_zero_and_still_persists(
+        self, use_case, mock_store, mock_factory, mock_runner
+    ):
+        """QA BUG-001: the count annotates an ALREADY-mounted, healthy
+        server — a count failure must neither fail the create nor leave the
+        mount unregistered (persisted with the 0 = unavailable convention)."""
+        # Arrange
+        mock_store.exists.return_value = False
+        mock_factory.fetch_spec.return_value = {"openapi": "3.0.3"}
+        mock_runner.mount.return_value = (
+            "http://raganything-api:8000/generated/petstore/mcp"
+        )
+        mock_runner.count_tools.side_effect = RuntimeError(
+            "Invalid or missing credentials"
+        )
+
+        # Act
+        result = await use_case.execute(_openapi_entry())
+
+        # Assert — create succeeds; the mounted server stays registered.
+        assert result.tool_count == 0
+        assert result.url == "http://raganything-api:8000/generated/petstore/mcp"
+        mock_store.save.assert_awaited_once()
+
     async def test_saves_entry_with_mounted_url_and_tool_count(
         self, use_case, mock_store, mock_factory, mock_runner
     ):
@@ -690,6 +714,31 @@ class TestUpdateMcpServerUseCaseOpenApi:
         # Assert
         assert result.created_at == original_created_at
         assert result.updated_at > original_created_at
+
+    async def test_count_failure_falls_back_to_zero_and_still_persists(
+        self, use_case, mock_store, mock_factory, mock_runner
+    ):
+        """QA BUG-001 (same guard as the create path): the count annotates an
+        ALREADY-mounted, healthy server — a count failure must neither fail
+        the update nor leave the mount unregistered."""
+        # Arrange
+        mock_store.get.return_value = _openapi_entry()
+        mock_factory.fetch_spec.return_value = {"openapi": "3.0.3"}
+        mock_runner.mount.return_value = (
+            "http://raganything-api:8000/generated/petstore/mcp"
+        )
+        mock_runner.count_tools.side_effect = RuntimeError(
+            "Invalid or missing credentials"
+        )
+        updated = _openapi_entry()
+
+        # Act
+        result = await use_case.execute("petstore", updated)
+
+        # Assert — update succeeds; the remounted server stays registered.
+        assert result.tool_count == 0
+        assert result.url == "http://raganything-api:8000/generated/petstore/mcp"
+        mock_store.save.assert_awaited_once()
 
 
 # =============================================================================

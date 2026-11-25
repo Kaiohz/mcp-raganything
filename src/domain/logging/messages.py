@@ -234,6 +234,13 @@ class LogMessage(StrEnum):
     MCP_RUNNER_MOUNTED = "Generated MCP server mounted: name=%s url=%s tool_count=%d"
     MCP_RUNNER_UNMOUNTED = "Generated MCP server unmounted: name=%s"
     MCP_RUNNER_MOUNT_FAILED = "Generated MCP server mount failed: name=%s error=%s"
+    MCP_RUNNER_LIFESPAN_CLOSE_FAILED = (
+        "Generated MCP lifespan close failed: name=%s error=%s"
+    )
+    MCP_TOOL_COUNT_FAILED = (
+        "Generated MCP tool count failed (the mounted server stays healthy): "
+        "name=%s error=%s"
+    )
     MCP_REHYDRATION_STARTED = "Rehydrating generated MCP servers from registry..."
     MCP_REHYDRATION_DONE = "Rehydration complete: mounted=%d skipped=%d"
     MCP_REHYDRATION_ENTRY_FAILED = (

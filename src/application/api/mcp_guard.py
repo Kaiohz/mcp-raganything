@@ -32,9 +32,13 @@ if TYPE_CHECKING:  # pragma: no cover — typing only, avoids a runtime import
 
 logger = logging.getLogger(__name__)
 
-#: Public OAuth2 protected-resource metadata document (MCP authorization
-#: spec 2025-06-18): the discovery target advertised by the 401 challenge and
-#: served by the public route wired in ``main.py`` (REQ-002-equivalent).
+#: Public OAuth2 protected-resource metadata documents (MCP authorization
+#: spec 2025-06-18, path-carrying discovery in the 2025-11-25 revision): the
+#: GLOBAL document lives at this path; each mount's OWN document lives at
+#: this path + the mount path (e.g.
+#: ``/.well-known/oauth-protected-resource/files/mcp``) — both served by the
+#: public routes wired in ``main.py`` and advertised by each mount's 401
+#: challenge (REQ-002-equivalent; per-mount pointers = QA BUG-002).
 WELL_KNOWN_PROTECTED_RESOURCE_PATH = "/.well-known/oauth-protected-resource"
 
 #: 401 response body — generic, non-enumerating (the centralized
@@ -129,21 +133,27 @@ def public_discovery_origin(
     return f"https://{_without_default_port(host)}"
 
 
-def www_authenticate_challenge(public_origin: str) -> str:
+def www_authenticate_challenge(public_origin: str, resource_path: str) -> str:
     """Build the MCP OAuth2 discovery challenge header value (REQ-001).
 
     Args:
         public_origin: The canonical public origin from
             :func:`public_discovery_origin` (scheme + host, no trailing
             slash) — never a raw, unvalidated request ``Host``.
+        resource_path: The mount path whose OWN per-mount protected-resource
+            document the challenge advertises (e.g. ``/files/mcp`` or
+            ``/generated/{name}/mcp``) — QA BUG-002: a client on each mount
+            must be pointed at a document advertising THAT mount's resource,
+            not the canonical ``/files/mcp`` one.
 
     Returns:
-        The ``WWW-Authenticate`` challenge pointing at the public
-        protected-resource metadata document.
+        The ``WWW-Authenticate`` challenge pointing at the mount's own
+        public protected-resource metadata document
+        (``.well-known/oauth-protected-resource<resource_path>``).
     """
     return (
         f'Bearer resource_metadata="{public_origin}'
-        f'{WELL_KNOWN_PROTECTED_RESOURCE_PATH}"'
+        f'{WELL_KNOWN_PROTECTED_RESOURCE_PATH}{resource_path}"'
     )
 
 
@@ -237,7 +247,11 @@ class McpAuthGuard:
         if origin is None:
             logger.warning(LogMessage.MCP_DISCOVERY_ORIGIN_UNAVAILABLE)
             return None
-        return www_authenticate_challenge(origin)
+        # QA BUG-002: each mount advertises ITS OWN per-mount document
+        # (/.well-known/oauth-protected-resource<mount_path>), so a client
+        # connecting to e.g. /web/mcp is told to request a token for
+        # /web/mcp — not for the canonical /files/mcp resource.
+        return www_authenticate_challenge(origin, self._mount_path)
 
     @staticmethod
     async def _send_unauthorized(send: Send, www_authenticate: str | None) -> None:

@@ -29,22 +29,29 @@ from mcp.shared.exceptions import McpError
 
 pytestmark = pytest.mark.asyncio(loop_scope="session")
 
-#: The expected 401 discovery challenge / generic 401 body (REQ-010/REQ-001).
-EXPECTED_WWW_AUTHENTICATE = (
-    'Bearer resource_metadata="https://raganything.soludev.tech'
-    '/.well-known/oauth-protected-resource"'
-)
+#: The per-mount 401 discovery challenge / generic 401 body (REQ-010/REQ-001;
+#: QA BUG-002 — each mount points at its OWN per-mount protected-resource
+#: document, so the challenge is derived from the probed mount).
+WELL_KNOWN_PATH = "/.well-known/oauth-protected-resource"
+PROD_HOST = "raganything.soludev.tech"
 GENERIC_401_BODY = {"detail": "Invalid or missing credentials"}
 #: Accepted credentials from the root ``auth_directory`` external doubles.
 API_KEY_KEY_ALICE = "key-alice"
 
 
-def assert_unauthorized_with_challenge(resp) -> None:
+def expected_www_authenticate_for(mount: str) -> str:
+    """The 401 challenge pointing at ONE mount's own discovery document."""
+    return f'Bearer resource_metadata="https://{PROD_HOST}{WELL_KNOWN_PATH}{mount}"'
+
+
+def assert_unauthorized_with_challenge(resp, mount: str) -> None:
     assert resp.status_code == 401, (
         f"expected HTTP 401, got {resp.status_code} with body {resp.text!r}"
     )
-    assert resp.headers.get("www-authenticate") == EXPECTED_WWW_AUTHENTICATE, (
-        f"401 must carry the discovery challenge, got: "
+    assert resp.headers.get("www-authenticate") == expected_www_authenticate_for(
+        mount
+    ), (
+        f"401 must carry the MOUNT-SPECIFIC discovery challenge, got: "
         f"{resp.headers.get('www-authenticate')!r}"
     )
     assert resp.json() == GENERIC_401_BODY, (
@@ -67,7 +74,7 @@ class TestInvalidJwtNeverFallsBackToApiKey:
                 "X-API-Key": API_KEY_KEY_ALICE,
             },
         )
-        assert_unauthorized_with_challenge(resp)
+        assert_unauthorized_with_challenge(resp, "/files/mcp")
 
     @pytest.mark.parametrize("mount", ["/classical/mcp", "/web/mcp", "/memories/mcp"])
     async def test_no_fallback_contract_covers_every_mount(
@@ -81,7 +88,7 @@ class TestInvalidJwtNeverFallsBackToApiKey:
                 "X-API-Key": API_KEY_KEY_ALICE,
             },
         )
-        assert_unauthorized_with_challenge(resp)
+        assert_unauthorized_with_challenge(resp, mount)
 
 
 class TestApiKeyFlowRegressionPins:
@@ -94,7 +101,7 @@ class TestApiKeyFlowRegressionPins:
             "/files/mcp",
             headers={"X-API-Key": "key_unknown_never_issued"},
         )
-        assert_unauthorized_with_challenge(resp)
+        assert_unauthorized_with_challenge(resp, "/files/mcp")
 
     async def test_no_longer_active_api_key_is_rejected(self, mcp_list):
         """A key whose hash no longer resolves as ACTIVE (revoked) is

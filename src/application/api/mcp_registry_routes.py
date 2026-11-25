@@ -313,9 +313,7 @@ async def reveal_mcp_server(
 async def update_mcp_server(
     name: str,
     body: McpServerUpdateRequest,
-    get_use_case: Annotated[
-        GetMcpServerUseCase, Depends(get_get_mcp_server_use_case)
-    ],
+    get_use_case: Annotated[GetMcpServerUseCase, Depends(get_get_mcp_server_use_case)],
     use_case: Annotated[
         UpdateMcpServerUseCase, Depends(get_update_mcp_server_use_case)
     ],

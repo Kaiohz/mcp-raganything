@@ -44,7 +44,7 @@ GENERATED_NAME = "probe-petstore"
 GENERATED_MOUNT = f"/generated/{GENERATED_NAME}/mcp"
 EXPECTED_WWW_AUTHENTICATE = (
     f'Bearer resource_metadata="https://{PROD_HOST}'
-    f'/.well-known/oauth-protected-resource"'
+    f'/.well-known/oauth-protected-resource{GENERATED_MOUNT}"'
 )
 GENERIC_401_BODY = {"detail": "Invalid or missing credentials"}
 

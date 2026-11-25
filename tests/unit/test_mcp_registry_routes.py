@@ -721,12 +721,19 @@ class TestPartialUpdateMergeContract:
     """
 
     async def test_partial_update_preserves_unspecified_secret_fields(
-        self, client: AsyncClient, mock_get_use_case: AsyncMock, mock_update_use_case: AsyncMock
+        self,
+        client: AsyncClient,
+        mock_get_use_case: AsyncMock,
+        mock_update_use_case: AsyncMock,
     ):
         # Arrange — the existing entry carries secrets; the body sends ONLY url
         existing = _entry("web-search", auth_token="keep-secret-token")
         existing = existing.model_copy(
-            update={"headers": {"X-K": "keep-v"}, "env": {"E": "keep-v"}, "tool_count": 4}
+            update={
+                "headers": {"X-K": "keep-v"},
+                "env": {"E": "keep-v"},
+                "tool_count": 4,
+            }
         )
         mock_get_use_case.execute = AsyncMock(return_value=existing)
         body = {"url": "http://new:3001/mcp"}
@@ -744,7 +751,9 @@ class TestPartialUpdateMergeContract:
         assert merged.env == {"E": "keep-v"}
         assert merged.tool_count == 4
 
-    async def test_tool_count_is_not_reset_to_zero(self, client, mock_get_use_case: AsyncMock, mock_update_use_case: AsyncMock):
+    async def test_tool_count_is_not_reset_to_zero(
+        self, client, mock_get_use_case: AsyncMock, mock_update_use_case: AsyncMock
+    ):
         # Arrange — url UNCHANGED (no re-validation): tool_count must be inherited
         existing = _entry("web-search", tool_count=6)
         mock_get_use_case.execute = AsyncMock(return_value=existing)
@@ -756,7 +765,9 @@ class TestPartialUpdateMergeContract:
         # Assert
         assert resp.status_code == 200
         merged = mock_update_use_case.execute.call_args.args[1]
-        assert merged.tool_count == 6, "an unchanged-url update must not reset tool_count"
+        assert merged.tool_count == 6, (
+            "an unchanged-url update must not reset tool_count"
+        )
 
     async def test_provided_map_fields_replace_the_stored_maps(
         self, client, mock_get_use_case: AsyncMock, mock_update_use_case: AsyncMock
@@ -787,15 +798,21 @@ class TestPartialUpdateMergeContract:
         mock_update_use_case.execute = AsyncMock(return_value=existing)
 
         # Act
-        resp = await client.put(f"{BASE_URL}/web-search", json={"headers": {"X-Only": "v"}, "url": None})
+        resp = await client.put(
+            f"{BASE_URL}/web-search", json={"headers": {"X-Only": "v"}, "url": None}
+        )
 
         # Assert — stable, actionable, non-sensitive message (BUG-002)
         assert resp.status_code == 422
         messages = {issue.get("msg", "") for issue in resp.json()["detail"]}
-        assert any("'url' is required when source_type='external'" in msg for msg in messages)
+        assert any(
+            "'url' is required when source_type='external'" in msg for msg in messages
+        )
         mock_update_use_case.execute.assert_not_awaited()
 
-    async def test_empty_body_is_rejected_422(self, client, mock_get_use_case: AsyncMock):
+    async def test_empty_body_is_rejected_422(
+        self, client, mock_get_use_case: AsyncMock
+    ):
         # Arrange
         body: dict = {}
 

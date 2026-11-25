@@ -124,7 +124,16 @@ class CreateMcpServerUseCase:
             entry.openapi_url or "", headers=entry.headers
         )
         mounted_url = await self._runner.mount(entry.name, spec, headers=entry.headers)
-        tool_count = await self._runner.count_tools(entry.name)
+        try:
+            tool_count = await self._runner.count_tools(entry.name)
+        except Exception as e:  # noqa: BLE001 — the mounted server must survive the count
+            # QA BUG-001: the count is an ANNOTATION on an already-mounted,
+            # healthy server — a count failure must neither fail the create
+            # nor leave the mount unregistered. Persist with the "count
+            # unavailable" convention (the same 0 used when no tool loader is
+            # configured); the count is refreshed by the next update.
+            logger.warning(LogMessage.MCP_TOOL_COUNT_FAILED, entry.name, e)
+            tool_count = 0
 
         saved = entry.model_copy(
             update={

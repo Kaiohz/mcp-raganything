@@ -2,9 +2,9 @@
 
 The runner (``infrastructure.openapi_mcp.runner``) mounts in-process FastMCP
 servers built from OpenAPI specs into the running FastAPI app under
-``/generated/{name}/mcp``. It owns the ASGI lifecycle via an
-``AsyncExitStack`` (lifespan startup on mount, shutdown on unmount) and applies
-middleware to each mounted server.
+``/generated/{name}/mcp``. It owns the ASGI lifecycle via a dedicated
+task-owned lifespan holder (lifespan startup on mount, shutdown on unmount)
+and applies middleware to each mounted server.
 
 Mocked external boundaries:
 - ``fastmcp.FastMCP.from_openapi`` (server build)
@@ -374,7 +374,14 @@ class TestUnmount:
 
 
 class TestCountTools:
-    """Tests for GeneratedMcpRunner.count_tools (must use mcp.list_tools())."""
+    """Tests for GeneratedMcpRunner.count_tools.
+
+    QA BUG-001: the count is an IN-PROCESS listing with no credential — it
+    MUST bypass the mounted server's middleware chain
+    (``list_tools(run_middleware=False)``), or the credential-guarded
+    ``on_list_tools`` raises ToolError inside fastmcp's task group (create →
+    500 + the mounted server corrupted for every later request).
+    """
 
     async def test_returns_tool_count_for_mounted_server(
         self, runner: GeneratedMcpRunner, mock_app: MagicMock
@@ -395,7 +402,36 @@ class TestCountTools:
 
         # Assert
         assert count == 3
-        fake_mcp.list_tools.assert_awaited_once()
+        fake_mcp.list_tools.assert_awaited_once_with(run_middleware=False)
+
+    async def test_count_bypasses_the_credential_middleware(
+        self, runner: GeneratedMcpRunner, mock_app: MagicMock
+    ):
+        """QA BUG-001: the count runs OUTSIDE the middleware chain — a fake
+        ``list_tools`` honoring ``run_middleware`` (guard raising when True)
+        still counts, proving the bypass."""
+        # Arrange
+        spec = _valid_spec()
+        fake_mcp = _fake_mcp()
+
+        async def _guard_then_list(*, run_middleware: bool = True):
+            if run_middleware:
+                raise RuntimeError("Invalid or missing credentials")
+            return ["tool-a", "tool-b"]
+
+        fake_mcp.list_tools = AsyncMock(side_effect=_guard_then_list)
+
+        with (
+            patch("fastmcp.FastMCP.from_openapi", new=MagicMock(return_value=fake_mcp)),
+            patch.object(httpx, "AsyncClient", new=MagicMock()),
+        ):
+            await runner.mount("petstore", spec, headers={})
+
+            # Act
+            count = await runner.count_tools("petstore")
+
+        # Assert
+        assert count == 2
 
     async def test_returns_zero_when_no_tools(
         self, runner: GeneratedMcpRunner, mock_app: MagicMock

@@ -12,10 +12,13 @@ Delegation contract pinned here (REQ-010 replicating REQ-001/REQ-002/REQ-017):
   is answered HTTP 401 BEFORE any MCP method runs — including an
   unauthenticated ``initialize`` (never a successful initialize followed by a
   JSON-RPC error at tools/list);
-* every 401 carries
-  ``WWW-Authenticate: Bearer resource_metadata="https://<host>/.well-known/oauth-protected-resource"``
-  (the host comes from the MCP_ALLOWED_HOSTS allow-list, never an unvalidated
-  request Host — M-2 hardening mirrored from composable-agents);
+* every mount's 401 carries
+  ``WWW-Authenticate: Bearer resource_metadata="https://<host>/.well-known/oauth-protected-resource/<mount>"``
+  — the MOUNT'S OWN per-mount document (QA BUG-002: a client on ``/web/mcp``
+  must be told to request a token for ``/web/mcp``, not for the canonical
+  ``/files/mcp``); the host comes from the MCP_ALLOWED_HOSTS allow-list,
+  never an unvalidated request Host — M-2 hardening mirrored from
+  composable-agents;
 * the 401 body stays the existing generic, non-enumerating JSON and every 401
   is uncacheable (``Cache-Control: no-store``).
 
@@ -34,25 +37,29 @@ pytestmark = pytest.mark.asyncio(loop_scope="session")
 PROD_HOST = "raganything.soludev.tech"
 MCP_MOUNTS = ("/files/mcp", "/classical/mcp", "/web/mcp", "/memories/mcp")
 WELL_KNOWN_PATH = "/.well-known/oauth-protected-resource"
-#: The expected 401 discovery challenge for the production Host (REQ-010/REQ-001).
-EXPECTED_WWW_AUTHENTICATE = (
-    f'Bearer resource_metadata="https://{PROD_HOST}{WELL_KNOWN_PATH}"'
-)
-#: The existing generic, non-enumerating 401 body.
+#: The generic, non-enumerating 401 body.
 GENERIC_401_BODY = {"detail": "Invalid or missing credentials"}
 #: A Host that is NOT in the test env's MCP_ALLOWED_HOSTS.
 FOREIGN_HOST = "dns-rebind.evil.example"
 
 
-def assert_unauthorized_with_discovery_challenge(resp) -> None:
-    """One assertion block for REQ-010/REQ-001: 401 + challenge + generic body."""
+def expected_www_authenticate_for(mount: str) -> str:
+    """The 401 discovery challenge pointing at ONE mount's own per-mount
+    document (QA BUG-002) for the production Host (REQ-010/REQ-001)."""
+    return f'Bearer resource_metadata="https://{PROD_HOST}{WELL_KNOWN_PATH}{mount}"'
+
+
+def assert_unauthorized_with_discovery_challenge(resp, mount: str) -> None:
+    """One assertion block for REQ-010/REQ-001: 401 + mount-specific challenge
+    + generic body."""
     assert resp.status_code == 401, (
         f"expected HTTP 401 BEFORE any MCP method runs, got {resp.status_code} "
         f"with body {resp.text!r}"
     )
-    assert resp.headers.get("www-authenticate") == EXPECTED_WWW_AUTHENTICATE, (
-        "401 must carry the MCP protected-resource discovery challenge "
-        f'("WWW-Authenticate: {EXPECTED_WWW_AUTHENTICATE}"), got: '
+    expected = expected_www_authenticate_for(mount)
+    assert resp.headers.get("www-authenticate") == expected, (
+        "401 must carry the MOUNT-SPECIFIC MCP protected-resource discovery "
+        f'challenge ("WWW-Authenticate: {expected}"), got: '
         f"{resp.headers.get('www-authenticate')!r}"
     )
     assert resp.json() == GENERIC_401_BODY, (
@@ -66,7 +73,7 @@ class TestHttp401BeforeAnyMcpMethod:
     ):
         """No credentials on the exact path → HTTP 401 + discovery challenge."""
         resp = await mcp_post(http_client, "/files/mcp")
-        assert_unauthorized_with_discovery_challenge(resp)
+        assert_unauthorized_with_discovery_challenge(resp, "/files/mcp")
 
     @pytest.mark.parametrize("mount", MCP_MOUNTS)
     async def test_every_mount_challenges_unauthenticated_initialize(
@@ -74,7 +81,7 @@ class TestHttp401BeforeAnyMcpMethod:
     ):
         """The unified guard pattern covers ALL FOUR mounts."""
         resp = await mcp_post(http_client, mount)
-        assert_unauthorized_with_discovery_challenge(resp)
+        assert_unauthorized_with_discovery_challenge(resp, mount)
 
     @pytest.mark.parametrize("mount", MCP_MOUNTS)
     async def test_invalid_bearer_jwt_gets_http_401_with_challenge(
@@ -84,7 +91,7 @@ class TestHttp401BeforeAnyMcpMethod:
         resp = await mcp_post(
             http_client, mount, headers={"Authorization": "Bearer not-a-real-token"}
         )
-        assert_unauthorized_with_discovery_challenge(resp)
+        assert_unauthorized_with_discovery_challenge(resp, mount)
 
     @pytest.mark.parametrize("mount", MCP_MOUNTS)
     async def test_unknown_api_key_gets_http_401_with_challenge(
@@ -94,7 +101,7 @@ class TestHttp401BeforeAnyMcpMethod:
         resp = await mcp_post(
             http_client, mount, headers={"X-API-Key": "key_unknown_never_issued"}
         )
-        assert_unauthorized_with_discovery_challenge(resp)
+        assert_unauthorized_with_discovery_challenge(resp, mount)
 
     async def test_tools_call_is_also_rejected_at_http_level(
         self, http_client, mcp_post
@@ -104,7 +111,7 @@ class TestHttp401BeforeAnyMcpMethod:
         resp = await mcp_post(
             http_client, "/files/mcp", headers={}, method="tools/call"
         )
-        assert_unauthorized_with_discovery_challenge(resp)
+        assert_unauthorized_with_discovery_challenge(resp, "/files/mcp")
 
 
 class TestInitializeNeverSucceedsUnauthenticated:
@@ -120,7 +127,7 @@ class TestInitializeNeverSucceedsUnauthenticated:
         returns an MCP-level initialize SUCCESS; the HTTP-level contract is a
         401 on BOTH path forms."""
         resp = await mcp_post(http_client, f"{mount}/")
-        assert_unauthorized_with_discovery_challenge(resp)
+        assert_unauthorized_with_discovery_challenge(resp, mount)
         assert "jsonrpc" not in resp.text, (
             f"the 401 must not carry any MCP/JSON-RPC response payload, got: {resp.text!r}"
         )
@@ -158,7 +165,9 @@ class TestChallengeOriginHardening:
         """The allow-listed production Host IS the fallback discovery origin."""
         resp = await mcp_post(http_client, f"http://{PROD_HOST}/files/mcp", headers={})
         assert resp.status_code == 401
-        assert resp.headers.get("www-authenticate") == EXPECTED_WWW_AUTHENTICATE
+        assert resp.headers.get("www-authenticate") == (
+            expected_www_authenticate_for("/files/mcp")
+        )
 
     @pytest.mark.parametrize("mount", MCP_MOUNTS)
     async def test_401_challenge_response_is_never_cacheable(

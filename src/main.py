@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -79,11 +80,36 @@ configure_logging(app_config)
 
 logger = logging.getLogger(__name__)
 
-#: The MCP resource advertised by the protected-resource metadata document
-#: (REQ-002-equivalent). The four built-in mounts share one authorization
-#: server and one well-known document; the files server is the canonical
-#: advertised one.
+#: The four built-in MCP mount paths (wired below). The per-mount
+#: protected-resource documents (QA BUG-002) are served for these paths plus
+#: the ``/generated/{name}/mcp`` pattern the registry mounts at runtime.
+MCP_MOUNT_PATHS = ("/files/mcp", "/classical/mcp", "/web/mcp", "/memories/mcp")
+
+#: The MCP resource advertised by the GLOBAL protected-resource metadata
+#: document (REQ-002-equivalent). QA BUG-002: one document cannot serve four
+#: distinct mounts, so the GLOBAL document keeps advertising the canonical
+#: files server while each mount's OWN document
+#: (``/.well-known/oauth-protected-resource/<mount>``) advertises
+#: ``https://<origin><mount>``.
 MCP_DISCOVERY_RESOURCE_PATH = "/files/mcp"
+
+
+def _is_mcp_mount_path(path: str) -> bool:
+    """Whether ``path`` is an MCP mount a per-mount discovery document serves.
+
+    The four built-in mounts plus the ``/generated/{name}/mcp`` pattern the
+    registry mounts at runtime (QA BUG-002) — everything else answers a plain
+    404 (no discovery document is manufactured for non-mount paths).
+
+    Args:
+        path: The candidate mount path below the well-known prefix.
+
+    Returns:
+        True when a per-mount protected-resource document is served for it.
+    """
+    return (
+        path in MCP_MOUNT_PATHS or re.fullmatch(r"/generated/.+/mcp", path) is not None
+    )
 
 
 def _run_alembic_upgrade() -> None:
@@ -471,32 +497,29 @@ app.include_router(mcp_registry_router, dependencies=_auth_dep)
 # app-wide CORS middleware without auth.
 
 
-@app.get(
-    WELL_KNOWN_PROTECTED_RESOURCE_PATH,
-    summary="OAuth2 protected-resource metadata (public discovery)",
-    description=(
-        "Unauthenticated RFC 9728-style protected-resource metadata for the "
-        "MCP OAuth2 discovery chain: the resource identifier plus the "
-        "authorization servers accepting tokens for it."
-    ),
-    response_description="The static protected-resource metadata document.",
-    include_in_schema=False,
-)
-async def oauth_protected_resource(request: Request) -> Response:
-    """Return the static OAuth2 protected-resource metadata (public).
+async def _protected_resource_document(
+    request: Request, resource_path: str
+) -> Response:
+    """Derive the public origin and return one protected-resource document.
+
+    Single derivation shared by the global and per-mount documents
+    (QA BUG-002): one :func:`public_discovery_origin` derivation, one plain
+    404 fallback, one ``authorization_servers`` shape (the RESOLVED
+    ``MCP_AUTHORIZATION_SERVER`` — an explicit setting or the
+    ``<LOGTO_URL>/oidc`` fallback resolved once at startup by the
+    ``AppConfig`` model validator) — the list is EMPTY when neither is
+    configured.
 
     Args:
         request: The incoming request (its ``Host`` header is used only when
             allow-listed by ``MCP_ALLOWED_HOSTS``).
+        resource_path: The advertised resource path (the canonical
+            ``MCP_DISCOVERY_RESOURCE_PATH`` for the global document, the
+            mount path itself for a per-mount document).
 
     Returns:
-        ``{"resource": "https://<public-origin>/files/mcp",
-        "authorization_servers": [...]}`` where the advertised issuer is
-        ``MCP_AUTHORIZATION_SERVER`` — ALREADY the resolved value (an explicit
-        setting, or the ``<LOGTO_URL>/oidc`` fallback resolved once at startup
-        by the ``AppConfig`` model validator, code-review MINOR-1) — the list
-        is EMPTY when neither is configured — and 404 (plain, no derivation
-        detail) when no trustworthy origin can be derived.
+        The static RFC 9728-style JSON document, or a plain 404 (no
+        derivation detail) when no trustworthy origin can be derived.
     """
     origin = public_discovery_origin(
         request.headers.get("host", ""),
@@ -510,7 +533,7 @@ async def oauth_protected_resource(request: Request) -> Response:
         )
     return JSONResponse(
         content={
-            "resource": f"{origin}{MCP_DISCOVERY_RESOURCE_PATH}",
+            "resource": f"{origin}{resource_path}",
             "authorization_servers": (
                 [app_config.MCP_AUTHORIZATION_SERVER]
                 if app_config.MCP_AUTHORIZATION_SERVER
@@ -518,6 +541,71 @@ async def oauth_protected_resource(request: Request) -> Response:
             ),
         }
     )
+
+
+@app.get(
+    WELL_KNOWN_PROTECTED_RESOURCE_PATH,
+    summary="OAuth2 protected-resource metadata (public discovery)",
+    description=(
+        "Unauthenticated RFC 9728-style protected-resource metadata for the "
+        "MCP OAuth2 discovery chain: the canonical resource identifier plus "
+        "the authorization servers accepting tokens for it. Each MCP mount "
+        "also serves its OWN metadata document at "
+        "'.well-known/oauth-protected-resource/<mount>' (QA BUG-002)."
+    ),
+    response_description="The static protected-resource metadata document.",
+    include_in_schema=False,
+)
+async def oauth_protected_resource(request: Request) -> Response:
+    """Return the canonical OAuth2 protected-resource metadata (public).
+
+    Args:
+        request: The incoming request (its ``Host`` header is used only when
+            allow-listed by ``MCP_ALLOWED_HOSTS``).
+
+    Returns:
+        ``{"resource": "https://<public-origin>/files/mcp",
+        "authorization_servers": [...]}`` — 404 (plain) when no trustworthy
+        origin can be derived.
+    """
+    return await _protected_resource_document(request, MCP_DISCOVERY_RESOURCE_PATH)
+
+
+@app.get(
+    WELL_KNOWN_PROTECTED_RESOURCE_PATH + "/{mount_path:path}",
+    summary="Per-mount OAuth2 protected-resource metadata (public discovery)",
+    description=(
+        "Unauthenticated RFC 9728-style protected-resource metadata for ONE "
+        "MCP mount: the document advertises that mount's OWN resource "
+        "identifier (QA BUG-002) plus the authorization servers accepting "
+        "tokens for it. Served for the four built-in mounts and the "
+        "/generated/{name}/mcp pattern."
+    ),
+    response_description="The mount-specific protected-resource metadata document.",
+    include_in_schema=False,
+)
+async def oauth_protected_resource_for_mount(
+    request: Request, mount_path: str
+) -> Response:
+    """Return the mount-specific OAuth2 protected-resource metadata (public).
+
+    Args:
+        request: The incoming request (its ``Host`` header is used only when
+            allow-listed by ``MCP_ALLOWED_HOSTS``).
+        mount_path: The mount path below the well-known prefix (its leading
+            ``/`` is already part of the URL).
+
+    Returns:
+        ``{"resource": "https://<public-origin><mount_path>",
+        "authorization_servers": [...]}``; a plain 404 when the path is not
+        an MCP mount or when no trustworthy origin can be derived.
+    """
+    if not _is_mcp_mount_path(f"/{mount_path}"):
+        # Not a mount (never a resource) → plain 404, like any unknown route.
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND, content={"detail": "Not Found"}
+        )
+    return await _protected_resource_document(request, f"/{mount_path}")
 
 
 # --- Protected MCP mounts (feat-mcp-oauth2-dual-auth) --------------------------
@@ -544,11 +632,10 @@ async def oauth_protected_resource(request: Request) -> Response:
 # keeps serving "/<mount>/..." sub-paths; the guard rewrites both path forms
 # to "/" for the inner app. The ``McpApiKeyMiddleware`` stays mounted INSIDE
 # each FastMCP app (above) as defense-in-depth behind the HTTP guard.
-for _mount_path, _mcp_app in (
-    ("/files/mcp", mcp_files_app),
-    ("/classical/mcp", mcp_classical_app),
-    ("/web/mcp", mcp_web_app),
-    ("/memories/mcp", mcp_memories_app),
+for _mount_path, _mcp_app in zip(
+    MCP_MOUNT_PATHS,
+    (mcp_files_app, mcp_classical_app, mcp_web_app, mcp_memories_app),
+    strict=True,
 ):
     _guarded = build_mcp_guard_stack(_mcp_app, _mount_path)
     app.router.routes.append(
