@@ -183,7 +183,9 @@ async def real_jwt_signer(running_app, auth_directory):
     monkeypatch.setattr(main.app_config, "JWT_AUDIENCE", _TEST_AUDIENCE)
     adapter = JwtAdapter(
         jwks_url=(
-            f"{main.app_config.LOGTO_URL}/oidc/jwks" if main.app_config.LOGTO_URL else ""
+            f"{main.app_config.LOGTO_URL}/oidc/jwks"
+            if main.app_config.LOGTO_URL
+            else ""
         ),
         audience=main.app_config.JWT_AUDIENCE,
     )
@@ -196,7 +198,9 @@ async def real_jwt_signer(running_app, auth_directory):
     adapter._jwks_http_client = AsyncMock()
     adapter._jwks_http_client.get = AsyncMock(return_value=jwks_response)
 
-    service = AuthService(jwt_port=adapter, api_key_repo=auth_directory.api_key_repository)
+    service = AuthService(
+        jwt_port=adapter, api_key_repo=auth_directory.api_key_repository
+    )
     previous_middleware_service = main.mcp_middleware._auth_service
     previous_rest_service = main.rest_security._auth_service
     previous_deps_auth = getattr(deps, "auth_service", None)

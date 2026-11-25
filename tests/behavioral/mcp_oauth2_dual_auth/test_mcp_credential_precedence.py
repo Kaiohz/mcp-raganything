@@ -85,7 +85,9 @@ class TestInvalidJwtNeverFallsBackToApiKey:
 
 
 class TestApiKeyFlowRegressionPins:
-    async def test_unknown_api_key_is_rejected_with_challenge(self, http_client, mcp_post):
+    async def test_unknown_api_key_is_rejected_with_challenge(
+        self, http_client, mcp_post
+    ):
         """An unknown key has no active hash match → 401 + challenge."""
         resp = await mcp_post(
             http_client,

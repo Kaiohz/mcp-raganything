@@ -96,7 +96,9 @@ class TestHttp401BeforeAnyMcpMethod:
         )
         assert_unauthorized_with_discovery_challenge(resp)
 
-    async def test_tools_call_is_also_rejected_at_http_level(self, http_client, mcp_post):
+    async def test_tools_call_is_also_rejected_at_http_level(
+        self, http_client, mcp_post
+    ):
         """A raw tools/call probe without credentials hits the same HTTP 401
         (the guard runs BEFORE the method layer, not only on tools/list)."""
         resp = await mcp_post(
@@ -154,14 +156,14 @@ class TestChallengeOriginHardening:
         self, http_client, mcp_post
     ):
         """The allow-listed production Host IS the fallback discovery origin."""
-        resp = await mcp_post(
-            http_client, f"http://{PROD_HOST}/files/mcp", headers={}
-        )
+        resp = await mcp_post(http_client, f"http://{PROD_HOST}/files/mcp", headers={})
         assert resp.status_code == 401
         assert resp.headers.get("www-authenticate") == EXPECTED_WWW_AUTHENTICATE
 
     @pytest.mark.parametrize("mount", MCP_MOUNTS)
-    async def test_401_challenge_response_is_never_cacheable(self, http_client, mount, mcp_post):
+    async def test_401_challenge_response_is_never_cacheable(
+        self, http_client, mount, mcp_post
+    ):
         """Every 401 carries `Cache-Control: no-store` (challenge responses
         must not be cached and replayed to a different client)."""
         resp = await mcp_post(http_client, mount)

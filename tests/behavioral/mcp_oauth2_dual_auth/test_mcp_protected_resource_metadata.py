@@ -41,7 +41,9 @@ BROWSER_ORIGIN = "http://localhost:5173"
 
 
 class TestProtectedResourceMetadata:
-    async def test_metadata_is_public_and_advertises_the_logto_issuer(self, http_client):
+    async def test_metadata_is_public_and_advertises_the_logto_issuer(
+        self, http_client
+    ):
         """Unauthenticated GET returns the static protected-resource metadata."""
         resp = await http_client.get(WELL_KNOWN_PATH)
         assert resp.status_code == 200, (
@@ -93,7 +95,7 @@ class TestProtectedResourceMetadata:
         allow-listed production Host (the ingress may forward the dialed
         port) and derive the SAME canonical, port-less document."""
         resp = await http_client.get(
-                    WELL_KNOWN_PATH, headers={"Host": f"{PROD_HOST}:443"}
+            WELL_KNOWN_PATH, headers={"Host": f"{PROD_HOST}:443"}
         )
         assert resp.status_code == 200, (
             f"the default-port Host form must be allow-listed, got "
@@ -106,9 +108,7 @@ class TestProtectedResourceMetadata:
         """M-2: without a trustworthy origin, a non-allow-listed request Host
         can NEVER shape the advertised document — no attacker-derived
         `resource` URL is ever echoed."""
-        resp = await http_client.get(
-            WELL_KNOWN_PATH, headers={"Host": FOREIGN_HOST}
-        )
+        resp = await http_client.get(WELL_KNOWN_PATH, headers={"Host": FOREIGN_HOST})
         assert resp.status_code == 404, (
             "the metadata document must not be served with an attacker-shaped "
             f"resource URL, got {resp.status_code}: {resp.text}"
