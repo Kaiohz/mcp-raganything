@@ -6,8 +6,8 @@ and formula as the pytest-crap report) so the gate can never drift from the
 report.
 
 Ratchet semantics (pre-existing offenders): a BASELINE file lists functions
-that already exceeded the threshold BEFORE a change (file:line label + the
-CRAP score at the time). The gate
+that already exceeded the threshold BEFORE a change (a ``path:name`` label +
+the CRAP score at the time). The gate
 
 * FAILS on any offender NOT listed in the baseline (a new offender), and
 * FAILS when a baseline-listed function's CRAP score rises above its recorded
@@ -45,6 +45,35 @@ def _python_files(source_root: Path) -> list[Path]:
     return sorted(source_root.rglob("*.py"))
 
 
+def _parse_baseline_entry(entry: str) -> tuple[str, float]:
+    """Parse one baseline entry in either accepted format.
+
+    The keyed format is ``path:name:crap`` (the shipped baseline); the
+    gate-output form ``path:line:name:crap`` (an offender line copied
+    verbatim from the gate or the pytest-crap report) is ALSO accepted and
+    keyed by ``path:name`` the same way. Malformed entries fail LOUDLY: a
+    silently mis-parsed allowance would turn a pre-existing offender into a
+    NEW offender and break the gate invisibly (code-review MINOR-3).
+    """
+    parts = entry.rsplit(":", 3)
+    if len(parts) == 4:
+        path, _line, name, crap = parts
+    elif len(parts) == 3:
+        path, name, crap = parts
+    else:
+        raise ValueError(
+            f"malformed baseline entry {entry!r}: expected 'path:name:crap' "
+            "(or the gate-output form 'path:line:name:crap')"
+        )
+    try:
+        return f"{path}:{name}", float(crap)
+    except ValueError as exc:
+        raise ValueError(
+            f"malformed baseline entry {entry!r}: the CRAP score {crap!r} "
+            "is not a number"
+        ) from exc
+
+
 def _load_baseline(baseline_path: Path) -> dict[str, float]:
     """Load ``path:name:crap`` allowances; missing file ⇒ empty ratchet."""
     if not baseline_path.exists():
@@ -54,21 +83,31 @@ def _load_baseline(baseline_path: Path) -> dict[str, float]:
         entry = raw.split("#")[0].strip()
         if not entry:
             continue
-        path, name, crap = entry.rsplit(":", 2)
-        allowances[f"{path}:{name}"] = float(crap)
+        key, crap = _parse_baseline_entry(entry)
+        allowances[key] = crap
     return allowances
 
 
 def main() -> int:
     """Run the CRAP gate over every function under ``--source``."""
     parser = argparse.ArgumentParser(description="CHANGE RISK (CRAP) gate")
-    parser.add_argument("--source", default="src", help="source tree to gate (default: src)")
-    parser.add_argument("--threshold", type=float, default=30.0, help="maximum CRAP score per function")
-    parser.add_argument("--coverage-file", default=".coverage", help="pytest-cov data file")
+    parser.add_argument(
+        "--source", default="src", help="source tree to gate (default: src)"
+    )
+    parser.add_argument(
+        "--threshold", type=float, default=30.0, help="maximum CRAP score per function"
+    )
+    parser.add_argument(
+        "--coverage-file", default=".coverage", help="pytest-cov data file"
+    )
     parser.add_argument(
         "--baseline",
         default="",
-        help="ratchet file with pre-existing allowances 'path:line:name:crap' (one per line)",
+        help=(
+            "ratchet file with pre-existing allowances 'path:name:crap' "
+            "(the gate-output form 'path:line:name:crap' is also accepted, "
+            "one per line)"
+        ),
     )
     args = parser.parse_args()
 
@@ -92,7 +131,9 @@ def main() -> int:
             entry = f"{rel}:{score.start_line}:{score.name}:{score.crap:.2f}"
             allowance = allowances.get(f"{rel}:{score.name}")
             if allowance is None:
-                new_offenders.append(f"{entry} (CC {score.cc}, coverage {score.coverage_percent:.1f}%)")
+                new_offenders.append(
+                    f"{entry} (CC {score.cc}, coverage {score.coverage_percent:.1f}%)"
+                )
                 continue
             stale_allowances.discard(f"{rel}:{score.name}")
             # Ratchet comparison at the RECORDED precision (2 decimals): the
@@ -103,9 +144,13 @@ def main() -> int:
                     f" (now at line {score.start_line})"
                 )
 
-    print(f"CRAP gate: {checked} functions checked (threshold {args.threshold:g}, source '{args.source}')")
+    print(
+        f"CRAP gate: {checked} functions checked (threshold {args.threshold:g}, source '{args.source}')"
+    )
     if new_offenders:
-        print(f"CRAP gate FAILED — {len(new_offenders)} NEW function(s) above the threshold:")
+        print(
+            f"CRAP gate FAILED — {len(new_offenders)} NEW function(s) above the threshold:"
+        )
         for offender in new_offenders:
             print(f"  - {offender}")
     if regressions:

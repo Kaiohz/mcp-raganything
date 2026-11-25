@@ -32,7 +32,7 @@ from infrastructure.database.rls_context import (
     current_credential,
     current_user_id,
 )
-from security import ComposableAgentsSecurity, McpApiKeyMiddleware
+from security import ComposableAgentsSecurity, McpApiKeyMiddleware, _cached_auth_context
 
 _MASTER_KEY = "super-secret-key"
 
@@ -494,4 +494,80 @@ class TestCachedAuthHandshake:
         assert svc.authenticate.await_count == 0, (
             "the Bearer token is the presented credential in the AuthService "
             "order — a matching cached context short-circuits"
+        )
+
+
+class TestCachedAuthContextReset:
+    """Code-review MINOR-4: the handshake cache must be RESET at the start of
+    every ``authenticate_headers`` pass — a stale entry can never outlive its
+    request, so two SEQUENTIAL requests with different credentials on the SAME
+    middleware instance never share the cached context (and a denied request
+    leaves NO stale entry from the previous one)."""
+
+    async def test_denied_request_leaves_no_stale_entry(self):
+        """After Alice's request caches her context, a second request with a
+        DIFFERENT (denied) credential must leave the cache EMPTY — before the
+        reset the cache would still hold Alice's verified principal."""
+        svc = AsyncMock()
+
+        async def _authenticate(authorization: str | None, api_key: str | None):
+            if api_key == "key-alice":
+                return AuthContext(
+                    user_id="user-alice", method="api_key", raw_credential="key-alice"
+                )
+            return None
+
+        svc.authenticate.side_effect = _authenticate
+        mw = McpApiKeyMiddleware(master_key=_MASTER_KEY)
+        mw.set_auth_service(svc)
+
+        # Request 1: alice authenticates (the guard's pass caches her context).
+        ctx_first = await mw.authenticate_headers(None, "key-alice")
+        assert ctx_first is not None and ctx_first.raw_credential == "key-alice"
+        assert _cached_auth_context.get() is ctx_first
+
+        # Request 2: a DIFFERENT credential is DENIED (e.g. a revoked key).
+        ctx_second = await mw.authenticate_headers(None, "key-revoked")
+        assert ctx_second is None
+        assert _cached_auth_context.get() is None, (
+            "a denied request must not leave a stale entry from the previous request"
+        )
+
+    async def test_two_sequential_requests_never_reuse_the_previous_principal(
+        self,
+    ):
+        """Two sequential granted requests with different credentials: the
+        cache holds ONLY the second request's own principal — a foreign
+        credential (here: the previous request's one) can never be matched
+        against it."""
+        svc = AsyncMock()
+
+        async def _authenticate(authorization: str | None, api_key: str | None):
+            if api_key == "key-alice":
+                return AuthContext(
+                    user_id="user-alice", method="api_key", raw_credential="key-alice"
+                )
+            if api_key == "key-bob":
+                return AuthContext(
+                    user_id="user-bob", method="api_key", raw_credential="key-bob"
+                )
+            return None
+
+        svc.authenticate.side_effect = _authenticate
+        mw = McpApiKeyMiddleware(master_key=_MASTER_KEY)
+        mw.set_auth_service(svc)
+
+        # Request 1: alice authenticates (her context is cached).
+        ctx_alice = await mw.authenticate_headers(None, "key-alice")
+        assert ctx_alice is not None and ctx_alice.user_id == "user-alice"
+
+        # Request 2: bob's own credential — SAME middleware instance.
+        ctx_bob = await mw.authenticate_headers(None, "key-bob")
+        assert ctx_bob is not None and ctx_bob.user_id == "user-bob"
+        cached = _cached_auth_context.get()
+        assert cached is not None
+        assert cached is ctx_bob
+        assert cached.raw_credential == "key-bob", (
+            "alice's cached context from the previous request must be GONE — "
+            "the reset runs before this request's own re-caching"
         )

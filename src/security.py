@@ -66,6 +66,9 @@ _BEARER_PREFIX = "Bearer "
 #: NFR). A credential that does not match the cached one re-verifies, so the
 #: defense-in-depth semantics are preserved on every path not covered by the
 #: guard ("cached" is only ever a shortcut for the SAME request's credential).
+#: The cache is reset at the START of every :meth:`authenticate_headers` pass
+#: (code-review MINOR-4): a stale entry must never outlive its request, even
+#: on a path not covered by the guard.
 _cached_auth_context: contextvars.ContextVar[AuthContext | None] = (
     contextvars.ContextVar("cached_mcp_auth_context", default=None)
 )
@@ -336,6 +339,13 @@ class McpApiKeyMiddleware(Middleware):
             set, or ``None`` when no credential validates OR when no dual
             auth is wired (fail-closed for the HTTP-level callers).
         """
+        # Code-review MINOR-4: the handshake cache is strictly REQUEST-scoped
+        # — reset it BEFORE anything else so a stale entry can never outlive
+        # its request. A request reaching the middleware on a path NOT covered
+        # by the guard must never inherit the PREVIOUS request's verified
+        # principal; this request's own pass re-caches the context it
+        # verifies below (and a denied request leaves the cache EMPTY).
+        _cached_auth_context.set(None)
         if self._auth_service is None:
             # Fail-closed until the composition root wires dual auth; the
             # legacy master-key mode stays available only to the method-level

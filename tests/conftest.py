@@ -121,10 +121,14 @@ async def running_app(auth_directory):
         # enforced it must stay allow-listed, or every REAL-client probe
         # would get 421. Pydantic BaseSettings ignores these env keys until
         # the fields exist, so RED runs are unaffected. LOGTO_URL feeds the
-        # advertised authorization servers (`{LOGTO_URL}/oidc`) of the
-        # protected-resource metadata (REQ-002).
+        # JWKS base; MCP_AUTHORIZATION_SERVER is the advertised issuer of the
+        # protected-resource metadata (REQ-002) — seeded EXPLICITLY because
+        # the ``<LOGTO_URL>/oidc`` fallback is resolved ONCE at config load
+        # (the AppConfig model validator): an import-time construction with
+        # no env seeding must still advertise the same issuer.
         "MCP_ALLOWED_HOSTS": ", ".join(_SEEDED_MCP_ALLOWED_HOSTS),
         "LOGTO_URL": "https://logto.soludev.tech",
+        "MCP_AUTHORIZATION_SERVER": "https://logto.soludev.tech/oidc",
     }
     with patch.dict(os.environ, environment):
         import main
@@ -148,7 +152,9 @@ async def running_app(auth_directory):
                 # at COLLECTION time, so ``app_config`` is built BEFORE this
                 # fixture's env patch is applied and the env seeding alone
                 # could not reach it. The behavioral values match the env
-                # seeding above (REQ-002/REQ-014).
+                # seeding above (REQ-002/REQ-014). MCP_AUTHORIZATION_SERVER
+                # is the RESOLVED advertised issuer (the model-validator
+                # fallback shape: <LOGTO_URL>/oidc).
                 patch.object(
                     main.app_config,
                     "MCP_ALLOWED_HOSTS",
@@ -156,6 +162,11 @@ async def running_app(auth_directory):
                 ),
                 patch.object(
                     main.app_config, "LOGTO_URL", "https://logto.soludev.tech"
+                ),
+                patch.object(
+                    main.app_config,
+                    "MCP_AUTHORIZATION_SERVER",
+                    "https://logto.soludev.tech/oidc",
                 ),
             ):
                 started = asyncio.Event()

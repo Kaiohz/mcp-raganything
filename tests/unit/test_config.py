@@ -160,7 +160,16 @@ class TestMcpAuthorizationServerSetting:
         assert cfg.MCP_AUTHORIZATION_SERVER == "http://logto:3001/oidc"
 
     def test_blank_value_is_treated_as_unset(self):
-        assert AppConfig(MCP_AUTHORIZATION_SERVER="   ").MCP_AUTHORIZATION_SERVER == ""
+        """A blank value means "unset": with ``LOGTO_URL`` empty too (both
+        explicit — the env must not leak into the assertion) NOTHING is
+        advertised. The FALLBACK resolution itself is pinned in
+        ``tests/unit/test_mcp_authorization_server_setting.py``."""
+        assert (
+            AppConfig(
+                MCP_AUTHORIZATION_SERVER="   ", LOGTO_URL=""
+            ).MCP_AUTHORIZATION_SERVER
+            == ""
+        )
 
 
 class TestLLMConfigApiKey:

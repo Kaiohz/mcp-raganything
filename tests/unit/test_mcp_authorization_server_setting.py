@@ -1,4 +1,4 @@
-"""Unit tests — the ``MCP_AUTHORIZATION_SERVER`` setting (M-3).
+"""Unit tests — the ``MCP_AUTHORIZATION_SERVER`` setting (M-3 / MINOR-1).
 
 Adapted from the composable-agents sibling (QA BUG-003): the public
 protected-resource metadata advertised a container-internal issuer derived
@@ -6,9 +6,10 @@ inline from the raw ``LOGTO_URL``. The explicit setting keeps the PUBLIC
 issuer decoupled:
 
 * an explicit value wins verbatim (the configmap sets the public issuer);
-* an unset/blank value falls back to ``<logto_url>/oidc`` inline at the
-  well-known route — empty when ``LOGTO_URL`` is empty too (nothing is
-  advertised);
+* an unset/blank value falls back to ``<LOGTO_URL>/oidc`` — resolved ONCE at
+  startup by the ``AppConfig`` model validator (code-review MINOR-1, mirroring
+  the sibling) instead of inline at the well-known route, and empty when
+  ``LOGTO_URL`` is empty too (nothing is advertised);
 * a present-but-non-absolute value REFUSES startup (the same
   present-but-invalid ⇒ refuse rule as the other configuration validators);
 * the two startup warnings (nothing advertised / non-https issuer) are part
@@ -21,6 +22,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+from httpx import ASGITransport, AsyncClient
 from pydantic import ValidationError
 
 import main  # noqa: F401 — imported at collection time: configure_logging() at
@@ -49,11 +51,76 @@ class TestMcpAuthorizationServerShape:
         assert config.MCP_AUTHORIZATION_SERVER == "https://logto.soludev.tech/oidc"
 
     def test_blank_value_is_treated_as_unset(self):
-        """A blank value means "unset" — the inline ``<LOGTO_URL>/oidc``
-        fallback applies at the well-known route, so nothing is advertised
-        and no malformed ``["/oidc"]``-shaped issuer can slip through."""
-        config = AppConfig(MCP_AUTHORIZATION_SERVER="   ")
+        """A blank value means "unset" — the ``<LOGTO_URL>/oidc`` fallback
+        resolution applies at config load (``AppConfig`` model validator);
+        with ``LOGTO_URL`` configured the effective advertised issuer is the
+        resolved fallback (no malformed ``["/oidc"]`` shape can slip
+        through)."""
+        config = AppConfig(
+            MCP_AUTHORIZATION_SERVER="   ", LOGTO_URL="http://logto:3001"
+        )
+        assert config.MCP_AUTHORIZATION_SERVER == "http://logto:3001/oidc"
+
+
+class TestMcpAuthorizationServerFallbackResolution:
+    """Code-review MINOR-1: the ``<LOGTO_URL>/oidc`` fallback is resolved ONCE
+    at config load by the ``AppConfig`` model validator (mirroring the
+    composable-agents sibling ``resolve_mcp_authorization_server``) instead of
+    inline at the well-known route — the effective advertised issuer is
+    ALWAYS ``MCP_AUTHORIZATION_SERVER``, so the startup warnings cover the
+    fallback (an internal ``http://`` issuer can no longer be published under
+    the radar)."""
+
+    def test_unset_value_falls_back_to_the_logto_issuer(self):
+        config = AppConfig(MCP_AUTHORIZATION_SERVER="", LOGTO_URL="http://logto:3001")
+        assert config.MCP_AUTHORIZATION_SERVER == "http://logto:3001/oidc"
+
+    def test_unset_value_kept_empty_without_logto_url(self):
+        """With neither value configured NOTHING is advertised (the route
+        then serves ``authorization_servers: []``)."""
+        config = AppConfig(MCP_AUTHORIZATION_SERVER="", LOGTO_URL="")
         assert config.MCP_AUTHORIZATION_SERVER == ""
+
+    def test_trailing_slash_is_stripped_from_the_logto_url(self):
+        config = AppConfig(
+            MCP_AUTHORIZATION_SERVER="", LOGTO_URL="https://logto.soludev.tech/"
+        )
+        assert config.MCP_AUTHORIZATION_SERVER == "https://logto.soludev.tech/oidc"
+
+    def test_explicit_value_wins_over_the_fallback(self):
+        config = AppConfig(
+            MCP_AUTHORIZATION_SERVER="https://logto.soludev.tech/oidc",
+            LOGTO_URL="http://logto:3001",
+        )
+        assert config.MCP_AUTHORIZATION_SERVER == "https://logto.soludev.tech/oidc"
+
+    async def test_route_advertises_the_single_resolved_issuer(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The well-known route reads ``MCP_AUTHORIZATION_SERVER`` ONLY (no
+        inline ``<LOGTO_URL>/oidc`` derivation is left): the internal issuer
+        a validator-resolved fallback produced is advertised verbatim —
+        with the startup warning covering it (``MCP_AUTHORIZATION_SERVER_NOT_HTTPS``)."""
+        monkeypatch.setattr(
+            main.app_config,
+            "MCP_PUBLIC_BASE_URL",
+            "https://raganything.soludev.tech",
+        )
+        # The RESOLVED internal fallback shape (what the validator produced
+        # for LOGTO_URL=http://logto:3001 with the setting unset).
+        monkeypatch.setattr(
+            main.app_config, "MCP_AUTHORIZATION_SERVER", "http://logto:3001/oidc"
+        )
+        async with AsyncClient(
+            transport=ASGITransport(app=main.app), base_url="http://test"
+        ) as client:
+            resp = await client.get("/.well-known/oauth-protected-resource")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["authorization_servers"] == ["http://logto:3001/oidc"], (
+            "the route must advertise the RESOLVED MCP_AUTHORIZATION_SERVER "
+            "value (no second inline-derivation source)"
+        )
 
 
 class TestMcpAuthorizationServerStartupWarnings:

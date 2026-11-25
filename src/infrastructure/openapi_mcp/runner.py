@@ -188,9 +188,7 @@ class GeneratedMcpRunner(GeneratedMcpRunnerPort):
         router = getattr(self._app, "router", None)
         routes = getattr(router, "routes", None) if router is not None else None
         if not isinstance(routes, list):
-            logger.warning(
-                LogMessage.MCP_EXACT_PATH_ROUTE_UNAVAILABLE, mount_path
-            )
+            logger.warning(LogMessage.MCP_EXACT_PATH_ROUTE_UNAVAILABLE, mount_path)
             return
         routes.append(
             Route(

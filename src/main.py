@@ -350,11 +350,13 @@ def _log_mcp_discovery_shape_warnings() -> None:
     a silent misconfiguration becomes a visible startup warning. The
     metadata document only advertises an issuer/origin a PUBLIC MCP client
     can reach: NOTHING advertised (both ``MCP_AUTHORIZATION_SERVER`` and
-    ``LOGTO_URL`` empty — this repo resolves the issuer inline at the
-    well-known route instead of a config model-validator) and a non-https
-    authorization server are warned for QA BUG-003; a non-https
-    ``MCP_PUBLIC_BASE_URL`` origin is warned for NEW-1 (a scheme-less value
-    already REFUSES startup in ``AppConfig._validate_mcp_public_base_url``).
+    ``LOGTO_URL`` empty — the ``<LOGTO_URL>/oidc`` fallback is resolved ONCE
+    at startup by the ``AppConfig`` model validator, so
+    ``MCP_AUTHORIZATION_SERVER`` below carries the EFFECTIVE advertised
+    issuer, explicit or fallback alike) and a non-https authorization
+    server are warned for QA BUG-003; a non-https ``MCP_PUBLIC_BASE_URL``
+    origin is warned for NEW-1 (a scheme-less value already REFUSES startup
+    in ``AppConfig._validate_mcp_public_base_url``).
     """
     if not app_config.MCP_AUTHORIZATION_SERVER and not app_config.LOGTO_URL:
         logger.warning(LogMessage.MCP_AUTHORIZATION_SERVER_NOT_ADVERTISED)
@@ -490,9 +492,11 @@ async def oauth_protected_resource(request: Request) -> Response:
     Returns:
         ``{"resource": "https://<public-origin>/files/mcp",
         "authorization_servers": [...]}`` where the advertised issuer is
-        ``MCP_AUTHORIZATION_SERVER`` falling back to ``<LOGTO_URL>/oidc`` —
-        the list is EMPTY when neither is configured — and 404 (plain, no
-        derivation detail) when no trustworthy origin can be derived.
+        ``MCP_AUTHORIZATION_SERVER`` — ALREADY the resolved value (an explicit
+        setting, or the ``<LOGTO_URL>/oidc`` fallback resolved once at startup
+        by the ``AppConfig`` model validator, code-review MINOR-1) — the list
+        is EMPTY when neither is configured — and 404 (plain, no derivation
+        detail) when no trustworthy origin can be derived.
     """
     origin = public_discovery_origin(
         request.headers.get("host", ""),
@@ -510,7 +514,7 @@ async def oauth_protected_resource(request: Request) -> Response:
             "authorization_servers": (
                 [app_config.MCP_AUTHORIZATION_SERVER]
                 if app_config.MCP_AUTHORIZATION_SERVER
-                else ([f"{app_config.LOGTO_URL}/oidc"] if app_config.LOGTO_URL else [])
+                else []
             ),
         }
     )

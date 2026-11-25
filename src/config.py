@@ -207,13 +207,17 @@ class AppConfig(BaseSettings):
     )
     # Public OAuth2 authorization server advertised by the protected-resource
     # metadata document (REQ-002-equivalent): the issuer an MCP client can
-    # actually REACH. When unset it falls back to ``<LOGTO_URL>/oidc``; when
-    # both are empty NOTHING is advertised (``authorization_servers: []``).
+    # actually REACH. Resolved ONCE at startup by ``resolve_mcp_authorization_server``
+    # (the ``model_validator``): an explicit value wins verbatim; when unset it
+    # falls back to ``<LOGTO_URL>/oidc`` — the SAME resolved value feeds the
+    # ``/.well-known`` route AND the startup warnings; when both are empty
+    # NOTHING is advertised (``authorization_servers: []``).
     MCP_AUTHORIZATION_SERVER: str = Field(
         default="",
         description="Explicit publicly-reachable OAuth2 authorization-server "
         "issuer advertised by the protected-resource metadata. Falls back to "
-        "<LOGTO_URL>/oidc when unset.",
+        "<LOGTO_URL>/oidc when unset (resolved once at startup by the "
+        "AppConfig model validator).",
     )
     # MCP transport-security Origin allow-list (comma-separated env var
     # ``MCP_ALLOWED_ORIGINS``). The ``mcp`` SDK matches an Origin EXACTLY (no
@@ -310,6 +314,29 @@ class AppConfig(BaseSettings):
                     "with https:// (e.g. 'https://logto.soludev.tech/oidc')"
                 )
         return value
+
+    @model_validator(mode="after")
+    def resolve_mcp_authorization_server(self) -> "AppConfig":
+        """Fall back to ``<LOGTO_URL>/oidc`` when the setting is unset.
+
+        Mirrors composable-agents' ``resolve_mcp_authorization_server``
+        (code-review MINOR-1): the advertised issuer used to be derived
+        INLINE in the well-known route from the raw ``LOGTO_URL``, so an
+        internal (container-only) address could reach the public discovery
+        document with NO startup warning. Resolving the fallback at config
+        load makes ``MCP_AUTHORIZATION_SERVER`` the ONE effective advertised
+        issuer — the ``/.well-known`` route and the startup warnings both
+        read the same resolved value, so a non-https fallback (e.g.
+        ``http://logto:3001/oidc``) is warned exactly like an explicit
+        non-https value.
+
+        When neither value is configured NOTHING is advertised (the route
+        serves ``authorization_servers: []`` and the
+        ``MCP_AUTHORIZATION_SERVER_NOT_ADVERTISED`` warning fires).
+        """
+        if not self.MCP_AUTHORIZATION_SERVER and self.LOGTO_URL:
+            self.MCP_AUTHORIZATION_SERVER = f"{self.LOGTO_URL.rstrip('/')}/oidc"
+        return self
 
 
 class DatabaseConfig(BaseSettings):
