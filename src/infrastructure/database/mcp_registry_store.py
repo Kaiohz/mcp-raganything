@@ -33,7 +33,7 @@ import json
 import logging
 from typing import Any
 
-from domain.entities.mcp_server_config import McpTransportType
+from domain.entities.mcp_server_config import McpAuthMode, McpTransportType
 from domain.entities.mcp_server_registry_entry import RegisteredMcpServer
 from domain.errors.mcp import McpServerAlreadyExistsError, McpServerNotFoundError
 from domain.errors.messages import ErrorMessage
@@ -61,6 +61,7 @@ class McpRegistryStore(McpServerRegistryStore):
         """Insert or update (upsert) a registered MCP server by name.
 
         Secrets (headers, env, auth_token) are encrypted before being written.
+        The ``auth_mode`` (REQ-004, non-secret) is persisted as plain text.
         The ``current_user_id`` RLS contextvar is persisted as ``user_id`` on
         the row (empty string when no user is set — legacy path).
 
@@ -108,8 +109,8 @@ class McpRegistryStore(McpServerRegistryStore):
             INSERT INTO mcp_servers
                 (name, transport, url, headers_encrypted, env_encrypted,
                  auth_token_encrypted, tool_count, created_at, updated_at,
-                 source_type, openapi_url, user_id)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                 source_type, openapi_url, user_id, auth_mode)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             ON CONFLICT (name) DO UPDATE SET
                 transport            = EXCLUDED.transport,
                 url                  = EXCLUDED.url,
@@ -120,7 +121,8 @@ class McpRegistryStore(McpServerRegistryStore):
                 updated_at           = now(),
                 source_type          = EXCLUDED.source_type,
                 openapi_url          = EXCLUDED.openapi_url,
-                user_id              = EXCLUDED.user_id
+                user_id              = EXCLUDED.user_id,
+                auth_mode            = EXCLUDED.auth_mode
             WHERE mcp_servers.user_id = EXCLUDED.user_id;
             """
         else:
@@ -129,8 +131,8 @@ class McpRegistryStore(McpServerRegistryStore):
             INSERT INTO mcp_servers
                 (name, transport, url, headers_encrypted, env_encrypted,
                  auth_token_encrypted, tool_count, created_at, updated_at,
-                 source_type, openapi_url, user_id)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                 source_type, openapi_url, user_id, auth_mode)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             ON CONFLICT (name) DO UPDATE SET
                 transport            = EXCLUDED.transport,
                 url                  = EXCLUDED.url,
@@ -141,7 +143,8 @@ class McpRegistryStore(McpServerRegistryStore):
                 updated_at           = now(),
                 source_type          = EXCLUDED.source_type,
                 openapi_url          = EXCLUDED.openapi_url,
-                user_id              = EXCLUDED.user_id;
+                user_id              = EXCLUDED.user_id,
+                auth_mode            = EXCLUDED.auth_mode;
             """
         async with self._pool.acquire() as conn:
             await set_rls_context(conn, current_user_id.get())
@@ -159,6 +162,7 @@ class McpRegistryStore(McpServerRegistryStore):
                 entry.source_type,
                 entry.openapi_url,
                 user_id,
+                entry.auth_mode.value,
             )
             logger.info(LogMessage.MCP_SERVER_SAVE_REPOSITORY, entry.name)
 
@@ -202,7 +206,7 @@ class McpRegistryStore(McpServerRegistryStore):
         sql = f"""
         SELECT name, transport, url, headers_encrypted, env_encrypted,
                auth_token_encrypted, tool_count, created_at, updated_at,
-               source_type, openapi_url, user_id
+               source_type, openapi_url, user_id, auth_mode
         FROM mcp_servers
         {where};
         """
@@ -240,7 +244,7 @@ class McpRegistryStore(McpServerRegistryStore):
         sql = f"""
         SELECT name, transport, url, headers_encrypted, env_encrypted,
                auth_token_encrypted, tool_count, created_at, updated_at,
-               source_type, openapi_url, user_id
+               source_type, openapi_url, user_id, auth_mode
         FROM mcp_servers
         {where}
         ORDER BY name;
@@ -354,6 +358,7 @@ class McpRegistryStore(McpServerRegistryStore):
             headers=json.loads(headers_json),
             env=json.loads(env_json),
             auth_token=auth_token,
+            auth_mode=McpAuthMode(row["auth_mode"]),
             tool_count=row["tool_count"],
             source_type=row["source_type"],
             openapi_url=row["openapi_url"],

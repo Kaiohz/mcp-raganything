@@ -62,6 +62,7 @@ def _row(
     tool_count: int = 3,
     source_type: str = "external",
     openapi_url: str | None = None,
+    auth_mode: str = "headers",
 ) -> dict:
     return {
         "name": name,
@@ -74,6 +75,7 @@ def _row(
         "tool_count": tool_count,
         "source_type": source_type,
         "openapi_url": openapi_url,
+        "auth_mode": auth_mode,
         "created_at": _now(),
         "updated_at": _now(),
     }

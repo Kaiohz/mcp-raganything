@@ -35,6 +35,7 @@ from dependencies import (
     get_update_mcp_server_use_case,
     get_validate_mcp_server_use_case,
 )
+from domain.entities.mcp_server_config import McpAuthMode
 from domain.entities.mcp_server_registry_entry import RegisteredMcpServer
 from domain.errors.mcp import (
     McpServerAlreadyExistsError,
@@ -57,6 +58,7 @@ def _entry(
     tool_count: int = 3,
     source_type: str = "external",
     openapi_url: str | None = None,
+    auth_mode: McpAuthMode = McpAuthMode.HEADERS,
 ) -> RegisteredMcpServer:
     return RegisteredMcpServer(
         name=name,
@@ -64,6 +66,7 @@ def _entry(
         headers={"Authorization": "Bearer tok"},
         env={"API_KEY": "abc"},
         auth_token=auth_token,
+        auth_mode=auth_mode,
         tool_count=tool_count,
         source_type=source_type,
         openapi_url=openapi_url,
@@ -78,6 +81,7 @@ def _masked_entry(
     tool_count: int = 3,
     source_type: str = "external",
     openapi_url: str | None = None,
+    auth_mode: McpAuthMode = McpAuthMode.HEADERS,
 ) -> RegisteredMcpServer:
     """An entry as returned by masked endpoints (secrets stripped)."""
     return RegisteredMcpServer(
@@ -86,6 +90,7 @@ def _masked_entry(
         headers={},
         env={},
         auth_token=None,
+        auth_mode=auth_mode,
         tool_count=tool_count,
         source_type=source_type,
         openapi_url=openapi_url,
@@ -821,3 +826,229 @@ class TestPartialUpdateMergeContract:
 
         # Assert
         assert resp.status_code == 422
+
+
+# -- auth_mode echo (feat-mcp-oauth2-dual-auth, registry M-1) -------------------
+
+
+class TestAuthModeEcho:
+    """``auth_mode`` (REQ-004) is persisted, echoed unmasked and typed.
+
+    Contract with composable-ui (which posts ``auth_mode``) and
+    composable-agents (whose registry client reads the echoed mode and warns
+    when it is dropped — M-5):
+
+    * create/validate accept ``auth_mode`` and the masked create/list/get
+      responses ECHO it unmasked (non-secret metadata — unlike headers/auth_
+      token/env);
+    * an unknown value is rejected with 422 (never silently degraded);
+    * PUT is a PARTIAL update: ABSENT ``auth_mode`` preserves the stored
+      value, an explicit value updates it, an explicit ``null`` is rejected.
+    """
+
+    async def test_create_accepts_user_token_and_echoes_it_unmasked(
+        self, client: AsyncClient, mock_create_use_case: AsyncMock
+    ):
+        # Arrange — the use case returns the persisted masked entry
+        mock_create_use_case.execute = AsyncMock(
+            return_value=_masked_entry("server-x", auth_mode=McpAuthMode.USER_TOKEN)
+        )
+        body = {
+            "name": "server-x",
+            "url": "http://localhost:3001/mcp",
+            "auth_mode": "user_token",
+        }
+
+        # Act
+        resp = await client.post(BASE_URL, json=body)
+
+        # Assert — the response echoes the mode while the secrets stay masked
+        assert resp.status_code == 201
+        assert resp.json()["auth_mode"] == "user_token"
+        assert resp.json()["auth_token"] is None
+        assert resp.json()["headers"] == {}
+
+        # The entity handed to the use case carries the requested mode
+        sent = mock_create_use_case.execute.call_args.args[0]
+        assert sent.auth_mode is McpAuthMode.USER_TOKEN
+
+    async def test_create_defaults_to_headers_when_absent(
+        self, client: AsyncClient, mock_create_use_case: AsyncMock
+    ):
+        # Arrange
+        mock_create_use_case.execute = AsyncMock(return_value=_masked_entry("server-x"))
+        body = {"name": "server-x", "url": "http://localhost:3001/mcp"}
+
+        # Act
+        resp = await client.post(BASE_URL, json=body)
+
+        # Assert
+        assert resp.status_code == 201
+        assert resp.json()["auth_mode"] == "headers"
+        sent = mock_create_use_case.execute.call_args.args[0]
+        assert sent.auth_mode is McpAuthMode.HEADERS
+
+    async def test_create_rejects_unknown_auth_mode_422(
+        self, client: AsyncClient, mock_create_use_case: AsyncMock
+    ):
+        # Arrange
+        body = {
+            "name": "server-x",
+            "url": "http://localhost:3001/mcp",
+            "auth_mode": "basic",
+        }
+
+        # Act — an unknown mode is REJECTED, never silently degrading
+        resp = await client.post(BASE_URL, json=body)
+
+        # Assert
+        assert resp.status_code == 422
+        mock_create_use_case.execute.assert_not_awaited()
+
+    async def test_validate_accepts_user_token(
+        self, client: AsyncClient, mock_validate_use_case: AsyncMock
+    ):
+        # Arrange
+        mock_validate_use_case.execute = AsyncMock(return_value=2)
+        body = {
+            "url": "http://localhost:3001/mcp",
+            "auth_mode": "user_token",
+        }
+
+        # Act
+        resp = await client.post(f"{BASE_URL}/validate", json=body)
+
+        # Assert
+        assert resp.status_code == 200
+        assert resp.json()["tool_count"] == 2
+
+    async def test_validate_rejects_unknown_auth_mode_422(
+        self, client: AsyncClient, mock_validate_use_case: AsyncMock
+    ):
+        # Arrange
+        body = {
+            "url": "http://localhost:3001/mcp",
+            "auth_mode": "bearer",
+        }
+
+        # Act
+        resp = await client.post(f"{BASE_URL}/validate", json=body)
+
+        # Assert
+        assert resp.status_code == 422
+        mock_validate_use_case.execute.assert_not_awaited()
+
+    async def test_list_echoes_auth_mode_with_masked_secrets(
+        self, client: AsyncClient, mock_list_use_case: AsyncMock
+    ):
+        # Arrange — one user_token entry, one default entry
+        mock_list_use_case.execute = AsyncMock(
+            return_value=[
+                _masked_entry("server-a", auth_mode=McpAuthMode.USER_TOKEN),
+                _masked_entry("server-b"),
+            ]
+        )
+
+        # Act
+        resp = await client.get(BASE_URL)
+
+        # Assert
+        assert resp.status_code == 200
+        by_name = {item["name"]: item for item in resp.json()}
+        assert by_name["server-a"]["auth_mode"] == "user_token"
+        assert by_name["server-b"]["auth_mode"] == "headers"
+        for item in by_name.values():
+            assert item["auth_token"] is None
+            assert item["headers"] == {}
+            assert item["env"] == {}
+
+    async def test_get_echoes_auth_mode(self, client, mock_get_use_case: AsyncMock):
+        # Arrange
+        mock_get_use_case.execute = AsyncMock(
+            return_value=_masked_entry("web-search", auth_mode=McpAuthMode.USER_TOKEN)
+        )
+
+        # Act
+        resp = await client.get(f"{BASE_URL}/web-search")
+
+        # Assert
+        assert resp.status_code == 200
+        assert resp.json()["auth_mode"] == "user_token"
+
+    async def test_reveal_echoes_auth_mode(self, client, mock_get_use_case: AsyncMock):
+        # Arrange — reveal keeps plaintext secrets AND the mode
+        mock_get_use_case.execute = AsyncMock(
+            return_value=_entry("web-search", auth_mode=McpAuthMode.USER_TOKEN)
+        )
+
+        # Act
+        resp = await client.get(f"{BASE_URL}/web-search/reveal")
+
+        # Assert
+        assert resp.status_code == 200
+        assert resp.json()["auth_mode"] == "user_token"
+        assert resp.json()["auth_token"] == "secret-token"
+
+    async def test_partial_update_explicit_auth_mode_updates_stored_value(
+        self, client, mock_get_use_case: AsyncMock, mock_update_use_case: AsyncMock
+    ):
+        # Arrange — existing entry in headers mode; the client switches to OAuth2
+        existing = _entry("web-search")
+        mock_get_use_case.execute = AsyncMock(return_value=existing)
+        mock_update_use_case.execute = AsyncMock(
+            return_value=_masked_entry("web-search", auth_mode=McpAuthMode.USER_TOKEN)
+        )
+        body = {"auth_mode": "user_token"}
+
+        # Act
+        resp = await client.put(f"{BASE_URL}/web-search", json=body)
+
+        # Assert — the merged entity carries the NEW mode, other fields preserved
+        assert resp.status_code == 200
+        merged = mock_update_use_case.execute.call_args.args[1]
+        assert merged.auth_mode is McpAuthMode.USER_TOKEN
+        assert merged.auth_token == "secret-token"
+        assert merged.headers == {"Authorization": "Bearer tok"}
+
+    async def test_partial_update_absent_auth_mode_preserves_stored_value(
+        self, client, mock_get_use_case: AsyncMock, mock_update_use_case: AsyncMock
+    ):
+        # Arrange — existing user_token entry; the body does NOT mention auth_mode
+        existing = _entry("web-search", auth_mode=McpAuthMode.USER_TOKEN)
+        mock_get_use_case.execute = AsyncMock(return_value=existing)
+        body = {"headers": {"X-Only": "v"}}
+
+        # Act
+        resp = await client.put(f"{BASE_URL}/web-search", json=body)
+
+        # Assert — the stored user_token mode is PRESERVED (exclude_unset)
+        assert resp.status_code == 200
+        merged = mock_update_use_case.execute.call_args.args[1]
+        assert merged.auth_mode is McpAuthMode.USER_TOKEN
+        assert merged.headers == {"X-Only": "v"}
+
+    async def test_partial_update_rejects_null_auth_mode_422(
+        self, client, mock_get_use_case: AsyncMock
+    ):
+        # Arrange — an explicit null is meaningless for the non-secret mode
+        body = {"auth_mode": None}
+
+        # Act
+        resp = await client.put(f"{BASE_URL}/web-search", json=body)
+
+        # Assert
+        assert resp.status_code == 422
+        mock_get_use_case.execute.assert_not_awaited()
+
+    async def test_partial_update_rejects_unknown_auth_mode_422(
+        self, client, mock_get_use_case: AsyncMock
+    ):
+        # Arrange
+        body = {"auth_mode": "session"}
+
+        # Act
+        resp = await client.put(f"{BASE_URL}/web-search", json=body)
+
+        # Assert
+        assert resp.status_code == 422
+        mock_get_use_case.execute.assert_not_awaited()

@@ -13,7 +13,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from domain.entities.mcp_server_config import McpTransportType
+from domain.entities.mcp_server_config import McpAuthMode, McpTransportType
 
 
 class RegisteredMcpServer(BaseModel):
@@ -31,6 +31,11 @@ class RegisteredMcpServer(BaseModel):
         headers: HTTP headers to send to the server (decrypted on read).
         env: Environment variables for stdio transport (decrypted on read).
         auth_token: Bearer auth token (decrypted on read, None if unset).
+        auth_mode: Credential-transmission mode (feat-mcp-oauth2 REQ-004) —
+            ``"headers"`` (default: the stored headers are sent as-is) or
+            ``"user_token"`` (the consuming service injects the connected
+            user's credential at load/validate time). Non-secret metadata:
+            echoed unmasked in every masked projection, unlike the secrets.
         tool_count: Number of tools discovered during the last validation.
         source_type: Origin of the server — ``"external"`` (plain MCP server
             reached over the network) or ``"openapi"`` (server built in-process
@@ -50,6 +55,7 @@ class RegisteredMcpServer(BaseModel):
     headers: dict[str, str] = Field(default_factory=dict)
     env: dict[str, str] = Field(default_factory=dict)
     auth_token: str | None = None
+    auth_mode: McpAuthMode = McpAuthMode.HEADERS
     tool_count: int = 0
     source_type: str = "external"
     openapi_url: str | None = None

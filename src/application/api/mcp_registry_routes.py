@@ -44,7 +44,11 @@ from dependencies import (
     get_update_mcp_server_use_case,
     get_validate_mcp_server_use_case,
 )
-from domain.entities.mcp_server_config import McpServerConfig, McpTransportType
+from domain.entities.mcp_server_config import (
+    McpAuthMode,
+    McpServerConfig,
+    McpTransportType,
+)
 from domain.entities.mcp_server_registry_entry import RegisteredMcpServer
 
 logger = logging.getLogger(__name__)
@@ -60,12 +64,20 @@ class _McpServerBaseRequest(BaseModel):
     ``source_type="external"`` (a configured remote URL) and ``openapi_url`` is
     required for ``source_type="openapi"`` (the mounted URL is generated, so
     ``url`` is omitted on the request).
+
+    ``auth_mode`` (feat-mcp-oauth2 REQ-004) selects the credential-transmission
+    mode: ``"headers"`` (default — the entered headers are sent as-is) or
+    ``"user_token"`` (the consuming service injects the connected user's
+    credential at load/validate time). Unknown values are rejected (the field
+    is typed, not an open string) so the registry never silently degrades an
+    unsupported mode.
     """
 
     url: str | None = None
     headers: dict[str, str] = Field(default_factory=dict)
     env: dict[str, str] = Field(default_factory=dict)
     auth_token: str | None = None
+    auth_mode: McpAuthMode = McpAuthMode.HEADERS
     source_type: str = "external"
     openapi_url: str | None = None
 
@@ -113,6 +125,11 @@ class McpServerUpdateRequest(BaseModel):
     fields) is validated on the MERGED entity server-side, after the merge —
     not on the partial body alone.
 
+    ``auth_mode`` (feat-mcp-oauth2 REQ-004): ABSENT preserves the stored mode,
+    an explicit value updates it, and an explicit ``null`` is rejected — the
+    mode is non-secret metadata, so ``null`` carries no "keep stored secret"
+    meaning the way ``headers``/``env``/``auth_token`` nulls might.
+
     The server ``name`` is taken from the URL path, not the body.
     """
 
@@ -120,6 +137,7 @@ class McpServerUpdateRequest(BaseModel):
     headers: dict[str, str] | None = None
     env: dict[str, str] | None = None
     auth_token: str | None = None
+    auth_mode: McpAuthMode | None = None
     source_type: str | None = None
     openapi_url: str | None = None
 
@@ -132,6 +150,22 @@ class McpServerUpdateRequest(BaseModel):
         """
         if not self.model_fields_set:
             raise ValueError("provide at least one editable field")
+        return self
+
+    @model_validator(mode="after")
+    def _reject_null_auth_mode(self) -> Self:
+        """Reject an explicit ``null`` ``auth_mode`` (REQ-004).
+
+        Only ABSENT (preserve) and a VALUE (update) are meaningful for the
+        non-secret mode; an explicit ``null`` would bypass the typed merge
+        (``model_copy`` does not re-validate) and violate the entity's
+        ``NOT NULL`` column downstream.
+
+        Raises:
+            ValueError: If ``auth_mode`` is explicitly ``null``.
+        """
+        if self.auth_mode is None and "auth_mode" in self.model_fields_set:
+            raise ValueError("'auth_mode' cannot be null (omit it to preserve)")
         return self
 
 
@@ -211,6 +245,7 @@ async def create_mcp_server(
         headers=body.headers,
         env=body.env,
         auth_token=body.auth_token,
+        auth_mode=body.auth_mode,
         source_type=body.source_type,
         openapi_url=body.openapi_url,
         created_at=now,

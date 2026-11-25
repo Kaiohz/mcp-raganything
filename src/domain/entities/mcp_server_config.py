@@ -18,6 +18,19 @@ class McpTransportType(StrEnum):
     HTTP = "http"
 
 
+class McpAuthMode(StrEnum):
+    """Authentication mode of a registered MCP server (feat-mcp-oauth2 REQ-004).
+
+    Non-secret metadata: the registry echoes it unmasked in every masked
+    projection (unlike ``headers``/``auth_token``/``env``).
+    """
+
+    #: The configured headers are sent as-is (default, current behavior).
+    HEADERS = "headers"
+    #: The connected user's credential is injected at load/validate time.
+    USER_TOKEN = "user_token"
+
+
 class McpServerConfig(BaseModel, frozen=True):
     """Configuration for connecting to an MCP server.
 

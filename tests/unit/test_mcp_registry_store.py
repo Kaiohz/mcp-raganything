@@ -18,7 +18,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from domain.entities.mcp_server_config import McpTransportType
+from domain.entities.mcp_server_config import McpAuthMode, McpTransportType
 from domain.entities.mcp_server_registry_entry import RegisteredMcpServer
 from domain.errors.mcp import McpServerNotFoundError
 from domain.ports.secret_cipher import SecretCipher
@@ -61,6 +61,7 @@ def _row(
     tool_count: int = 3,
     source_type: str = "external",
     openapi_url: str | None = None,
+    auth_mode: str = "headers",
 ) -> dict:
     return {
         "name": name,
@@ -72,6 +73,7 @@ def _row(
         "tool_count": tool_count,
         "source_type": source_type,
         "openapi_url": openapi_url,
+        "auth_mode": auth_mode,
         "created_at": _now(),
         "updated_at": _now(),
     }
@@ -425,3 +427,140 @@ class TestExists:
 
         # Assert
         assert result is False
+
+
+# -- auth_mode persistence (feat-mcp-oauth2-dual-auth, registry M-1) ------------
+
+
+class TestAuthModePersistence:
+    """``auth_mode`` (REQ-004, non-secret) round-trips through the store.
+
+    The mode is persisted as plain text (no cipher round) and rehydrated into
+    the entity on read — the mode must survive restarts, unlike secrets whose
+    ciphertext is decrypted on read.
+    """
+
+    async def test_save_persists_auth_mode_as_plain_text(
+        self, store: McpRegistryStore, mock_conn: AsyncMock, mock_cipher: AsyncMock
+    ):
+        # Arrange — a user_token entry
+        entry = _entry(name="oauth-server")
+        entry = entry.model_copy(update={"auth_mode": McpAuthMode.USER_TOKEN})
+
+        # Act
+        await store.save(entry)
+
+        # Assert — the raw "user_token" value travels as the last SQL param
+        # (plain text: the cipher is NEVER called with the mode value)
+        params = mock_conn.execute.await_args.args
+        assert params[-1] == "user_token"
+        cipher_args = [c.args[0] for c in mock_cipher.encrypt.await_args_list]
+        assert all("user_token" not in v for v in cipher_args)
+
+    async def test_save_upsert_updates_auth_mode(
+        self, store: McpRegistryStore, mock_conn: AsyncMock
+    ):
+        # Arrange
+        entry = _entry()
+        entry = entry.model_copy(update={"auth_mode": McpAuthMode.HEADERS})
+
+        # Act
+        await store.save(entry)
+
+        # Assert — the ON CONFLICT clause carries auth_mode
+        sql_arg = mock_conn.execute.await_args.args[0]
+        assert "auth_mode            = EXCLUDED.auth_mode" in sql_arg
+
+    async def test_get_rehydrates_auth_mode_from_row(
+        self, store: McpRegistryStore, mock_conn: AsyncMock
+    ):
+        # Arrange — the row carries the persisted user_token mode
+        mock_conn.fetchrow.return_value = _row(
+            auth_mode="user_token",
+            headers_encrypted="ENC({})",
+            env_encrypted="ENC({})",
+            auth_token_encrypted=None,
+        )
+
+        # Act
+        result = await store.get("oauth-server")
+
+        # Assert
+        assert result.auth_mode is McpAuthMode.USER_TOKEN
+
+    async def test_get_defaults_to_backfilled_headers_mode(
+        self, store: McpRegistryStore, mock_conn: AsyncMock
+    ):
+        # Arrange — a row backfilled by the 004 migration ('headers')
+        mock_conn.fetchrow.return_value = _row(
+            auth_mode="headers",
+            headers_encrypted="ENC({})",
+            env_encrypted="ENC({})",
+            auth_token_encrypted=None,
+        )
+
+        # Act
+        result = await store.get("web-search")
+
+        # Assert
+        assert result.auth_mode is McpAuthMode.HEADERS
+
+    async def test_list_all_carries_auth_mode(
+        self, store: McpRegistryStore, mock_conn: AsyncMock
+    ):
+        # Arrange — one user_token row, one backfilled row
+        mock_conn.fetch.return_value = [
+            _row(
+                name="oauth-server",
+                auth_mode="user_token",
+                headers_encrypted="ENC({})",
+                env_encrypted="ENC({})",
+                auth_token_encrypted=None,
+            ),
+            _row(
+                name="legacy-server",
+                auth_mode="headers",
+                headers_encrypted="ENC({})",
+                env_encrypted="ENC({})",
+                auth_token_encrypted=None,
+            ),
+        ]
+
+        # Act
+        entries = {e.name: e for e in await store.list_all()}
+
+        # Assert
+        assert entries["oauth-server"].auth_mode is McpAuthMode.USER_TOKEN
+        assert entries["legacy-server"].auth_mode is McpAuthMode.HEADERS
+
+    async def test_auth_mode_survives_a_fresh_store_instance(
+        self, mock_pool: MagicMock, mock_conn: AsyncMock, mock_cipher: AsyncMock
+    ):
+        """Persistence across a second store instantiation (restart semantics).
+
+        A NEW :class:`McpRegistryStore` built over the SAME backend must read
+        back the mode persisted by the first instance — the mode lives in the
+        row, not in the process.
+        """
+        # Arrange — first instance saves a user_token entry
+        first = McpRegistryStore(pool=mock_pool, cipher=mock_cipher)
+        entry = _entry(name="oauth-server")
+        entry = entry.model_copy(update={"auth_mode": McpAuthMode.USER_TOKEN})
+        await first.save(entry)
+
+        # The second instantiation reads the row the FIRST one wrote
+        persisted_params = mock_conn.execute.await_args.args
+        mock_conn.fetchrow.return_value = _row(
+            name="oauth-server",
+            auth_mode=persisted_params[-1],
+            headers_encrypted="ENC({})",
+            env_encrypted="ENC({})",
+            auth_token_encrypted=None,
+        )
+
+        # Act
+        second = McpRegistryStore(pool=mock_pool, cipher=mock_cipher)
+        result = await second.get("oauth-server")
+
+        # Assert
+        assert result.auth_mode is McpAuthMode.USER_TOKEN
