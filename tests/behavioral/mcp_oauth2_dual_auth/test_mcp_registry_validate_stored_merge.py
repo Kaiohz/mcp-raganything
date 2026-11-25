@@ -22,6 +22,9 @@ What is pinned here (the FULL real chain: REAL app → REAL route → REAL
   no id) FAILS with a 401-driven 422 — the bug, reproduced;
 * validating the same payload + ``id`` SUCCEEDS — the stored secret reached
   the target (observed on the socket, not mocked): the 401→200 proof;
+* the UI's ``server_id`` wire name (BUG-005) runs the SAME stored merge —
+  401 → 200 with the stored credential on the wire — while both-absent
+  payloads keep the stateless candidate semantics;
 * the response carries no stored secret (tool count only);
 * a dirty override (url + auth_mode) is honored while the secrets still come
   from storage;
@@ -249,7 +252,7 @@ def registry_store(running_app, monkeypatch: pytest.MonkeyPatch):
 
 @pytest.mark.asyncio(loop_scope="session")
 class TestValidateStoredEntry:
-    """"Test connection" against a stored server carries its credential."""
+    """ "Test connection" against a stored server carries its credential."""
 
     async def test_edit_mode_probe_uses_the_stored_credential_401_to_200_proof(
         self,
@@ -298,7 +301,8 @@ class TestValidateStoredEntry:
 
         # Act 2 — the FIX: the same payload + id → stored credential travels
         fix_resp = await http_client.post(
-            VALIDATE_PATH, json={**bug_body, "id": "qa-validate-stored-apikey"},
+            VALIDATE_PATH,
+            json={**bug_body, "id": "qa-validate-stored-apikey"},
             headers=API_KEY_ALICE,
         )
 
@@ -473,4 +477,80 @@ class TestValidateStoredEntry:
         # Assert
         assert resp.status_code == 200, resp.text
         assert resp.json()["tool_count"] == 1
+        assert set(target.probe.api_key_values()) == {STORED_API_KEY}
+
+    async def test_server_id_wire_alias_and_both_absent_semantics(
+        self,
+        http_client: httpx.AsyncClient,
+        probe_targets,
+        registry_store,
+        real_jwt_signer,
+    ):
+        """UI BUG-005: the edit dialog sends ``server_id`` — the alias must
+        run the SAME stored merge as ``id`` (401 → 200, the stored credential
+        observed on the wire), while both-absent payloads keep the stateless
+        candidate semantics (the false 401 unchanged)."""
+        # Arrange — a server registered with a VALID stored credential; the
+        # edit dialog sends the masked payload referencing the entry under
+        # the UI's field name
+        target = probe_targets(STORED_API_KEY)
+        resp = await http_client.post(
+            SERVERS_PATH,
+            json={
+                "name": "qa-validate-server-id",
+                "source_type": "external",
+                "url": f"{target.base_url}/mcp",
+                "headers": {"X-API-Key": STORED_API_KEY},
+                "env": {},
+                "auth_mode": "headers",
+            },
+            headers=API_KEY_ALICE,
+        )
+        assert resp.status_code == 201, resp.text
+        assert resp.json()["tool_count"] == 1
+        target.probe.reset()  # drop the create session's records
+
+        masked_body = {
+            "name": "qa-validate-server-id",
+            "source_type": "external",
+            "url": f"{target.base_url}/mcp",
+            "headers": {},
+            "env": {},
+            "auth_mode": "headers",
+        }
+
+        # Act 1 — BOTH names absent: the stateless probe runs UNAUTHENTICATED
+        # (the unchanged semantics — the false 401 must stay observable)
+        stateless = await http_client.post(
+            VALIDATE_PATH, json=masked_body, headers=API_KEY_ALICE
+        )
+        assert stateless.status_code == 422, stateless.text
+        assert "401" in stateless.json()["detail"]
+
+        # Act 2 — the UI's field name: the stored credential reaches the target
+        by_alias = await http_client.post(
+            VALIDATE_PATH,
+            json={**masked_body, "server_id": "qa-validate-server-id"},
+            headers=API_KEY_ALICE,
+        )
+
+        # Assert 2 — 200 with the REAL tool count, the stored key on the wire
+        assert by_alias.status_code == 200, by_alias.text
+        assert by_alias.json()["tool_count"] >= 1
+        assert by_alias.json() == {"tool_count": 1}
+        alias_keys = target.probe.api_key_values()
+        assert alias_keys, "the alias probe must have reached the real target"
+        assert set(alias_keys) == {STORED_API_KEY}
+        target.probe.reset()
+
+        # Act 3 — ``id`` keeps working (the primary name is unchanged)
+        by_id = await http_client.post(
+            VALIDATE_PATH,
+            json={**masked_body, "id": "qa-validate-server-id"},
+            headers=API_KEY_ALICE,
+        )
+
+        # Assert 3
+        assert by_id.status_code == 200, by_id.text
+        assert by_id.json()["tool_count"] >= 1
         assert set(target.probe.api_key_values()) == {STORED_API_KEY}

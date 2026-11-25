@@ -13,6 +13,11 @@ In both cases the entry is persisted with the discovered tool count. The
 openapi ports (``OpenApiMcpFactory``, ``GeneratedMcpRunnerPort``) are optional
 so the external path stays backward-compatible with callers that only inject
 the original dependencies.
+
+``probe_credentials`` (REQ-004 / BUG-006): OPTIONAL probe-only headers
+(the ``user_token`` caller credential derived at the transport boundary)
+merged into the reachability probe — the tool load for external servers,
+the spec fetch for openapi servers — and never persisted.
 """
 
 import logging
@@ -54,11 +59,23 @@ class CreateMcpServerUseCase:
         self._openapi_factory = openapi_factory
         self._runner = runner
 
-    async def execute(self, entry: RegisteredMcpServer) -> RegisteredMcpServer:
+    async def execute(
+        self,
+        entry: RegisteredMcpServer,
+        probe_credentials: dict[str, str] | None = None,
+    ) -> RegisteredMcpServer:
         """Register a new MCP server.
 
         Args:
             entry: The registered server entry to create.
+            probe_credentials: PROBE-ONLY headers for the reachability check
+                (REQ-004 / BUG-006): the caller's ``auth_mode`` injection
+                (``user_token``) derived by the ``user_credential_headers``
+                domain rule at the transport boundary. Merged AFTER the
+                configured headers (an injected credential wins over
+                colliding names) and NEVER persisted — the stored entry keeps
+                exactly ``entry.headers``. ``None``/empty (headers mode, no
+                caller credential, legacy callers) probes unchanged.
 
         Returns:
             The persisted entry with the discovered tool count.
@@ -76,13 +93,13 @@ class CreateMcpServerUseCase:
             )
 
         if entry.source_type == "openapi":
-            return await self._create_openapi(entry)
+            return await self._create_openapi(entry, probe_credentials)
 
         config = McpServerConfig(
             name=entry.name,
             transport=entry.transport,
             url=entry.url,
-            headers=entry.headers,
+            headers={**entry.headers, **(probe_credentials or {})},
             env=entry.env,
             auth_token=entry.auth_token,
         )
@@ -104,11 +121,22 @@ class CreateMcpServerUseCase:
         logger.info(LogMessage.MCP_SERVER_CREATED_UC, saved.name, tool_count)
         return saved
 
-    async def _create_openapi(self, entry: RegisteredMcpServer) -> RegisteredMcpServer:
+    async def _create_openapi(
+        self,
+        entry: RegisteredMcpServer,
+        probe_credentials: dict[str, str] | None = None,
+    ) -> RegisteredMcpServer:
         """Fetch spec + runner.mount + runner.count_tools, then persist.
+
+        ``probe_credentials`` (REQ-004 / BUG-006) reaches the SPEC FETCH only
+        (the network probe of the create flow); the mounted server keeps the
+        stored headers. Mirrors the validate route's openapi branch
+        (injected credential wins over colliding header names).
 
         Args:
             entry: The registered server entry (``source_type="openapi"``).
+            probe_credentials: PROBE-ONLY fetch headers (see
+                :meth:`execute`); ``None``/empty fetches unchanged.
 
         Returns:
             The persisted entry with the discovered tool count and mounted URL.
@@ -121,7 +149,8 @@ class CreateMcpServerUseCase:
         assert self._runner is not None  # noqa: S101 — openapi path requires the runner
 
         spec = await self._openapi_factory.fetch_spec(
-            entry.openapi_url or "", headers=entry.headers
+            entry.openapi_url or "",
+            headers={**entry.headers, **(probe_credentials or {})},
         )
         mounted_url = await self._runner.mount(entry.name, spec, headers=entry.headers)
         try:

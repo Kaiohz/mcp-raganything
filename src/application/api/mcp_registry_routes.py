@@ -3,9 +3,13 @@
 Endpoints (all under ``/api/v1/mcp/servers``, protected by the global API key
 dependency injected when the router is included in ``main.py``):
 
-    POST   /                 — create a registered MCP server (201, masked)
+    POST   /                 — create a registered MCP server (201, masked);
+                               the create-time probe carries the caller's
+                               credential when ``auth_mode="user_token"``
+                               (REQ-004 / BUG-006, probe-only injection)
     POST   /validate         — dry-run validation of a server config (200);
-                               an optional ``id`` merges the probe over the
+                               an optional ``id`` (or ``server_id`` —
+                               BUG-005 alias) merges the probe over the
                                STORED entry (UI BUG-001: masked edit payload)
     GET    /                 — list all registered servers (200, masked)
     GET    /{name}           — get a single server (200, masked)
@@ -30,7 +34,7 @@ from datetime import UTC, datetime
 from typing import Annotated, Self
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field, model_validator
+from pydantic import AliasChoices, BaseModel, Field, model_validator
 
 from application.use_cases.create_mcp_server import CreateMcpServerUseCase
 from application.use_cases.delete_mcp_server import DeleteMcpServerUseCase
@@ -165,9 +169,19 @@ class McpServerValidateRequest(_McpServerBaseRequest):
     the stored mode otherwise. No source-type coherence is enforced on the
     payload alone when ``id`` is present — the check runs server-side on the
     MERGED specification (same contract as the partial update route).
+
+    The stored-entry reference is accepted under BOTH wire names (BUG-005):
+    ``id`` remains the primary (first) name and ``server_id`` is the
+    composable-ui edit dialog's field — either populates the same ``id``
+    attribute, and when BOTH are sent ``id`` wins. Accepting the UI's name
+    keeps the two halves of the wire contract pinned together (the UI's
+    behavioural suite sends ``server_id``; this backend's suite sends ``id``).
     """
 
-    id: str | None = None
+    id: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("id", "server_id"),
+    )
 
     @model_validator(mode="after")
     def validate_source_type_fields(self) -> Self:
@@ -303,12 +317,29 @@ async def create_mcp_server(
     use_case: Annotated[
         CreateMcpServerUseCase, Depends(get_create_mcp_server_use_case)
     ],
+    caller: Annotated[AuthContext | None, Depends(get_request_auth_context)],
 ) -> RegisteredMcpServer:
     """Create a new registered MCP server.
+
+    The create-time reachability probe (the tool load that records
+    ``tool_count``; for ``source_type="openapi"`` the spec fetch) runs with
+    ``auth_mode`` honored (REQ-004, BUG-006): when ``auth_mode="user_token"``
+    and the caller is authenticated, the caller's credential
+    (``Authorization: Bearer <jwt>`` / ``X-API-Key: <key>``, derived by the
+    ``user_credential_headers`` domain rule) is merged into the PROBE headers
+    ONLY — an injected credential wins over colliding header names. The
+    injected value is never persisted: the stored entry keeps exactly the
+    configured headers (the calling user's token is per-request state, not a
+    stored secret). The default ``headers`` mode probes unchanged, and a
+    ``user_token`` request without a caller credential (legacy/unattended
+    path) drops the injection (drop-empty semantics — the probe then answers
+    the target's own 401 exactly as before).
 
     Args:
         body: The request body with server configuration.
         use_case: Injected create use case.
+        caller: The authenticated caller context (``None`` when the request
+            carries no dual-auth credential).
 
     Returns:
         The created registered server entry (secrets masked).
@@ -327,7 +358,8 @@ async def create_mcp_server(
         created_at=now,
         updated_at=now,
     )
-    created = await use_case.execute(entry)
+    probe_credentials = user_credential_headers(body.auth_mode, caller)
+    created = await use_case.execute(entry, probe_credentials=probe_credentials)
     return _mask(created)
 
 
@@ -384,7 +416,10 @@ async def validate_mcp_server(
     fields override them — a masked-empty value (``headers={}``, ``env={}``,
     ``auth_token=""``/``null``) never clears a stored secret. A foreign or
     unknown ``id`` answers 404 (per-user isolation). The response stays the
-    standard validate payload — the stored secrets are never echoed.
+    standard validate payload — the stored secrets are never echoed. The
+    reference is accepted as ``id`` (primary) or ``server_id`` (BUG-005: the
+    composable-ui payload name — both populate the same field; ``id`` wins
+    when both are sent).
 
     ``auth_mode`` (feat-mcp-oauth2 REQ-004) is honored at validate time — "Test
     connection" probes the target EXACTLY as the runtime would: when the

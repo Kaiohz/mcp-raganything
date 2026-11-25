@@ -464,6 +464,121 @@ class TestCreateMcpServerRouteOpenApi:
         assert resp.json()["headers"] == {}
 
 
+# -- POST /api/v1/mcp/servers/validate (create probe injection, REQ-004/BUG-006) -
+
+
+class TestCreateAuthModeInjection:
+    """``POST /`` injects the caller credential into the CREATE probe (REQ-004).
+
+    The create-time reachability probe IS a load (it runs the same tool
+    loading that records ``tool_count``), so in the ``user_token`` mode the
+    caller's credential (``user_credential_headers`` domain rule + the
+    ``get_request_auth_context`` provider, exactly like the validate route —
+    BUG-006) must reach the target during create too. The injection is
+    PROBE-ONLY: the route derives it from the request and the persisted entry
+    keeps exactly the configured headers.
+    """
+
+    def _wire_caller(
+        self, method: Literal["jwt", "api_key"] = "jwt", credential: str = "caller-jwt"
+    ):
+        app.dependency_overrides[get_request_auth_context] = lambda: AuthContext(
+            user_id="user-alice",
+            method=method,
+            raw_credential=credential,
+        )
+
+    async def test_user_token_create_injects_caller_jwt_probe_only(
+        self, client: AsyncClient, mock_create_use_case: AsyncMock
+    ):
+        # Arrange — the OAuth2 registration flow: user_token + JWT caller
+        self._wire_caller(method="jwt", credential="caller-jwt")
+        body = {
+            "name": "oauth2-self",
+            "url": "https://target.example.com/mcp",
+            "headers": {"X-Custom": "value"},
+            "auth_mode": "user_token",
+        }
+
+        # Act
+        resp = await client.post(BASE_URL, json=body)
+
+        # Assert — the persisted entry keeps the configured headers; the
+        # probe carries the INJECTED credential
+        assert resp.status_code == 201, resp.text
+        entry = mock_create_use_case.execute.await_args.args[0]
+        probe_credentials = mock_create_use_case.execute.await_args.kwargs[
+            "probe_credentials"
+        ]
+        assert entry.headers == {"X-Custom": "value"}
+        assert probe_credentials == {"Authorization": "Bearer caller-jwt"}
+
+    async def test_user_token_create_api_key_caller_injects_x_api_key(
+        self, client: AsyncClient, mock_create_use_case: AsyncMock
+    ):
+        # Arrange — a caller authenticated with its per-user API key
+        self._wire_caller(method="api_key", credential="key-alice")
+        body = {
+            "name": "oauth2-self-apikey",
+            "url": "https://target.example.com/mcp",
+            "auth_mode": "user_token",
+        }
+
+        # Act
+        resp = await client.post(BASE_URL, json=body)
+
+        # Assert
+        assert resp.status_code == 201, resp.text
+        probe_credentials = mock_create_use_case.execute.await_args.kwargs[
+            "probe_credentials"
+        ]
+        assert probe_credentials == {"X-API-Key": "key-alice"}
+
+    async def test_headers_mode_create_sends_no_probe_credentials(
+        self, client: AsyncClient, mock_create_use_case: AsyncMock
+    ):
+        # Arrange — a caller credential EXISTS but the server asks headers mode
+        self._wire_caller(method="jwt")
+        body = {
+            "name": "headers-mode",
+            "url": "https://target.example.com/mcp",
+            "headers": {"X-API-Key": "configured-key"},
+            "auth_mode": "headers",
+        }
+
+        # Act
+        resp = await client.post(BASE_URL, json=body)
+
+        # Assert — no injection (behavior identical to the pre-feature one)
+        assert resp.status_code == 201, resp.text
+        probe_credentials = mock_create_use_case.execute.await_args.kwargs[
+            "probe_credentials"
+        ]
+        assert probe_credentials == {}
+
+    async def test_user_token_create_without_caller_credential_probes_unchanged(
+        self, client: AsyncClient, mock_create_use_case: AsyncMock
+    ):
+        # Arrange — no dual-auth credential on the request (legacy fallback /
+        # unattended run) → the provider returns None → drop-empty semantics
+        app.dependency_overrides[get_request_auth_context] = lambda: None
+        body = {
+            "name": "unattended",
+            "url": "https://target.example.com/mcp",
+            "auth_mode": "user_token",
+        }
+
+        # Act
+        resp = await client.post(BASE_URL, json=body)
+
+        # Assert — the credential is DROPPED, not guessed (REQ-004 error case)
+        assert resp.status_code == 201, resp.text
+        probe_credentials = mock_create_use_case.execute.await_args.kwargs[
+            "probe_credentials"
+        ]
+        assert probe_credentials == {}
+
+
 # -- POST /api/v1/mcp/servers/validate -----------------------------------------
 
 
@@ -903,6 +1018,70 @@ class TestValidateStoredMerge:
         kwargs = mock_validate_use_case.execute_openapi.await_args.kwargs
         assert kwargs["openapi_url"] == "https://specs.example.com/openapi.json"
         assert kwargs["headers"] == {"X-API-Key": "stored-key"}
+
+    # -- the ``server_id`` wire alias (BUG-005) --------------------------------
+
+    async def test_server_id_alias_resolves_the_stored_entry(
+        self, client: AsyncClient, mock_validate_use_case: AsyncMock, mock_get_use_case
+    ):
+        """BUG-005: the composable-ui edit dialog sends the stored-entry
+        reference as ``server_id`` — the alias must resolve the SAME merge as
+        ``id`` (the two halves of the wire contract speak both names)."""
+        # Arrange — the edit-dialog shape with the UI's field name
+        mock_get_use_case.execute = AsyncMock(return_value=self._stored_with_secrets())
+        mock_validate_use_case.execute = AsyncMock(return_value=5)
+        body = {
+            "server_id": "web-search",
+            "name": "web-search",
+            "source_type": "external",
+            "url": "https://stored.example.com/mcp",
+            "headers": {},
+            "env": {},
+            "auth_mode": "headers",
+        }
+
+        # Act
+        resp = await client.post(f"{BASE_URL}/validate", json=body)
+
+        # Assert — the merge ran over the referenced stored entry
+        assert resp.status_code == 200, resp.text
+        mock_get_use_case.execute.assert_awaited_once_with("web-search")
+        config = mock_validate_use_case.execute.await_args.args[0]
+        assert config.headers == {"X-API-Key": "stored-key"}
+        assert config.auth_token == "stored-bearer"
+
+    async def test_id_wins_when_both_reference_names_are_sent(
+        self, client: AsyncClient, mock_validate_use_case: AsyncMock, mock_get_use_case
+    ):
+        # Arrange — both forms in one payload: ``id`` is the primary name
+        mock_get_use_case.execute = AsyncMock(return_value=self._stored_with_secrets())
+        mock_validate_use_case.execute = AsyncMock(return_value=5)
+        body = {"id": "web-search", "server_id": "server-ghost"}
+
+        # Act
+        resp = await client.post(f"{BASE_URL}/validate", json=body)
+
+        # Assert — the PRIMARY name resolved the stored entry
+        assert resp.status_code == 200, resp.text
+        mock_get_use_case.execute.assert_awaited_once_with("web-search")
+
+    async def test_server_id_alias_on_a_foreign_entry_answers_404(
+        self, client: AsyncClient, mock_validate_use_case: AsyncMock, mock_get_use_case
+    ):
+        # Arrange — the alias flows through the same RLS-scoped lookup
+        mock_get_use_case.execute = AsyncMock(
+            side_effect=McpServerNotFoundError(
+                ErrorMessage.MCP_SERVER_NOT_FOUND.format(name="ransom")
+            )
+        )
+        body = {"server_id": "ransom"}
+
+        # Act
+        resp = await client.post(f"{BASE_URL}/validate", json=body)
+
+        # Assert — identical 404 semantics under the alias (no probe fired)
+        assert resp.status_code == 404, resp.text
+        mock_validate_use_case.execute.assert_not_awaited()
 
     async def test_real_provider_reads_the_request_contextvars(
         self, client: AsyncClient, mock_validate_use_case: AsyncMock

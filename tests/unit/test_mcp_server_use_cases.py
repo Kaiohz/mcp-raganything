@@ -266,6 +266,76 @@ class TestCreateMcpServerUseCase:
         # Assert
         mock_store.save.assert_not_awaited()
 
+    # -- probe-only credential injection (REQ-004 / BUG-006) -------------------
+
+    async def test_probe_credentials_reach_the_loader_but_not_the_entry(
+        self, use_case, mock_store, mock_loader
+    ):
+        """BUG-006 (REQ-004): the create-time probe IS a load, so its
+        ``user_token`` caller credential merges into the PROBE config (an
+        injected credential wins over colliding names) and is NEVER
+        persisted."""
+        # Arrange
+        mock_store.exists.return_value = False
+        mock_loader.load_tools.return_value = ["tool-a"]
+        entry = _external_entry()
+
+        # Act
+        await use_case.execute(entry, probe_credentials={"X-API-Key": "caller-key"})
+
+        # Assert — the probe carried stored headers + the injected credential
+        config = mock_loader.load_tools.await_args.args[0][0]
+        assert config.headers == {
+            "Authorization": "Bearer tok",
+            "X-API-Key": "caller-key",
+        }
+        # ...while the STORED entry keeps exactly the configured headers
+        saved = mock_store.save.await_args.args[0]
+        assert saved.headers == {"Authorization": "Bearer tok"}
+        assert mock_store.save.await_args.args[0].auth_token == "secret-token"
+
+    async def test_injected_probe_credential_wins_over_colliding_header(
+        self, use_case, mock_store, mock_loader
+    ):
+        # Arrange — an explicit header COLLIDING with the injected name
+        mock_store.exists.return_value = False
+        mock_loader.load_tools.return_value = ["tool-a"]
+        entry = RegisteredMcpServer(
+            name="oauth2-self",
+            transport=McpTransportType.HTTP,
+            url="http://localhost:3001/mcp",
+            headers={"Authorization": "Bearer explicit"},
+            auth_token=None,
+            tool_count=0,
+            source_type="external",
+            created_at=_now(),
+            updated_at=_now(),
+        )
+
+        # Act
+        await use_case.execute(
+            entry, probe_credentials={"Authorization": "Bearer caller-jwt"}
+        )
+
+        # Assert — one Authorization header only: the INJECTED credential
+        config = mock_loader.load_tools.await_args.args[0][0]
+        assert config.headers == {"Authorization": "Bearer caller-jwt"}
+
+    async def test_no_probe_credentials_keeps_the_configured_probe(
+        self, use_case, mock_store, mock_loader
+    ):
+        # Arrange — legacy callers pass no probe credentials at all
+        mock_store.exists.return_value = False
+        mock_loader.load_tools.return_value = ["tool-a"]
+        entry = _external_entry()
+
+        # Act
+        await use_case.execute(entry)
+
+        # Assert — the probe config carries exactly the configured headers
+        config = mock_loader.load_tools.await_args.args[0][0]
+        assert config.headers == {"Authorization": "Bearer tok"}
+
 
 class TestCreateMcpServerUseCaseOpenApi:
     """Tests for the openapi source_type branch of CreateMcpServerUseCase."""
@@ -438,6 +508,36 @@ class TestCreateMcpServerUseCaseOpenApi:
         # Act & Assert
         with pytest.raises(OpenApiInvalidSpecError):
             await use_case.execute(_openapi_entry())
+
+    async def test_probe_credentials_reach_the_spec_fetch_not_the_mount(
+        self, use_case, mock_store, mock_factory, mock_runner
+    ):
+        """BUG-006 (openapi): the spec fetch IS the create-time network probe,
+        so its headers merge the ``user_token`` caller credential (injected
+        wins over colliding names); the mounted server keeps the STORED
+        runtime headers."""
+        # Arrange
+        mock_store.exists.return_value = False
+        mock_factory.fetch_spec.return_value = {"openapi": "3.0.3"}
+        mock_runner.mount.return_value = (
+            "http://raganything-api:8000/generated/petstore/mcp"
+        )
+        mock_runner.count_tools.return_value = 2
+        entry = _openapi_entry(headers={"Authorization": "Bearer upstream"})
+
+        # Act
+        await use_case.execute(entry, probe_credentials={"X-API-Key": "caller-key"})
+
+        # Assert — the FETCH carried stored + injected headers...
+        mock_factory.fetch_spec.assert_awaited_once_with(
+            entry.openapi_url,
+            headers={"Authorization": "Bearer upstream", "X-API-Key": "caller-key"},
+        )
+        # ...while the MOUNT (the runtime of the in-process server) keeps
+        # exactly the configured headers.
+        assert mock_runner.mount.await_args.kwargs["headers"] == {
+            "Authorization": "Bearer upstream"
+        }
 
 
 # =============================================================================
