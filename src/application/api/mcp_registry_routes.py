@@ -4,7 +4,9 @@ Endpoints (all under ``/api/v1/mcp/servers``, protected by the global API key
 dependency injected when the router is included in ``main.py``):
 
     POST   /                 — create a registered MCP server (201, masked)
-    POST   /validate         — dry-run validation of a server config (200)
+    POST   /validate         — dry-run validation of a server config (200);
+                               an optional ``id`` merges the probe over the
+                               STORED entry (UI BUG-001: masked edit payload)
     GET    /                 — list all registered servers (200, masked)
     GET    /{name}           — get a single server (200, masked)
     GET    /{name}/reveal    — get a single server with plaintext secrets (200)
@@ -40,6 +42,7 @@ from dependencies import (
     get_create_mcp_server_use_case,
     get_delete_mcp_server_use_case,
     get_get_mcp_server_use_case,
+    get_get_mcp_server_use_case_optional,
     get_list_mcp_servers_use_case,
     get_request_auth_context,
     get_update_mcp_server_use_case,
@@ -52,11 +55,44 @@ from domain.entities.mcp_server_config import (
     McpTransportType,
 )
 from domain.entities.mcp_server_registry_entry import RegisteredMcpServer
+from domain.errors.config import DependencyNotInitializedError
 from domain.services.mcp_auth_mode import user_credential_headers
+from domain.services.mcp_validate_merge import (
+    McpValidateOverrides,
+    resolve_validate_candidate,
+)
 
 logger = logging.getLogger(__name__)
 
 mcp_registry_router = APIRouter(prefix="/api/v1/mcp/servers", tags=["mcp-registry"])
+
+
+#: Controlled coherence messages (stable, non-sensitive — safe to surface to
+#: REST and MCP clients; never embed request payloads or secrets).
+_COHERENCE_EXTERNAL_URL_REQUIRED = "'url' is required when source_type='external'"
+_COHERENCE_OPENAPI_URL_REQUIRED = "'openapi_url' is required when source_type='openapi'"
+
+
+def _check_source_type_fields(
+    *, source_type: str, url: str | None, openapi_url: str | None
+) -> None:
+    """Enforce the per-source-type required fields (shared by create/validate).
+
+    Args:
+        source_type: The effective source type of the candidate.
+        url: The effective remote URL (``None`` = unset).
+        openapi_url: The effective spec URL (``None`` = unset).
+
+    Raises:
+        ValueError: If ``source_type="openapi"`` without ``openapi_url``,
+            or ``source_type="external"`` without ``url``.
+    """
+    if source_type == "openapi":
+        if not openapi_url:
+            raise ValueError(_COHERENCE_OPENAPI_URL_REQUIRED)
+    else:  # external (default)
+        if not url:
+            raise ValueError(_COHERENCE_EXTERNAL_URL_REQUIRED)
 
 
 class _McpServerBaseRequest(BaseModel):
@@ -95,12 +131,11 @@ class _McpServerBaseRequest(BaseModel):
             ValueError: If ``source_type="openapi"`` without ``openapi_url``,
                 or ``source_type="external"`` without ``url``.
         """
-        if self.source_type == "openapi":
-            if not self.openapi_url:
-                raise ValueError("'openapi_url' is required when source_type='openapi'")
-        else:  # external (default)
-            if not self.url:
-                raise ValueError("'url' is required when source_type='external'")
+        _check_source_type_fields(
+            source_type=self.source_type,
+            url=self.url,
+            openapi_url=self.openapi_url,
+        )
         return self
 
 
@@ -115,7 +150,49 @@ class McpServerCreateRequest(_McpServerBaseRequest):
 
 
 class McpServerValidateRequest(_McpServerBaseRequest):
-    """Request body for dry-run validation of an MCP server config."""
+    """Request body for dry-run validation of an MCP server config.
+
+    ``id`` (UI BUG-001, edit-mode "Test connection"): OPTIONAL primary key
+    (the registered server's ``name``) of an EXISTING registered server. When
+    present, the stored entry (secrets decrypted by the registry store,
+    RLS-scoped to the caller; a foreign/unknown ``id`` answers 404) SUPPLIES
+    the credential/config values the probe uses, and the payload fields
+    override ONLY what the client explicitly changed — an absent or
+    masked-empty value for a credential field (``headers={}``, ``env={}``,
+    ``auth_token=""``) NEVER clears a stored secret (the masked UI of
+    REQ-016 cannot send stored secrets back). ``auth_mode`` follows the
+    current validate semantics: the explicitly provided request value wins,
+    the stored mode otherwise. No source-type coherence is enforced on the
+    payload alone when ``id`` is present — the check runs server-side on the
+    MERGED specification (same contract as the partial update route).
+    """
+
+    id: str | None = None
+
+    @model_validator(mode="after")
+    def validate_source_type_fields(self) -> Self:
+        """Enforce per-source-type coherence, deferring it when ``id`` is set.
+
+        With an ``id`` the per-source-type required fields may come from the
+        STORED entry (e.g. an ``openapi`` server validated without a payload
+        ``url``), so the empty-payload check would misreject the merge; the
+        coherence is validated on the merged values by the route instead.
+
+        Returns:
+            The validated request.
+
+        Raises:
+            ValueError: If no ``id`` is present and the per-source-type
+                required fields are missing.
+        """
+        if self.id is not None:
+            return self
+        _check_source_type_fields(
+            source_type=self.source_type,
+            url=self.url,
+            openapi_url=self.openapi_url,
+        )
+        return self
 
 
 class McpServerUpdateRequest(BaseModel):
@@ -176,12 +253,6 @@ class McpServerValidateResponse(BaseModel):
     """Response body for the validate endpoint."""
 
     tool_count: int
-
-
-#: Controlled coherence messages (stable, non-sensitive — safe to surface to
-#: REST and MCP clients; never embed request payloads or secrets).
-_COHERENCE_EXTERNAL_URL_REQUIRED = "'url' is required when source_type='external'"
-_COHERENCE_OPENAPI_URL_REQUIRED = "'openapi_url' is required when source_type='openapi'"
 
 
 def _validate_merged_spec(
@@ -260,6 +331,34 @@ async def create_mcp_server(
     return _mask(created)
 
 
+def _payload_overrides(body: McpServerValidateRequest) -> McpValidateOverrides:
+    """Project the candidate payload into the merge rule's override contract.
+
+    Transport-boundary mapping (the resolution itself stays in the domain
+    rule): a masked, empty or absent value becomes ``None`` — it can NEVER
+    override a stored secret (BUG-001) — while a real value is an explicit
+    dirty change. ``auth_mode`` and ``source_type`` are honored when the
+    client EXPLICITLY provides them (``fields_set`` distinguishes a real
+    value from the DTO default: current validate semantics).
+
+    Args:
+        body: The validated validate request body.
+
+    Returns:
+        The dirty-field overrides for :func:`resolve_validate_candidate`.
+    """
+    provided = body.model_fields_set
+    return McpValidateOverrides(
+        url=body.url or None,
+        headers=body.headers or None,
+        env=body.env or None,
+        auth_token=body.auth_token or None,
+        auth_mode=body.auth_mode if "auth_mode" in provided else None,
+        source_type=body.source_type if "source_type" in provided else None,
+        openapi_url=body.openapi_url or None,
+    )
+
+
 @mcp_registry_router.post("/validate", status_code=status.HTTP_200_OK)
 async def validate_mcp_server(
     body: McpServerValidateRequest,
@@ -267,6 +366,10 @@ async def validate_mcp_server(
         ValidateMcpServerUseCase, Depends(get_validate_mcp_server_use_case)
     ],
     caller: Annotated[AuthContext | None, Depends(get_request_auth_context)],
+    get_use_case: Annotated[
+        GetMcpServerUseCase | None,
+        Depends(get_get_mcp_server_use_case_optional),
+    ],
 ) -> McpServerValidateResponse:
     """Dry-run validation of an MCP server connection.
 
@@ -274,43 +377,76 @@ async def validate_mcp_server(
     For ``source_type="openapi"``, fetches the OpenAPI spec, builds an in-process
     FastMCP server, and counts its tools (no mount, no persistence).
 
+    When the body carries ``id`` of an EXISTING registered server (UI BUG-001,
+    edit-mode "Test connection"), the probe run against the STORED entry
+    merged with the payload: the stored (decrypted, RLS-scoped) credentials
+    are supplied by the registry and only the explicitly changed payload
+    fields override them — a masked-empty value (``headers={}``, ``env={}``,
+    ``auth_token=""``/``null``) never clears a stored secret. A foreign or
+    unknown ``id`` answers 404 (per-user isolation). The response stays the
+    standard validate payload — the stored secrets are never echoed.
+
     ``auth_mode`` (feat-mcp-oauth2 REQ-004) is honored at validate time — "Test
     connection" probes the target EXACTLY as the runtime would: when the
-    request carries ``auth_mode: "user_token"`` and the caller is
+    effective ``auth_mode`` is ``"user_token"`` and the caller is
     authenticated, the caller's credential (``Authorization: Bearer <jwt>`` for
     a JWT caller, ``X-API-Key: <key>`` for an API-key caller) is injected into
     the probe headers (injected credentials win over colliding header names).
-    A ``headers``-mode request or a request without a caller credential (the
+    A ``headers``-mode probe or a request without a caller credential (the
     legacy path) is probed unchanged.
 
     Args:
-        body: The request body with server configuration (no persistence).
+        body: The request body (candidate config, plus the optional ``id`` of
+            a stored server to merge over).
         use_case: Injected validate use case.
         caller: The authenticated caller context (``None`` when the request
             carries no dual-auth credential).
+        get_use_case: Injected get use case over the registry store (``None``
+            when the registry is disabled — the stored entry is read ONLY
+            when ``id`` is present).
 
     Returns:
         The number of tools discovered on the server.
+
+    Raises:
+        HTTPException: 404 when ``id`` names no server of this caller; 422
+            when the probe cannot reach the target or the merged
+            specification is incoherent (controlled, non-sensitive detail).
     """
-    if body.source_type == "openapi":
+    stored = None
+    if body.id:
+        if get_use_case is None:
+            # id-driven validation against a DISABLED registry: the same
+            # "registry disabled" contract as every store-dependent route
+            # (503 — never a guessed 404).
+            raise DependencyNotInitializedError(
+                "MCP registry store is not initialized; id-based validation "
+                "requires the application lifespan to wire the registry."
+            )
+        stored = await get_use_case.execute(body.id)
+    spec = resolve_validate_candidate(stored, _payload_overrides(body))
+    _validate_merged_spec(
+        url=spec.url, openapi_url=spec.openapi_url, source_type=spec.source_type
+    )
+    if spec.source_type == "openapi":
         fetch_headers = {
-            **body.headers,
-            **user_credential_headers(body.auth_mode, caller),
+            **spec.headers,
+            **user_credential_headers(spec.auth_mode, caller),
         }
         tool_count = await use_case.execute_openapi(
-            openapi_url=body.openapi_url or "",
+            openapi_url=spec.openapi_url or "",
             headers=fetch_headers,
         )
     else:
         config = McpServerConfig(
-            name="validate",
+            name=body.id or "validate",
             transport=McpTransportType.HTTP,
-            url=body.url or "",
-            headers=body.headers,
-            env=body.env,
-            auth_token=body.auth_token,
+            url=spec.url or "",
+            headers=spec.headers,
+            env=spec.env,
+            auth_token=spec.auth_token,
         )
-        injected = user_credential_headers(body.auth_mode, caller)
+        injected = user_credential_headers(spec.auth_mode, caller)
         if injected:  # user_token probe: the caller's credential reaches the target
             config = config.model_copy(
                 update={"headers": {**config.headers, **injected}}

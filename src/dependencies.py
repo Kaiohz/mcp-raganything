@@ -671,6 +671,24 @@ def get_get_mcp_server_use_case() -> GetMcpServerUseCase:
     return GetMcpServerUseCase(store=get_mcp_registry_store())
 
 
+def get_get_mcp_server_use_case_optional() -> GetMcpServerUseCase | None:
+    """Return the get use case when the registry store is wired (None otherwise).
+
+    The validate route (BUG-001 id-merge) reads the stored entry ONLY when the
+    body carries ``id``; on the stateless candidate probe (no ``id``) the
+    registry is not needed at all, so an UNWIRED store must not break the
+    legacy validate callers that never had a store dependency. The ``{name}``
+    routes keep the STRICT providers (a store-dependent call on a disabled
+    registry answers 503, never a guess).
+
+    Returns:
+        The get use case, or ``None`` when the registry is disabled.
+    """
+    if mcp_registry_store is None:
+        return None
+    return GetMcpServerUseCase(store=mcp_registry_store)
+
+
 def get_update_mcp_server_use_case() -> UpdateMcpServerUseCase:
     return UpdateMcpServerUseCase(
         store=get_mcp_registry_store(),

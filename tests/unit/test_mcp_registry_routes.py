@@ -33,6 +33,7 @@ from dependencies import (
     get_create_mcp_server_use_case,
     get_delete_mcp_server_use_case,
     get_get_mcp_server_use_case,
+    get_get_mcp_server_use_case_optional,
     get_list_mcp_servers_use_case,
     get_request_auth_context,
     get_update_mcp_server_use_case,
@@ -208,6 +209,11 @@ def _wire_router_and_overrides(
     )
     app.dependency_overrides[get_list_mcp_servers_use_case] = lambda: mock_list_use_case
     app.dependency_overrides[get_get_mcp_server_use_case] = lambda: mock_get_use_case
+    # The validate route resolves the stored entry through the OPTIONAL
+    # provider (lazy, BUG-001): wire it to the same mock.
+    app.dependency_overrides[get_get_mcp_server_use_case_optional] = lambda: (
+        mock_get_use_case
+    )
     app.dependency_overrides[get_update_mcp_server_use_case] = lambda: (
         mock_update_use_case
     )
@@ -658,6 +664,245 @@ class TestValidateAuthModeInjection:
         assert resp.status_code == 200
         headers = mock_validate_use_case.execute_openapi.await_args.kwargs["headers"]
         assert headers == {"X-API-Key": "key-alice"}
+
+
+# -- validate-with-id: probe the STORED entry (UI BUG-001) ---------------------
+
+
+class TestValidateStoredMerge:
+    """``POST /validate`` with ``id`` of a stored server (UI BUG-001).
+
+    The masked edit dialog cannot send the stored secrets back (REQ-016), so
+    its "Test connection" payload reached the stateless validator with empty
+    credential editors and a credential-REQUIRED target answered a FALSE 401.
+    The route now merges the probe over the STORED (decrypted) entry: only a
+    real payload value overrides a stored one, the response stays the standard
+    validate payload (no stored secret is ever echoed), and an id that is not
+    the caller's own entry answers 404 (per-user isolation).
+    """
+
+    def _stored_with_secrets(
+        self,
+        name: str = "web-search",
+        auth_mode: McpAuthMode = McpAuthMode.HEADERS,
+    ) -> RegisteredMcpServer:
+        """A stored entry as the registry store returns it (secrets decrypted)."""
+        return RegisteredMcpServer(
+            name=name,
+            url="https://stored.example.com/mcp",
+            headers={"X-API-Key": "stored-key"},
+            env={"STORED_VAR": "1"},
+            auth_token="stored-bearer",
+            auth_mode=auth_mode,
+            tool_count=3,
+            source_type="external",
+            created_at=_now(),
+            updated_at=_now(),
+        )
+
+    async def test_stored_credentials_supply_the_probe_config(
+        self, client: AsyncClient, mock_validate_use_case: AsyncMock, mock_get_use_case
+    ):
+        # Arrange — the edit-dialog shape: id + masked-empty credential fields
+        mock_get_use_case.execute = AsyncMock(return_value=self._stored_with_secrets())
+        mock_validate_use_case.execute = AsyncMock(return_value=5)
+        body = {
+            "id": "web-search",
+            "name": "web-search",  # ignored (extra) — id is the reference
+            "source_type": "external",
+            "url": "https://stored.example.com/mcp",
+            "headers": {},
+            "env": {},
+            "auth_token": None,
+            "auth_mode": "headers",
+        }
+
+        # Act
+        resp = await client.post(f"{BASE_URL}/validate", json=body)
+
+        # Assert — the probe ran with the STORED (decrypted) values
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["tool_count"] == 5
+        assert set(resp.json().keys()) == {"tool_count"}  # no secret echo
+        config = mock_validate_use_case.execute.await_args.args[0]
+        assert config.name == "web-search"
+        assert config.url == "https://stored.example.com/mcp"
+        assert config.headers == {"X-API-Key": "stored-key"}
+        assert config.auth_token == "stored-bearer"
+        mock_get_use_case.execute.assert_awaited_once_with("web-search")
+
+    async def test_masked_empty_values_do_not_wipe_the_stored_secrets(
+        self, client: AsyncClient, mock_validate_use_case: AsyncMock, mock_get_use_case
+    ):
+        # Arrange — the stored entry keeps its secrets; the payload is the
+        # masked projection (empty editors) sent by the REQ-016 UI
+        mock_get_use_case.execute = AsyncMock(return_value=self._stored_with_secrets())
+        mock_validate_use_case.execute = AsyncMock(return_value=2)
+        body = {
+            "id": "web-search",
+            "url": "https://stored.example.com/mcp",
+            "headers": {},
+            "env": {},
+            "auth_token": "",
+            "auth_mode": "headers",
+        }
+
+        # Act
+        resp = await client.post(f"{BASE_URL}/validate", json=body)
+
+        # Assert — the stored headers/env/auth_token reached the probe intact
+        assert resp.status_code == 200, resp.text
+        config = mock_validate_use_case.execute.await_args.args[0]
+        assert config.headers == {"X-API-Key": "stored-key"}
+        assert config.env == {"STORED_VAR": "1"}
+        assert config.auth_token == "stored-bearer"
+
+    async def test_explicit_payload_values_override_the_stored_ones(
+        self, client: AsyncClient, mock_validate_use_case: AsyncMock, mock_get_use_case
+    ):
+        # Arrange — the user edited url + key + token in the dialog
+        mock_get_use_case.execute = AsyncMock(return_value=self._stored_with_secrets())
+        mock_validate_use_case.execute = AsyncMock(return_value=7)
+        body = {
+            "id": "web-search",
+            "url": "https://changed.example.com/mcp",
+            "headers": {"X-API-Key": "changed-key"},
+            "auth_token": "changed-bearer",
+        }
+
+        # Act
+        resp = await client.post(f"{BASE_URL}/validate", json=body)
+
+        # Assert — the dirty fields win; the untouched env stays stored
+        assert resp.status_code == 200, resp.text
+        config = mock_validate_use_case.execute.await_args.args[0]
+        assert config.url == "https://changed.example.com/mcp"
+        assert config.headers == {"X-API-Key": "changed-key"}
+        assert config.auth_token == "changed-bearer"
+        assert config.env == {"STORED_VAR": "1"}
+
+    async def test_stored_auth_mode_is_used_and_explicit_mode_overrides(
+        self, client: AsyncClient, mock_validate_use_case: AsyncMock, mock_get_use_case
+    ):
+        # Arrange — a user_token-stored server, payload WITHHELS the mode
+        mock_get_use_case.execute = AsyncMock(
+            return_value=self._stored_with_secrets(auth_mode=McpAuthMode.USER_TOKEN)
+        )
+        mock_validate_use_case.execute = AsyncMock(return_value=2)
+        app.dependency_overrides[get_request_auth_context] = lambda: AuthContext(
+            user_id="user-alice", method="jwt", raw_credential="caller-jwt"
+        )
+        body = {"id": "web-search"}
+
+        # Act
+        resp = await client.post(f"{BASE_URL}/validate", json=body)
+
+        # Assert — stored mode drives the injection; stored key + caller JWT
+        # (the injected credential wins only over COLLIDING names)
+        assert resp.status_code == 200, resp.text
+        config = mock_validate_use_case.execute.await_args.args[0]
+        assert config.headers == {
+            "X-API-Key": "stored-key",
+            "Authorization": "Bearer caller-jwt",
+        }
+
+        # Arrange 2 — an EXPLICIT mode wins over the stored one
+        app.dependency_overrides[get_request_auth_context] = lambda: None
+        body2 = {"id": "web-search", "auth_mode": "headers"}
+        mock_validate_use_case.execute = AsyncMock(return_value=2)
+
+        # Act 2
+        resp2 = await client.post(f"{BASE_URL}/validate", json=body2)
+
+        # Assert 2 — no injection: the headers-mode probe runs as-is
+        assert resp2.status_code == 200, resp2.text
+        config2 = mock_validate_use_case.execute.await_args.args[0]
+        assert config2.headers == {"X-API-Key": "stored-key"}
+
+    async def test_id_against_a_disabled_registry_answers_503(
+        self, client: AsyncClient, mock_validate_use_case: AsyncMock
+    ):
+        # Arrange — the registry store is NOT wired (lifespan never ran): the
+        # id-driven probe cannot resolve, so it answers the "registry
+        # disabled" 503 (the stateless no-id path is unaffected)
+        app.dependency_overrides.pop(get_get_mcp_server_use_case_optional, None)
+        body = {"id": "any", "url": "https://target.example.com/mcp"}
+
+        # Act
+        resp = await client.post(f"{BASE_URL}/validate", json=body)
+
+        # Assert — 503, and no probe was fired
+        assert resp.status_code == 503, resp.text
+        mock_validate_use_case.execute.assert_not_awaited()
+
+    async def test_stateless_validate_without_id_never_touches_the_store(
+        self, client: AsyncClient, mock_validate_use_case: AsyncMock, mock_get_use_case
+    ):
+        # Arrange — NO registry at all (the store is disabled): the legacy
+        # stateless candidate probe must keep working untouched
+        app.dependency_overrides.pop(get_get_mcp_server_use_case_optional, None)
+        mock_validate_use_case.execute = AsyncMock(return_value=4)
+        body = {"url": "https://target.example.com/mcp"}
+
+        # Act
+        resp = await client.post(f"{BASE_URL}/validate", json=body)
+
+        # Assert
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["tool_count"] == 4
+        mock_get_use_case.execute.assert_not_awaited()
+
+    async def test_unknown_or_foreign_id_answers_404(
+        self, client: AsyncClient, mock_validate_use_case: AsyncMock, mock_get_use_case
+    ):
+        # Arrange — the get use case applies the caller's RLS scope (a foreign
+        # id and an unknown id raise the SAME not-found domain error)
+        mock_get_use_case.execute = AsyncMock(
+            side_effect=McpServerNotFoundError(
+                ErrorMessage.MCP_SERVER_NOT_FOUND.format(name="ransom")
+            )
+        )
+        mock_validate_use_case.execute = AsyncMock(return_value=2)
+        body = {"id": "ransom"}
+
+        # Act
+        resp = await client.post(f"{BASE_URL}/validate", json=body)
+
+        # Assert — 404, and NO probe was ever fired
+        assert resp.status_code == 404
+        mock_validate_use_case.execute.assert_not_awaited()
+
+    async def test_openapi_id_merge_uses_the_stored_spec(
+        self, client: AsyncClient, mock_validate_use_case: AsyncMock, mock_get_use_case
+    ):
+        # Arrange — a stored openapi server validated WITHOUT payload fields
+        mock_get_use_case.execute = AsyncMock(
+            return_value=RegisteredMcpServer(
+                name="petstore",
+                url="http://api:8000/generated/petstore/mcp",
+                headers={"X-API-Key": "stored-key"},
+                env={},
+                auth_token=None,
+                auth_mode=McpAuthMode.HEADERS,
+                tool_count=3,
+                source_type="openapi",
+                openapi_url="https://specs.example.com/openapi.json",
+                created_at=_now(),
+                updated_at=_now(),
+            )
+        )
+        mock_validate_use_case.execute_openapi = AsyncMock(return_value=9)
+        body = {"id": "petstore"}
+
+        # Act
+        resp = await client.post(f"{BASE_URL}/validate", json=body)
+
+        # Assert — the stored spec url + stored headers drove the fetch
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["tool_count"] == 9
+        kwargs = mock_validate_use_case.execute_openapi.await_args.kwargs
+        assert kwargs["openapi_url"] == "https://specs.example.com/openapi.json"
+        assert kwargs["headers"] == {"X-API-Key": "stored-key"}
 
     async def test_real_provider_reads_the_request_contextvars(
         self, client: AsyncClient, mock_validate_use_case: AsyncMock
