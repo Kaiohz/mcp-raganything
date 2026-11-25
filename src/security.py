@@ -9,12 +9,20 @@ Provides two components:
   (JWT bearer token + per-user API key lookup), sets the RLS contextvars on
   success, and raises :class:`AuthenticationError` (401) on failure.
 
-- ``McpApiKeyMiddleware`` — FastMCP middleware that guards ``tools/call`` and
+- ``McpApiKeyMiddleware`` — FastMCP middleware guarding ``tools/call`` and
   ``tools/list``. Historically checked only the ``X-API-Key`` master key; now
   extended to ALSO accept ``Authorization: Bearer`` (JWT) and per-user API keys
   via the same injected ``AuthService``. The RLS contextvars are set so that
   downstream asyncpg usage in the tool handler is RLS-scoped (contextvars
   propagate within the same asyncio task).
+
+  feat-mcp-oauth2-dual-auth (REQ-017): the HTTP-level ASGI guard
+  (:mod:`application.api.mcp_guard`) is now the PRIMARY gate on the MCP
+  mounts — it authenticates every request (including ``initialize``) at the
+  HTTP level through the shared :meth:`McpApiKeyMiddleware.authenticate_headers`
+  seam. The middleware stays mounted on the FastMCP apps as DEFENSE-IN-DEPTH
+  behind the HTTP guard; its dual-auth path now shares one implementation with
+  the guard, so both layers behave identically.
 
 When the master key is empty, the legacy ``verify_api_key`` / ``_check_api_key``
 paths disable auth (useful for local dev/test). The dual-auth paths are
@@ -204,11 +212,13 @@ class McpApiKeyMiddleware(Middleware):
         """Raise ``ToolError`` if the request lacks valid credentials.
 
         Resolution order:
-        1. If a dual-auth :class:`AuthService` is wired → delegate to it
-           (Bearer JWT precedence, else X-API-Key lookup). Set the RLS
-           contextvars on success.
-        2. Else (legacy master-key mode) → if master key empty, bypass; else
-           require the ``X-API-Key`` header to match the master key.
+        1. Dual-auth :class:`AuthService` wired → the shared
+           :meth:`authenticate_headers` seam (Bearer JWT precedence, else
+           X-API-Key lookup; RLS contextvars set on success).
+        2. Dual-auth wired but credentials invalid → deny (no legacy
+           fallback).
+        3. Legacy master-key mode (no dual-auth wired) → master key empty
+           bypasses, else the ``X-API-Key`` header must match the master key.
         """
         headers: dict[str, str] = get_http_headers(include_all=True) or {}
         authorization = headers.get("authorization")
@@ -218,25 +228,60 @@ class McpApiKeyMiddleware(Middleware):
         # dual-auth middleware must see the raw ``Authorization: Bearer`` and
         # ``X-API-Key`` headers, hence ``include_all=True``.
 
-        # 1. Dual-auth path (JWT + per-user API key).
-        if self._auth_service is not None:
-            ctx = await self._auth_service.authenticate(
-                authorization=authorization,
-                api_key=api_key,
-            )
-            if ctx is None:
-                raise ToolError("Invalid or missing credentials")
-            # Set the RLS contextvars for downstream asyncpg usage in the tool.
-            current_user_id.set(ctx.user_id)
-            current_credential.set(ctx.raw_credential)
-            current_auth_method.set(ctx.method)
+        # 1+2. Dual-auth path (JWT + per-user API key), shared with the ASGI
+        #      HTTP guard so both layers behave identically (REQ-017).
+        ctx = await self.authenticate_headers(authorization, api_key)
+        if ctx is not None:
             return
+        if self._auth_service is not None:
+            # Dual-auth wired: no credential validated → deny (an invalid
+            # Bearer JWT never falls back to the API key).
+            raise ToolError("Invalid or missing credentials")
 
-        # 2. Legacy master-key path.
+        # 3. Legacy master-key path.
         if not self._master_key:
             return
         if not api_key or not secrets.compare_digest(api_key, self._master_key):
             raise ToolError("Invalid or missing API key")
+
+    async def authenticate_headers(
+        self, authorization: str | None, api_key: str | None
+    ) -> AuthContext | None:
+        """Authenticate raw request headers at the HTTP level (REQ-017).
+
+        The single seam shared by the FastMCP method-level middleware and the
+        HTTP-level ASGI guard (``application.api.mcp_guard.McpAuthGuard``):
+        both delegate to the wired :class:`AuthService` and resolve the
+        RLS contextvars exactly alike, so MCP tool calls stay scoped to the
+        authenticated user whichever layer authenticated the request.
+
+        Args:
+            authorization: Raw ``Authorization`` header value (``None`` if
+                absent); only ``Bearer`` (JWT) is recognised — API keys
+                travel only in ``X-API-Key``.
+            api_key: Raw ``X-API-Key`` header value (``None`` if absent).
+
+        Returns:
+            The authenticated :class:`AuthContext` with the RLS contextvars
+            set, or ``None`` when no credential validates OR when no dual
+            auth is wired (fail-closed for the HTTP-level callers).
+        """
+        if self._auth_service is None:
+            # Fail-closed until the composition root wires dual auth; the
+            # legacy master-key mode stays available only to the method-level
+            # middleware (its own branch below).
+            return None
+        ctx = await self._auth_service.authenticate(
+            authorization=authorization,
+            api_key=api_key,
+        )
+        if ctx is None:
+            return None
+        # Set the RLS contextvars for downstream asyncpg usage.
+        current_user_id.set(ctx.user_id)
+        current_credential.set(ctx.raw_credential)
+        current_auth_method.set(ctx.method)
+        return ctx
 
     async def on_call_tool(self, context: MiddlewareContext, call_next):
         """Guard tool execution with the credential check."""

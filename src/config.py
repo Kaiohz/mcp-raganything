@@ -1,15 +1,52 @@
 import logging
 import os
 import tempfile
+from typing import Annotated
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
 from dotenv import load_dotenv
-from pydantic import Field, PrivateAttr, model_validator
-from pydantic_settings import BaseSettings
+from pydantic import Field, PrivateAttr, ValidationInfo, model_validator
+from pydantic import field_validator as pydantic_field_validator
+from pydantic_settings import BaseSettings, NoDecode
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+#: The single refusal message for an empty ``MCP_ALLOWED_HOSTS`` list, shared
+#: by the empty env-string branch and the empty-Python-list branch (they are
+#: the same silent-421 outage with DNS-rebinding protection enabled).
+_EMPTY_MCP_ALLOWED_HOSTS_MESSAGE = (
+    "MCP_ALLOWED_HOSTS must not be empty: with DNS-rebinding protection enabled "
+    "an empty host allow-list rejects every MCP request with HTTP 421 — list the "
+    "public proxy host plus the localhost defaults"
+)
+
+
+def _is_json_style_list_value(stripped: str) -> bool:
+    """Whether a CSV env value is actually a JSON-style document.
+
+    An author may copy the neighbouring ``ALLOWED_ORIGINS`` JSON form
+    (``'["https://raganything.soludev.tech"]'``): it does not CSV-split and
+    would become ONE entry that matches nothing — a silent total outage (421
+    for every MCP request with DNS-rebinding protection enabled for
+    ``MCP_ALLOWED_HOSTS``, dead audiences for ``JWT_AUDIENCES``). The
+    characteristic JSON shapes are quote characters anywhere or a ``{``-wrap;
+    a legit host[:port] CSV value never carries either (the ``[::1]`` IPv6
+    literal is bracket-wrapped but never quoted).
+    """
+    return '"' in stripped or "'" in stripped or stripped.startswith("{")
+
+
+def _json_style_list_error(field_name: str, value: str) -> str:
+    """Build the refusal message for a JSON-style CSV env value."""
+    return (
+        f"{field_name} received a JSON-style value ({value!r}) — an "
+        "ALLOWED_ORIGINS-style value; these env vars are parsed as "
+        "comma-separated lists (e.g. MCP_ALLOWED_HOSTS=host-a,host-b); a "
+        "JSON-written value stays ONE entry that matches nothing (silent auth "
+        "failures; HTTP 421 for every MCP request)"
+    )
 
 
 class AppConfig(BaseSettings):
@@ -64,6 +101,82 @@ class AppConfig(BaseSettings):
         "audience validation. When empty, no audience check is performed "
         "(PyJWT treats an empty string as 'no audience expected').",
     )
+    # --- feat-mcp-oauth2-dual-auth (REQ-003-equivalent / REQ-014) ---
+    # Additional accepted JWT audiences (comma-separated env var
+    # ``JWT_AUDIENCES``, e.g. the Logto OpenCode app-id). The legacy single
+    # ``JWT_AUDIENCE`` stays honored; the two lists are merged by the JWT
+    # adapter (deduped, legacy value first). Empty/absent → legacy-only.
+    JWT_AUDIENCES: Annotated[list[str], NoDecode] = Field(
+        default_factory=list,
+        description="Additional accepted JWT ``aud`` claims, comma-separated "
+        "(e.g. the Logto OpenCode app-id). Merged with the legacy "
+        "``JWT_AUDIENCE`` (deduplicated) by the JWT adapter.",
+    )
+    # MCP transport-security Host allow-list (comma-separated env var
+    # ``MCP_ALLOWED_HOSTS``). DNS-rebinding protection stays ENABLED; only the
+    # host list is configurable. The default mirrors the loopback lists used
+    # for dev/QA; the production configmap adds the public proxy host
+    # (raganything.soludev.tech). A present-but-empty value REFUSES startup
+    # (an empty allow-list would 421 every MCP request — fail fast instead).
+    MCP_ALLOWED_HOSTS: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["127.0.0.1:*", "localhost:*", "[::1]:*"],
+        description="MCP transport-security Host allow-list, comma-separated "
+        "(REQ-014). DNS-rebinding protection stays ENABLED. Must list the "
+        "public proxy host (raganything.soludev.tech) in production plus the "
+        "loopback defaults for tests/dev.",
+    )
+    # Public base origin advertised by the MCP OAuth2 discovery documents
+    # (M-2 hardening), e.g. ``https://raganything.soludev.tech``. The request
+    # ``Host`` header is client-supplied and MUST NOT be echoed unvalidated:
+    # when this is configured it always wins; when unset the request Host is
+    # trusted ONLY when it matches the ``MCP_ALLOWED_HOSTS`` allow-list.
+    MCP_PUBLIC_BASE_URL: str = Field(
+        default="",
+        description="Configured public origin for the MCP OAuth2 discovery "
+        "documents (401 challenge + /.well-known metadata). Always wins over "
+        "the request Host when set.",
+    )
+    # Public OAuth2 authorization server advertised by the protected-resource
+    # metadata document (REQ-002-equivalent): the issuer an MCP client can
+    # actually REACH. When unset it falls back to ``<LOGTO_URL>/oidc``; when
+    # both are empty NOTHING is advertised (``authorization_servers: []``).
+    MCP_AUTHORIZATION_SERVER: str = Field(
+        default="",
+        description="Explicit publicly-reachable OAuth2 authorization-server "
+        "issuer advertised by the protected-resource metadata. Falls back to "
+        "<LOGTO_URL>/oidc when unset.",
+    )
+
+    @pydantic_field_validator("JWT_AUDIENCES", "MCP_ALLOWED_HOSTS", mode="before")
+    @classmethod
+    def _coerce_csv_list(cls, value: object, info: ValidationInfo) -> object:
+        """Coerce a comma-separated env string into a list (REQ-003/REQ-014).
+
+        ``JWT_AUDIENCES`` / ``MCP_ALLOWED_HOSTS`` are authored as
+        comma-separated env values (never JSON); an already-parsed list passes
+        through unchanged and absent values fall back to the field default.
+
+        Refusals (fail fast at startup instead of a silent outage):
+        * a JSON-STYLE value (see :func:`_is_json_style_list_value`);
+        * an empty ``MCP_ALLOWED_HOSTS`` (env string or Python list) — with
+          DNS-rebinding protection ENABLED an empty allow-list 421s every MCP
+          request; ``JWT_AUDIENCES`` tolerates empty (legacy-only).
+        """
+        if isinstance(value, list):
+            if not value and info.field_name == "MCP_ALLOWED_HOSTS":
+                raise ValueError(_EMPTY_MCP_ALLOWED_HOSTS_MESSAGE)
+            return value
+        if isinstance(value, str):
+            stripped = value.strip()
+            if _is_json_style_list_value(stripped):
+                raise ValueError(
+                    _json_style_list_error(info.field_name or "", stripped)
+                )
+            parts = [part.strip() for part in value.split(",") if part.strip()]
+            if not parts and info.field_name == "MCP_ALLOWED_HOSTS":
+                raise ValueError(_EMPTY_MCP_ALLOWED_HOSTS_MESSAGE)
+            return parts
+        return value
 
 
 class DatabaseConfig(BaseSettings):

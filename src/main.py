@@ -7,8 +7,11 @@ from pathlib import Path
 
 import asyncpg
 import uvicorn
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from starlette.routing import Route
+from starlette.types import ASGIApp
 
 from application.api.classical_indexing_routes import classical_indexing_router
 from application.api.classical_query_routes import classical_query_router
@@ -16,8 +19,14 @@ from application.api.file_routes import file_router
 from application.api.health_routes import health_router
 from application.api.mcp_classical_tools import mcp_classical
 from application.api.mcp_file_tools import mcp_files
+from application.api.mcp_guard import (
+    WELL_KNOWN_PROTECTED_RESOURCE_PATH,
+    McpAuthGuard,
+    public_discovery_origin,
+)
 from application.api.mcp_memory_tools import mcp_memories
 from application.api.mcp_registry_routes import mcp_registry_router
+from application.api.mcp_transport_security import McpTransportSecurityGuard
 from application.api.mcp_web_tools import mcp_web
 from application.error_handlers import (
     authentication_error_handler,
@@ -69,6 +78,12 @@ from security import ComposableAgentsSecurity, McpApiKeyMiddleware
 configure_logging(app_config)
 
 logger = logging.getLogger(__name__)
+
+#: The MCP resource advertised by the protected-resource metadata document
+#: (REQ-002-equivalent). The four built-in mounts share one authorization
+#: server and one well-known document; the files server is the canonical
+#: advertised one.
+MCP_DISCOVERY_RESOURCE_PATH = "/files/mcp"
 
 
 def _run_alembic_upgrade() -> None:
@@ -158,6 +173,39 @@ mcp_web_app = mcp_web.http_app(path="/")
 mcp_memories_app = mcp_memories.http_app(path="/")
 
 
+def build_mcp_guard_stack(inner_app: ASGIApp, mount_path: str) -> ASGIApp:
+    """Compose one MCP mount's HTTP-level ASGI guard stack (REQ-014/015/017).
+
+    The stack (outermost first) is: ``McpAuthGuard`` — dual-auth HTTP guard
+    delegating to the wired dual-auth wiring (Bearer JWT + X-API-Key, RLS
+    contextvars) and answering unauthenticated requests with HTTP 401 + the
+    OAuth2 discovery challenge BEFORE any MCP method runs — then
+    ``McpTransportSecurityGuard`` — the explicit
+    ``TransportSecuritySettings`` host/origin validation (foreign Host → 421,
+    DNS-rebinding protection ENABLED) — then the FastMCP ``http_app``.
+
+    Host/origin lists are read from ``app_config`` at REQUEST time so the
+    configmap stays authoritative without a rebuild. The inner
+    ``McpApiKeyMiddleware`` (already mounted on every FastMCP server) stays
+    as defense-in-depth behind the HTTP guard.
+
+    Args:
+        inner_app: The FastMCP ``http_app`` to guard.
+        mount_path: The public mount path (e.g. ``/files/mcp`` or
+            ``/generated/{name}/mcp``) for the guard's path normalization.
+
+    Returns:
+        The guarded ASGI callable to route/mount. ``ASGIApp`` = a callable
+        ``(scope, receive, send) -> Awaitable[None]``.
+    """
+    return McpAuthGuard(
+        McpTransportSecurityGuard(inner_app, app_config),
+        mcp_middleware.authenticate_headers,
+        mount_path=mount_path,
+        settings=app_config,
+    )
+
+
 async def _initialize_mcp_registry(
     app: FastAPI,
 ) -> tuple[FernetSecretCipher | None, McpRegistryStore | None]:
@@ -218,6 +266,7 @@ def _initialize_dual_auth() -> None:
                     f"{app_config.LOGTO_URL}/oidc/jwks" if app_config.LOGTO_URL else ""
                 ),
                 audience=app_config.JWT_AUDIENCE,
+                audiences=app_config.JWT_AUDIENCES,
             )
             api_key_reader = AsyncpgApiKeyReader(pool=_mcp_pool)
             _deps.jwt_adapter = jwt_adapter
@@ -328,6 +377,11 @@ generated_mcp_runner = GeneratedMcpRunner(
     app=app,
     base_url=app_config.GENERATED_MCP_BASE_URL,
     middleware=[mcp_middleware],
+    # The generated /generated/{name}/mcp mounts get the SAME HTTP-level
+    # guard stack (auth + transport security) as the four static mounts
+    # (feat-mcp-oauth2-dual-auth, REQ-017); the FastMCP method-level
+    # middleware stays as defense-in-depth inside each generated server.
+    guard_factory=build_mcp_guard_stack,
 )
 app.state.generated_mcp_runner = generated_mcp_runner
 import dependencies as _deps  # noqa: E402
@@ -361,10 +415,88 @@ app.include_router(classical_query_router, prefix=REST_PATH, dependencies=_auth_
 # it is included without an additional prefix (only the auth dependency).
 app.include_router(mcp_registry_router, dependencies=_auth_dep)
 
-app.mount("/files/mcp", mcp_files_app)
-app.mount("/classical/mcp", mcp_classical_app)
-app.mount("/web/mcp", mcp_web_app)
-app.mount("/memories/mcp", mcp_memories_app)
+# --- Public OAuth2 discovery (REQ-002-equivalent) -----------------------------
+#
+# A PUBLIC (unauthenticated) route returning the static RFC 9728-style
+# protected-resource metadata document. MUST be registered BEFORE the MCP
+# mounts so it stays reachable regardless of later mount prefixes (it shares
+# no prefix with them — kept adjacent to the mount wiring for the same
+# discovery-chain readability). OPTIONS preflights on it are answered by the
+# app-wide CORS middleware without auth.
+
+
+@app.get(
+    WELL_KNOWN_PROTECTED_RESOURCE_PATH,
+    summary="OAuth2 protected-resource metadata (public discovery)",
+    description=(
+        "Unauthenticated RFC 9728-style protected-resource metadata for the "
+        "MCP OAuth2 discovery chain: the resource identifier plus the "
+        "authorization servers accepting tokens for it."
+    ),
+    response_description="The static protected-resource metadata document.",
+    include_in_schema=False,
+)
+async def oauth_protected_resource(request: Request) -> Response:
+    """Return the static OAuth2 protected-resource metadata (public).
+
+    Args:
+        request: The incoming request (its ``Host`` header is used only when
+            allow-listed by ``MCP_ALLOWED_HOSTS``).
+
+    Returns:
+        ``{"resource": "https://<public-origin>/files/mcp",
+        "authorization_servers": [...]}`` where the advertised issuer is
+        ``MCP_AUTHORIZATION_SERVER`` falling back to ``<LOGTO_URL>/oidc`` —
+        the list is EMPTY when neither is configured — and 404 (plain, no
+        derivation detail) when no trustworthy origin can be derived.
+    """
+    origin = public_discovery_origin(
+        request.headers.get("host", ""),
+        configured_base_url=app_config.MCP_PUBLIC_BASE_URL,
+        allowed_hosts=list(app_config.MCP_ALLOWED_HOSTS),
+    )
+    if origin is None:
+        logger.warning(LogMessage.MCP_DISCOVERY_ORIGIN_UNAVAILABLE)
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND, content={"detail": "Not Found"}
+        )
+    return JSONResponse(
+        content={
+            "resource": f"{origin}{MCP_DISCOVERY_RESOURCE_PATH}",
+            "authorization_servers": (
+                [app_config.MCP_AUTHORIZATION_SERVER]
+                if app_config.MCP_AUTHORIZATION_SERVER
+                else ([f"{app_config.LOGTO_URL}/oidc"] if app_config.LOGTO_URL else [])
+            ),
+        }
+    )
+
+
+# --- Protected MCP mounts (feat-mcp-oauth2-dual-auth) --------------------------
+#
+# The HTTP-level guard stack (auth 401 + discovery challenge, then explicit
+# transport security) authenticates EVERY request — including ``initialize`` —
+# BEFORE any MCP method runs (REQ-001/017). The exact-path Route serves
+# POST <mount> directly — no Starlette Mount 307 and no ``http://`` scheme
+# downgrade behind the TLS-terminating proxy (REQ-015) — while the Mount
+# keeps serving "/<mount>/..." sub-paths; the guard rewrites both path forms
+# to "/" for the inner app. The ``McpApiKeyMiddleware`` stays mounted INSIDE
+# each FastMCP app (above) as defense-in-depth behind the HTTP guard.
+for _mount_path, _mcp_app in (
+    ("/files/mcp", mcp_files_app),
+    ("/classical/mcp", mcp_classical_app),
+    ("/web/mcp", mcp_web_app),
+    ("/memories/mcp", mcp_memories_app),
+):
+    _guarded = build_mcp_guard_stack(_mcp_app, _mount_path)
+    app.router.routes.append(
+        Route(
+            _mount_path,
+            _guarded,
+            name=f"mcp_{_mount_path.strip('/').replace('/', '_')}_endpoint",
+        )
+    )
+    app.mount(_mount_path, _guarded)
 
 app.add_exception_handler(StorageNotFoundError, storage_not_found_handler)
 app.add_exception_handler(StorageError, storage_error_handler)

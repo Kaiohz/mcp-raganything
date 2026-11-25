@@ -180,6 +180,16 @@ class LogMessage(StrEnum):
     AUTH_JWKS_FETCH_FAILED = "JWKS fetch failed"
     AUTH_CREDENTIALS_VALIDATED = "Credentials validated for user_id=%s method=%s"
 
+    # --- MCP HTTP-level guard (feat-mcp-oauth2-dual-auth) ---
+    # No credential material is ever interpolated (401s stay non-enumerating
+    # and the logs stay PII-free).
+    MCP_REQUEST_DENIED = "MCP request denied (missing or invalid credentials)"
+    MCP_DISCOVERY_ORIGIN_UNAVAILABLE = (
+        "MCP OAuth2 discovery origin unresolved: MCP_PUBLIC_BASE_URL is unset and "
+        "the request Host is not in MCP_ALLOWED_HOSTS — no discovery URL is advertised"
+    )
+    MCP_TRANSPORT_REJECTED = "MCP request rejected by transport security: %s"
+
     # --- MCP server registry (use cases / store / factory / runner) ---
     MCP_SERVER_CREATED_UC = "MCP server created (use case): name=%s tool_count=%d"
     MCP_SERVER_UPDATED_UC = "MCP server updated (use case): name=%s tool_count=%d"

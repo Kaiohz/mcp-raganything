@@ -12,6 +12,7 @@ the lifespan is active, so the lifespan is started on ``mount`` and stopped on
 """
 
 import logging
+from collections.abc import Callable
 from contextlib import AsyncExitStack
 from typing import Any
 
@@ -31,8 +32,14 @@ class GeneratedMcpRunner(GeneratedMcpRunnerPort):
 
     Attributes:
         _app: The host FastAPI/Starlette app to mount servers into.
-        _base_url: The absolute base URL used to build the mounted server URL.
+        _base_url: The absolute base URL (e.g. ``http://host:port``) used to
+            build the mounted server URL.
         _middleware: Optional FastMCP middleware instances applied to each server.
+        _guard_factory: Optional ``(inner_app, mount_path) -> asgi_app`` the
+            runner applies to every built ``http_app`` before mounting — the
+            HTTP-level auth + transport-security stack shared with the static
+            mounts (feat-mcp-oauth2-dual-auth, REQ-017). ``None`` keeps the
+            historic unguarded mounting.
         _mounts: Mapping of mounted name -> ``_Mount`` state (mcp, stack, route).
     """
 
@@ -41,6 +48,7 @@ class GeneratedMcpRunner(GeneratedMcpRunnerPort):
         app: Any,
         base_url: str,
         middleware: list[Any] | None = None,
+        guard_factory: Callable[[Any, str], Any] | None = None,
     ) -> None:
         """Initialize the runner.
 
@@ -49,10 +57,15 @@ class GeneratedMcpRunner(GeneratedMcpRunnerPort):
             base_url: Absolute base URL (e.g. ``http://host:port``) used to
                 build the mounted server URL returned by ``mount``.
             middleware: Optional FastMCP middleware applied to each built server.
+            guard_factory: Optional ASGI guard factory ``(inner_app,
+                mount_path) -> guarded asgi app`` applied to every mounted
+                server (the HTTP-level auth + transport-security stack). When
+                ``None`` the built ``http_app`` is mounted directly.
         """
         self._app = app
         self._base_url = base_url.rstrip("/")
         self._middleware = list(middleware) if middleware else []
+        self._guard_factory = guard_factory
         self._mounts: dict[str, _Mount] = {}
 
     async def mount(self, name: str, spec: dict, headers: dict[str, str]) -> str:
@@ -94,8 +107,24 @@ class GeneratedMcpRunner(GeneratedMcpRunnerPort):
             mcp.add_middleware(mw)
 
         http_app = mcp.http_app(path="/")
+        # Apply the shared HTTP-level guard stack (auth + transport security)
+        # when one is wired — the generated mounts get the SAME treatment as
+        # the static /files, /classical, /web and /memories servers
+        # (feat-mcp-oauth2-dual-auth, REQ-017). The FastMCP middleware stay
+        # mounted as defense-in-depth behind the HTTP guard.
+        mount_target = (
+            self._guard_factory(http_app, f"/generated/{name}/mcp")
+            if self._guard_factory is not None
+            else http_app
+        )
         mount_path = f"/generated/{name}/mcp"
-        self._app.mount(mount_path, http_app)
+        # Exact-path Route FIRST: POST <mount_path> (no trailing slash) is
+        # served directly — no Starlette Mount 307 round-trip behind the
+        # proxy (REQ-015, same pattern as the four static mounts) — while the
+        # Mount keeps serving sub-paths. The HTTP guard rewrites both forms
+        # to "/" for the inner app.
+        self._mount_exact_path_route(mount_path, mount_target)
+        self._app.mount(mount_path, mount_target)
 
         # Drive the mounted server's lifespan so FastMCP's session manager exists.
         stack = AsyncExitStack()
@@ -143,6 +172,32 @@ class GeneratedMcpRunner(GeneratedMcpRunnerPort):
         # ``unmount`` pops from ``_mounts``, so iterate over a snapshot copy.
         for name in self._mounts.copy():
             await self.unmount(name)
+
+    def _mount_exact_path_route(self, mount_path: str, mount_target: Any) -> None:
+        """Append the exact-path ``Route`` serving ``mount_path`` directly.
+
+        Best-effort: only a list-shaped ``app.router.routes`` (FastAPI or
+        Starlette) is touched; anything else falls back to the Mount-only
+        historic behavior (the redirect round-trip) instead of failing.
+        """
+        from starlette.routing import Route
+
+        router = getattr(self._app, "router", None)
+        routes = getattr(router, "routes", None) if router is not None else None
+        if not isinstance(routes, list):
+            logger.warning(
+                "Cannot add the exact-path route for %s: host app has no "
+                "router.routes list; the Mount-only 307 behavior applies.",
+                mount_path,
+            )
+            return
+        routes.append(
+            Route(
+                mount_path,
+                mount_target,
+                name=f"generated_mcp_{mount_path.strip('/').replace('/', '_')}_endpoint",
+            )
+        )
 
 
 class _Mount:
