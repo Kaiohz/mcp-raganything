@@ -13,6 +13,7 @@ Internal component (the store adapter) is exercised for real.
 """
 
 import json
+import logging
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
@@ -20,7 +21,7 @@ import pytest
 
 from domain.entities.mcp_server_config import McpAuthMode, McpTransportType
 from domain.entities.mcp_server_registry_entry import RegisteredMcpServer
-from domain.errors.mcp import McpServerNotFoundError
+from domain.errors.mcp import McpServerInvalidAuthModeError, McpServerNotFoundError
 from domain.ports.secret_cipher import SecretCipher
 from infrastructure.database.mcp_registry_store import McpRegistryStore
 
@@ -532,6 +533,130 @@ class TestAuthModePersistence:
         # Assert
         assert entries["oauth-server"].auth_mode is McpAuthMode.USER_TOKEN
         assert entries["legacy-server"].auth_mode is McpAuthMode.HEADERS
+
+
+# -- corrupted persisted auth_mode (feat-mcp-oauth2 REQ-004, re-review MAJOR-2)--
+
+
+class TestCorruptedAuthMode:
+    """A corrupted stored ``auth_mode`` surfaces with its OWN domain error.
+
+    Only manual DB surgery or a foreign writer can produce an unsupported
+    mode value. Before this guard: ``get`` raised a raw ``ValueError`` (an
+    uncentralized 500) and ``list_all`` DROPPED the row with the misleading
+    "secret decryption failed" reason.
+    """
+
+    async def test_get_raises_the_domain_error_not_a_raw_value_error(
+        self, store: McpRegistryStore, mock_conn: AsyncMock
+    ):
+        # Arrange — a row forced (at the store level) to a corrupted mode
+        mock_conn.fetchrow.return_value = _row(
+            name="oauth-server",
+            auth_mode="client_credentials",
+            headers_encrypted="ENC({})",
+            env_encrypted="ENC({})",
+            auth_token_encrypted=None,
+        )
+
+        # Act & Assert — a domain error carrying the centralized message
+        with pytest.raises(McpServerInvalidAuthModeError) as excinfo:
+            await store.get("oauth-server")
+        assert "client_credentials" in excinfo.value.detail
+
+    async def test_list_all_skips_the_corrupted_row_with_the_labeled_log(
+        self,
+        store: McpRegistryStore,
+        mock_conn: AsyncMock,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        # Arrange — one corrupted row (kept healthy secrets) + one good row
+        mock_conn.fetch.return_value = [
+            _row(
+                name="corrupted",
+                auth_mode="client_credentials",
+                headers_encrypted="ENC({})",
+                env_encrypted="ENC({})",
+                auth_token_encrypted=None,
+            ),
+            _row(
+                name="good",
+                auth_mode="headers",
+                headers_encrypted="ENC({})",
+                env_encrypted="ENC({})",
+                auth_token_encrypted=None,
+            ),
+        ]
+
+        # Act
+        with caplog.at_level(
+            logging.WARNING, logger="infrastructure.database.mcp_registry_store"
+        ):
+            entries = await store.list_all()
+
+        # Assert — the good row survives; the corrupted row is excluded
+        assert [e.name for e in entries] == ["good"]
+        labeled = [
+            r
+            for r in caplog.records
+            if r.getMessage().count("invalid stored auth_mode")
+        ]
+        assert labeled, "the skip must be LABELED with its own reason"
+        assert any("corrupted" in r.getMessage() for r in labeled), (
+            "the log must name the skipped server"
+        )
+
+    async def test_list_all_never_reports_the_auth_mode_corruption_as_decryption_failure(
+        self,
+        store: McpRegistryStore,
+        mock_conn: AsyncMock,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        # Arrange — ONLY a corrupted-auth_mode row (no decryption failure)
+        mock_conn.fetch.return_value = [
+            _row(
+                name="corrupted",
+                auth_mode="basic",
+                headers_encrypted="ENC({})",
+                env_encrypted="ENC({})",
+                auth_token_encrypted=None,
+            ),
+        ]
+
+        # Act
+        with caplog.at_level(
+            logging.WARNING, logger="infrastructure.database.mcp_registry_store"
+        ):
+            entries = await store.list_all()
+
+        # Assert — the misleading "secret decryption failed" miss is gone
+        assert entries == []
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("invalid stored auth_mode" in m for m in messages)
+        assert not any("secret decryption failed" in m for m in messages), (
+            "the auth_mode corruption must not be mislabeled as a decryption failure"
+        )
+
+    async def test_list_all_null_auth_mode_is_coerced_to_backfilled_headers(
+        self, store: McpRegistryStore, mock_conn: AsyncMock
+    ):
+        # Arrange — the defensive pre-backfill shape (the 004 column is
+        # NOT NULL DEFAULT 'headers'; None is tolerated as today's default)
+        mock_conn.fetch.return_value = [
+            _row(
+                name="pre-backfill",
+                auth_mode=None,
+                headers_encrypted="ENC({})",
+                env_encrypted="ENC({})",
+                auth_token_encrypted=None,
+            ),
+        ]
+
+        # Act
+        entries = await store.list_all()
+
+        # Assert
+        assert [e.auth_mode for e in entries] == [McpAuthMode.HEADERS]
 
     async def test_auth_mode_survives_a_fresh_store_instance(
         self, mock_pool: MagicMock, mock_conn: AsyncMock, mock_cipher: AsyncMock

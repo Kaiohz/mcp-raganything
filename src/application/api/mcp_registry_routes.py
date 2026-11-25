@@ -41,15 +41,18 @@ from dependencies import (
     get_delete_mcp_server_use_case,
     get_get_mcp_server_use_case,
     get_list_mcp_servers_use_case,
+    get_request_auth_context,
     get_update_mcp_server_use_case,
     get_validate_mcp_server_use_case,
 )
+from domain.entities.auth.auth_context import AuthContext
 from domain.entities.mcp_server_config import (
     McpAuthMode,
     McpServerConfig,
     McpTransportType,
 )
 from domain.entities.mcp_server_registry_entry import RegisteredMcpServer
+from domain.services.mcp_auth_mode import user_credential_headers
 
 logger = logging.getLogger(__name__)
 
@@ -217,6 +220,8 @@ def _mask(entry: RegisteredMcpServer) -> RegisteredMcpServer:
 
     Returns:
         A frozen copy with ``auth_token=None``, ``headers={}``, ``env={}``.
+        ``auth_mode`` is deliberately NOT masked: it is non-secret metadata
+        (REQ-004) and the registry's consumers read it from the echo.
     """
     return entry.model_copy(update={"auth_token": None, "headers": {}, "env": {}})
 
@@ -261,6 +266,7 @@ async def validate_mcp_server(
     use_case: Annotated[
         ValidateMcpServerUseCase, Depends(get_validate_mcp_server_use_case)
     ],
+    caller: Annotated[AuthContext | None, Depends(get_request_auth_context)],
 ) -> McpServerValidateResponse:
     """Dry-run validation of an MCP server connection.
 
@@ -268,17 +274,32 @@ async def validate_mcp_server(
     For ``source_type="openapi"``, fetches the OpenAPI spec, builds an in-process
     FastMCP server, and counts its tools (no mount, no persistence).
 
+    ``auth_mode`` (feat-mcp-oauth2 REQ-004) is honored at validate time — "Test
+    connection" probes the target EXACTLY as the runtime would: when the
+    request carries ``auth_mode: "user_token"`` and the caller is
+    authenticated, the caller's credential (``Authorization: Bearer <jwt>`` for
+    a JWT caller, ``X-API-Key: <key>`` for an API-key caller) is injected into
+    the probe headers (injected credentials win over colliding header names).
+    A ``headers``-mode request or a request without a caller credential (the
+    legacy path) is probed unchanged.
+
     Args:
         body: The request body with server configuration (no persistence).
         use_case: Injected validate use case.
+        caller: The authenticated caller context (``None`` when the request
+            carries no dual-auth credential).
 
     Returns:
         The number of tools discovered on the server.
     """
     if body.source_type == "openapi":
+        fetch_headers = {
+            **body.headers,
+            **user_credential_headers(body.auth_mode, caller),
+        }
         tool_count = await use_case.execute_openapi(
             openapi_url=body.openapi_url or "",
-            headers=body.headers,
+            headers=fetch_headers,
         )
     else:
         config = McpServerConfig(
@@ -289,6 +310,11 @@ async def validate_mcp_server(
             env=body.env,
             auth_token=body.auth_token,
         )
+        injected = user_credential_headers(body.auth_mode, caller)
+        if injected:  # user_token probe: the caller's credential reaches the target
+            config = config.model_copy(
+                update={"headers": {**config.headers, **injected}}
+            )
         tool_count = await use_case.execute(config)
     return McpServerValidateResponse(tool_count=tool_count)
 

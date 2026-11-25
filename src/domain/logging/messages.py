@@ -169,6 +169,7 @@ class LogMessage(StrEnum):
     LOG_UNHANDLED_DOMAIN_ERROR = "Unhandled domain error: %s"
     LOG_INVALID_API_KEY = "Invalid API key: %s"
     LOG_MCP_ERROR = "MCP error: %s"
+    LOG_MCP_INVALID_STORED_CONFIG = "MCP invalid stored configuration: %s"
     MCP_CONNECT_FAILED = "MCP connection to %s failed: %s"
     MCP_TOOLS_LOAD_FAILED = "MCP tool loading from %s failed: %s"
 
@@ -250,6 +251,12 @@ class LogMessage(StrEnum):
         "Rehydration skipped %d generated MCP server(s) due to mount failures; "
         "they will be retried on the next startup."
     )
+    # list_all skip reasons (feat-mcp-oauth2 REQ-004): the two failure modes are
+    # labeled separately so a corrupted ``auth_mode`` value is never reported as
+    # a "secret decryption failed" miss. No PII — the server name and the
+    # exception detail (the unsupported non-secret mode value) only.
+    MCP_SERVER_SKIPPED_DECRYPT_FAILED = "Skipping MCP server from the catalog: secret decryption failed: server=%s error=%s"
+    MCP_REGISTRY_ENTRY_INVALID_AUTH_MODE = "Skipping MCP server from the catalog: invalid stored auth_mode: server=%s error=%s"
 
     # --- Web search tool (DDGS + Crawl4AI) ---
     # No query, URL or crawled content is interpolated (untrusted external data).

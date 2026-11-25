@@ -42,6 +42,7 @@ from application.error_handlers import (
     indexing_error_handler,
     invalid_api_key_handler,
     llm_not_configured_handler,
+    mcp_invalid_stored_config_handler,
     storage_error_handler,
     storage_not_found_handler,
     unsupported_format_handler,
@@ -61,6 +62,7 @@ from domain.errors.document import DocumentReadError, UnsupportedFormatError
 from domain.errors.file import FileError, FileTooLargeError, FileValidationError
 from domain.errors.indexing import IndexingError
 from domain.errors.llm import LlmNotConfiguredError
+from domain.errors.mcp import McpServerInvalidAuthModeError
 from domain.errors.security import AuthenticationError, InvalidApiKeyError
 from domain.errors.storage import StorageError, StorageNotFoundError
 from domain.errors.vector_store import VectorStoreConfigError, VectorStoreError
@@ -665,6 +667,9 @@ app.add_exception_handler(ConfigError, config_error_handler)
 app.add_exception_handler(InvalidApiKeyError, invalid_api_key_handler)
 app.add_exception_handler(AuthenticationError, authentication_error_handler)
 app.add_exception_handler(LlmNotConfiguredError, llm_not_configured_handler)
+app.add_exception_handler(
+    McpServerInvalidAuthModeError, mcp_invalid_stored_config_handler
+)
 app.add_exception_handler(DomainError, domain_error_handler)
 
 

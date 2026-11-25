@@ -56,3 +56,16 @@ class OpenApiInvalidSpecError(McpError):
     """Raised when a fetched OpenAPI spec is invalid (missing key, wrong version, too large)."""
 
     status_code = ErrorCode.UNPROCESSABLE_ENTITY
+
+
+class McpServerInvalidAuthModeError(McpError):
+    """Raised when a persisted ``auth_mode`` is not a supported mode (REQ-004).
+
+    Only manual DB surgery or a foreign writer can produce it (the
+    application only ever writes ``entry.auth_mode.value``); it maps to a
+    structured 500 ("invalid stored configuration") instead of a raw
+    ``ValueError`` so the read path surfaces the corruption without a stack
+    trace.
+    """
+
+    status_code = ErrorCode.INTERNAL_SERVER_ERROR

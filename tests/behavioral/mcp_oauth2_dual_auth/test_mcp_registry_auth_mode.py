@@ -293,15 +293,18 @@ class TestRegistryAuthModeEcho:
         assert resp.status_code == 422, resp.text
         assert await registry_store.exists(SERVER_NAME) is False
 
-    async def test_mode_survives_a_second_app_instantiation(
+    async def test_mode_survives_a_second_rest_chain_over_the_same_store(
         self, http_client, registry_store, stub_spec_fetch
     ):
         """Restart semantics: the persisted mode is read back by a new chain.
 
-        The mode lives in the persisted row (the store boundary), not in the
-        process: a SECOND REST chain over the SAME store — the app's
-        startup rehydrate path (``list_all``) plus the REST read the agent's
-        registry client performs — must observe the persisted mode.
+        A SECOND REST chain over the SAME store — the app's startup rehydrate
+        path (``list_all``) plus the REST read the agent's registry client
+        performs — must observe the persisted mode. (No second app is
+        instantiated by this fixture chain; the REAL restart semantics — a
+        fresh ``McpRegistryStore`` over the same backend rows — are pinned by
+        the store-adapter tests in
+        ``tests/unit/test_mcp_registry_store.py::TestAuthModePersistence``.)
         """
         # Arrange — register in the user_token mode
         async with registered_openapi_server(

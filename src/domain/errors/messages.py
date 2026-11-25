@@ -70,6 +70,9 @@ class ErrorMessage(StrEnum):
     MCP_SERVER_ALREADY_EXISTS = "MCP server already exists: {name}"
     MCP_SERVER_UNREACHABLE = "MCP server unreachable: {error}"
     MCP_SERVER_STORAGE_FAILED = "MCP server storage failed for {name}: {error}"
+    MCP_SERVER_AUTH_MODE_INVALID = (
+        "MCP server registry contains an invalid stored auth_mode: {value}"
+    )
     OPENAPI_FETCH_FAILED = "OpenAPI spec fetch failed for {url}: {error}"
     OPENAPI_INVALID_SPEC = "OpenAPI spec invalid for {url}: {reason}"
     MCP_ALREADY_MOUNTED = "MCP server already mounted: {name}"

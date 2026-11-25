@@ -14,7 +14,9 @@ Tests cover masking of secrets in responses, 404/409 errors, the openapi create
 flow, and validate dry-run.
 """
 
+import logging
 from datetime import UTC, datetime
+from typing import Literal
 from unittest.mock import AsyncMock
 
 import pytest
@@ -32,16 +34,21 @@ from dependencies import (
     get_delete_mcp_server_use_case,
     get_get_mcp_server_use_case,
     get_list_mcp_servers_use_case,
+    get_request_auth_context,
     get_update_mcp_server_use_case,
     get_validate_mcp_server_use_case,
 )
+from domain.entities.auth.auth_context import AuthContext
 from domain.entities.mcp_server_config import McpAuthMode
 from domain.entities.mcp_server_registry_entry import RegisteredMcpServer
 from domain.errors.mcp import (
     McpServerAlreadyExistsError,
+    McpServerInvalidAuthModeError,
     McpServerNotFoundError,
     McpServerUnreachableError,
 )
+from domain.errors.messages import ErrorMessage
+from infrastructure.database.rls_context import current_auth_method, current_credential
 from main import app
 
 BASE_URL = "/api/v1/mcp/servers"
@@ -521,6 +528,200 @@ class TestValidateMcpServerRoute:
         mock_validate_use_case.execute_openapi.assert_awaited_once()
 
 
+# -- validate auth_mode credential injection (REQ-004, re-review MAJOR-1) ------
+
+
+class TestValidateAuthModeInjection:
+    """``POST /validate`` honors ``auth_mode`` at validate time (REQ-004).
+
+    auth_mode used to be accepted and then DISCARDED by the validate route,
+    so "Test connection" probed a ``user_token`` target with no credential
+    (an authenticated target answered 401 → a false validation failure). The
+    injected credential is derived by the domain rule
+    ``user_credential_headers`` from the injected caller context.
+    """
+
+    def _wire_jwt_caller(
+        self, method: Literal["jwt", "api_key"] = "jwt", credential: str = "jwt-token"
+    ):
+        app.dependency_overrides[get_request_auth_context] = lambda: AuthContext(
+            user_id="user-alice",
+            method=method,
+            raw_credential=credential,
+        )
+
+    async def test_user_token_injects_caller_jwt_authorization(
+        self, client: AsyncClient, mock_validate_use_case: AsyncMock
+    ):
+        # Arrange — caller authenticated via JWT, request asks user_token
+        self._wire_jwt_caller(method="jwt")
+        body = {
+            "url": "https://target.example.com/mcp",
+            "auth_mode": "user_token",
+            "headers": {},
+        }
+
+        # Act
+        resp = await client.post(f"{BASE_URL}/validate", json=body)
+
+        # Assert — the probe config carries the caller's credential
+        assert resp.status_code == 200
+        config = mock_validate_use_case.execute.await_args.args[0]
+        assert config.headers == {"Authorization": "Bearer jwt-token"}
+
+    async def test_user_token_injects_caller_api_key(
+        self, client: AsyncClient, mock_validate_use_case: AsyncMock
+    ):
+        # Arrange — caller authenticated via API key
+        self._wire_jwt_caller(method="api_key", credential="key-alice")
+        body = {"url": "https://target.example.com/mcp", "auth_mode": "user_token"}
+
+        # Act
+        resp = await client.post(f"{BASE_URL}/validate", json=body)
+
+        # Assert — X-API-Key is the injected credential header
+        assert resp.status_code == 200
+        config = mock_validate_use_case.execute.await_args.args[0]
+        assert config.headers == {"X-API-Key": "key-alice"}
+
+    async def test_headers_mode_probes_exactly_the_entered_headers(
+        self, client: AsyncClient, mock_validate_use_case: AsyncMock
+    ):
+        # Arrange — a caller credential EXISTS but the server asks headers mode
+        self._wire_jwt_caller(method="jwt")
+        body = {
+            "url": "https://target.example.com/mcp",
+            "auth_mode": "headers",
+            "headers": {"X-Custom": "value"},
+        }
+
+        # Act
+        resp = await client.post(f"{BASE_URL}/validate", json=body)
+
+        # Assert — no injection (behavior identical to the pre-feature one)
+        assert resp.status_code == 200
+        config = mock_validate_use_case.execute.await_args.args[0]
+        assert config.headers == {"X-Custom": "value"}
+
+    async def test_user_token_without_caller_credential_probes_unchanged(
+        self, client: AsyncClient, mock_validate_use_case: AsyncMock
+    ):
+        # Arrange — no dual-auth credential on the request (the provider
+        # returns None: legacy fallback / unattended run) → drop-empty
+        app.dependency_overrides[get_request_auth_context] = lambda: None
+        body = {"url": "https://target.example.com/mcp", "auth_mode": "user_token"}
+
+        # Act
+        resp = await client.post(f"{BASE_URL}/validate", json=body)
+
+        # Assert — the credential is DROPPED, not guessed (REQ-004 error case)
+        assert resp.status_code == 200
+        config = mock_validate_use_case.execute.await_args.args[0]
+        assert config.headers == {}
+
+    async def test_injected_credential_wins_over_colliding_header(
+        self, client: AsyncClient, mock_validate_use_case: AsyncMock
+    ):
+        # Arrange — an explicit Authorization header AND user_token (REQ-004:
+        # "injected credential takes precedence over colliding header names")
+        self._wire_jwt_caller(method="jwt", credential="injected-jwt")
+        body = {
+            "url": "https://target.example.com/mcp",
+            "auth_mode": "user_token",
+            "headers": {"Authorization": "Bearer explicit"},
+        }
+
+        # Act
+        resp = await client.post(f"{BASE_URL}/validate", json=body)
+
+        # Assert — one header only: the INJECTED credential
+        assert resp.status_code == 200
+        config = mock_validate_use_case.execute.await_args.args[0]
+        assert config.headers == {"Authorization": "Bearer injected-jwt"}
+
+    async def test_openapi_user_token_injects_credential_into_fetch_headers(
+        self, client: AsyncClient, mock_validate_use_case: AsyncMock
+    ):
+        # Arrange — an openapi server in user_token mode: the spec fetch is
+        # the probe's target, so the credential reaches its headers too
+        self._wire_jwt_caller(method="api_key", credential="key-alice")
+        body = {
+            "source_type": "openapi",
+            "openapi_url": "https://specs.example.com/openapi.json",
+            "auth_mode": "user_token",
+        }
+
+        # Act
+        resp = await client.post(f"{BASE_URL}/validate", json=body)
+
+        # Assert
+        assert resp.status_code == 200
+        headers = mock_validate_use_case.execute_openapi.await_args.kwargs["headers"]
+        assert headers == {"X-API-Key": "key-alice"}
+
+    async def test_real_provider_reads_the_request_contextvars(
+        self, client: AsyncClient, mock_validate_use_case: AsyncMock
+    ):
+        # Arrange — the REAL get_request_auth_context dependency (not
+        # overridden): the RLS contextvars set by verify_credentials must be
+        # projected into the domain rule's input
+        token = current_credential.set("jwt-token")
+        method_token = current_auth_method.set("jwt")
+        body = {"url": "https://target.example.com/mcp", "auth_mode": "user_token"}
+
+        # Act
+        try:
+            resp = await client.post(f"{BASE_URL}/validate", json=body)
+        finally:
+            current_auth_method.reset(method_token)
+            current_credential.reset(token)
+
+        # Assert
+        assert resp.status_code == 200
+        config = mock_validate_use_case.execute.await_args.args[0]
+        assert config.headers == {"Authorization": "Bearer jwt-token"}
+
+    async def test_real_provider_api_key_context_injects_x_api_key(
+        self, client: AsyncClient, mock_validate_use_case: AsyncMock
+    ):
+        # Arrange — the REAL provider with an api_key context (the dual-auth
+        # X-API-Key caller shape)
+        token = current_credential.set("key-alice")
+        method_token = current_auth_method.set("api_key")
+        body = {"url": "https://target.example.com/mcp", "auth_mode": "user_token"}
+
+        # Act
+        try:
+            resp = await client.post(f"{BASE_URL}/validate", json=body)
+        finally:
+            current_auth_method.reset(method_token)
+            current_credential.reset(token)
+
+        # Assert
+        assert resp.status_code == 200
+        config = mock_validate_use_case.execute.await_args.args[0]
+        assert config.headers == {"X-API-Key": "key-alice"}
+
+    async def test_real_provider_drops_a_credential_without_a_dual_auth_method(
+        self, client: AsyncClient, mock_validate_use_case: AsyncMock
+    ):
+        # Arrange — a credential with NO method (legacy master-key path: no
+        # contextvar was set by verify_api_key) → never guess an injection
+        token = current_credential.set("master-key")
+        body = {"url": "https://target.example.com/mcp", "auth_mode": "user_token"}
+
+        # Act
+        try:
+            resp = await client.post(f"{BASE_URL}/validate", json=body)
+        finally:
+            current_credential.reset(token)
+
+        # Assert — the header is DROPPED (drop-empty semantics)
+        assert resp.status_code == 200
+        config = mock_validate_use_case.execute.await_args.args[0]
+        assert config.headers == {}
+
+
 # -- GET /api/v1/mcp/servers (list) --------------------------------------------
 
 
@@ -632,6 +833,40 @@ class TestRevealMcpServerRoute:
 
         # Assert
         assert resp.status_code == 404
+
+    async def test_corrupted_auth_mode_maps_to_a_structured_500(
+        self,
+        client: AsyncClient,
+        mock_get_use_case: AsyncMock,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        # Arrange — a corrupted stored auth_mode surfacing through the REAL
+        # domain-error handler chain (502-class registry: McpError 500)
+        mock_get_use_case.execute = AsyncMock(
+            side_effect=McpServerInvalidAuthModeError(
+                ErrorMessage.MCP_SERVER_AUTH_MODE_INVALID.format(
+                    value="client_credentials"
+                )
+            )
+        )
+
+        # Act
+        with caplog.at_level(logging.INFO, logger="application.error_handlers"):
+            resp = await client.get(f"{BASE_URL}/corrupted/reveal")
+
+        # Assert — a CONTROLLED 500 (not a raw ValueError stack), with the
+        # CORRECT centralized log line (not "Unhandled domain error")
+        assert resp.status_code == 500
+        assert resp.json()["detail"] == (
+            "MCP server registry contains an invalid stored auth_mode: "
+            "client_credentials"
+        )
+        assert any(
+            "MCP invalid stored configuration" in r.getMessage() for r in caplog.records
+        )
+        assert not any(
+            "Unhandled domain error" in r.getMessage() for r in caplog.records
+        )
 
 
 # -- PUT /api/v1/mcp/servers/{name} (update) -----------------------------------

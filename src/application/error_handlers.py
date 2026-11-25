@@ -138,3 +138,17 @@ def authentication_error_handler(_request: Request, exc: Exception) -> JSONRespo
 def llm_not_configured_handler(_request: Request, exc: Exception) -> JSONResponse:
     """Map :class:`LlmNotConfiguredError` to 422 (user has no LLM provider)."""
     return _domain_response(exc, LogMessage.LOG_CONFIG_ERROR, level=logging.WARNING)
+
+
+def mcp_invalid_stored_config_handler(
+    _request: Request, exc: Exception
+) -> JSONResponse:
+    """Map a corrupted stored MCP config (invalid ``auth_mode``) to 500.
+
+    A structured server-side error with its OWN centralized log message — the
+    generic "Unhandled domain error" line would say nothing about the actual
+    corruption class.
+    """
+    return _domain_response(
+        exc, LogMessage.LOG_MCP_INVALID_STORED_CONFIG, level=logging.ERROR
+    )

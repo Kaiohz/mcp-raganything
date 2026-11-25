@@ -6,8 +6,9 @@ Persists registered MCP servers in the ``mcp_servers`` table. Secrets
 entity only ever holds plaintext.
 
 **Schema ownership:** the ``mcp_servers`` table is created and evolved by this
-service's Alembic migrations (``001_create_mcp_servers_table`` and
-``002_add_user_id_to_mcp_servers``), run automatically at startup via
+service's Alembic migrations (``001_create_mcp_servers_table``,
+``002_add_user_id_to_mcp_servers``, ``003_enable_rls_mcp_servers`` and
+``004_add_auth_mode_to_mcp_servers``), run automatically at startup via
 ``_run_alembic_upgrade`` in ``main.py``. The migration state is tracked in the
 ``raganything_alembic_version`` table, separate from composable-agents'
 ``alembic_version`` table so both services can share the same database without
@@ -35,7 +36,11 @@ from typing import Any
 
 from domain.entities.mcp_server_config import McpAuthMode, McpTransportType
 from domain.entities.mcp_server_registry_entry import RegisteredMcpServer
-from domain.errors.mcp import McpServerAlreadyExistsError, McpServerNotFoundError
+from domain.errors.mcp import (
+    McpServerAlreadyExistsError,
+    McpServerInvalidAuthModeError,
+    McpServerNotFoundError,
+)
 from domain.errors.messages import ErrorMessage
 from domain.logging.messages import LogMessage
 from domain.ports.mcp_server_registry_store import McpServerRegistryStore
@@ -43,6 +48,32 @@ from domain.ports.secret_cipher import SecretCipher
 from infrastructure.database.rls_context import current_user_id, set_rls_context
 
 logger = logging.getLogger(__name__)
+
+
+def _coerce_auth_mode(value: Any) -> McpAuthMode:
+    """Coerce a persisted ``auth_mode`` value into the domain enum.
+
+    Args:
+        value: The raw column value (a persisted string, or ``None`` for a
+            defensive pre-backfill guard — the 004 migration makes the column
+            ``NOT NULL DEFAULT 'headers'`` so ``None`` is not expected).
+
+    Returns:
+        The domain enum value (``HEADERS`` for ``None``).
+
+    Raises:
+        McpServerInvalidAuthModeError: If the stored value is not a supported
+            mode — never silently coerced (a corrupted row must surface, with
+            its OWN error, not a raw ``ValueError``).
+    """
+    if value is None:
+        return McpAuthMode.HEADERS
+    try:
+        return McpAuthMode(value)
+    except ValueError as exc:
+        raise McpServerInvalidAuthModeError(
+            ErrorMessage.MCP_SERVER_AUTH_MODE_INVALID.format(value=value)
+        ) from exc
 
 
 class McpRegistryStore(McpServerRegistryStore):
@@ -229,7 +260,10 @@ class McpRegistryStore(McpServerRegistryStore):
 
         Entries whose secrets cannot be decrypted (e.g. encrypted with a
         previous/rotated key) are logged and skipped so a single corrupted row
-        never blocks the list or application startup.
+        never blocks the list or application startup. A corrupted
+        ``auth_mode`` (an unsupported stored value, REQ-004) is skipped
+        separately with its OWN labeled reason — it must never be misreported
+        as a "secret decryption failed" miss.
 
         Returns:
             A list of all registered server entries with decryptable secrets.
@@ -258,11 +292,13 @@ class McpRegistryStore(McpServerRegistryStore):
         for row in rows:
             try:
                 entries.append(await self._row_to_entry(row))
+            except McpServerInvalidAuthModeError as e:
+                logger.warning(
+                    LogMessage.MCP_REGISTRY_ENTRY_INVALID_AUTH_MODE, row["name"], e
+                )
             except Exception as e:  # noqa: BLE001 — decryption/json errors are per-row
                 logger.warning(
-                    "Skipping MCP server %s: secret decryption failed: %s",
-                    row["name"],
-                    e,
+                    LogMessage.MCP_SERVER_SKIPPED_DECRYPT_FAILED, row["name"], e
                 )
         return entries
 
@@ -342,6 +378,11 @@ class McpRegistryStore(McpServerRegistryStore):
 
         Returns:
             The registered server entity with plaintext secrets.
+
+        Raises:
+            McpServerInvalidAuthModeError: If the stored ``auth_mode`` is not a
+                supported mode (a corrupted row is surfaced, never silently
+                coerced).
         """
         headers_json = await self._cipher.decrypt(row["headers_encrypted"])
         env_json = await self._cipher.decrypt(row["env_encrypted"])
@@ -358,7 +399,7 @@ class McpRegistryStore(McpServerRegistryStore):
             headers=json.loads(headers_json),
             env=json.loads(env_json),
             auth_token=auth_token,
-            auth_mode=McpAuthMode(row["auth_mode"]),
+            auth_mode=_coerce_auth_mode(row["auth_mode"]),
             tool_count=row["tool_count"],
             source_type=row["source_type"],
             openapi_url=row["openapi_url"],
