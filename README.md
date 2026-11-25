@@ -135,6 +135,8 @@ The middleware accepts **either** header on the same request. If both are presen
 - **Per-user LLM credentials** resolution (see [Per-user LLM](#per-user-llm-credentials)),
 - **Per-user RAG isolation** (chunks tagged with `user_id`, see [RAG isolation](#per-user-rag-isolation)).
 
+An invalid presented JWT **never** falls back to an API key (an `Authorization` header always means JWT). The audience check accepts `JWT_AUDIENCES` (comma-separated list) merged with the legacy `JWT_AUDIENCE` (legacy first — single-audience behavior is unchanged when `JWT_AUDIENCES` is unset).
+
 ### Enabling authentication
 
 Both modes are active as soon as the relevant env vars are set:
@@ -204,7 +206,37 @@ mcp_servers:
 | Layer | Protected | Public |
 |-------|-----------|--------|
 | REST | `/api/v1/files/*`, `/api/v1/files`, `/api/v1/classical/*`, `/api/v1/file/*`, `/api/v1/folder/*`, `/api/v1/query`, `/api/v1/mcp/servers*` | `/api/v1/health`, `/api/v1/health/live` |
-| MCP | `tools/call`, `tools/list` (all 4 servers + generated servers) | `initialize` |
+| MCP | `initialize`, `tools/call`, `tools/list` (all 4 servers + generated servers) — an unauthenticated request is answered HTTP 401 **before any MCP method runs** | `/.well-known/oauth-protected-resource` (public discovery) |
+
+### MCP OAuth2 discovery (feat-mcp-oauth2-dual-auth)
+
+Every MCP mount (`/files/mcp`, `/classical/mcp`, `/web/mcp`, `/memories/mcp`, generated `/generated/{name}/mcp`) implements the MCP authorization discovery chain:
+
+1. an unauthenticated request (including `initialize`) is answered HTTP `401` with
+   `WWW-Authenticate: Bearer resource_metadata="https://<host>/.well-known/oauth-protected-resource/<mount>"`
+   plus `Cache-Control: no-store` and a generic non-enumerating body;
+2. each mount serves its own public document
+   `GET /.well-known/oauth-protected-resource/<mount>` (plus the global document) advertising
+   `resource: https://<host>/<mount>` and `authorization_servers: [<MCP_AUTHORIZATION_SERVER>]`;
+3. `MCP_ALLOWED_HOSTS` drives the transport-security Host check (prod host accepted incl. its
+   `:443`/`:80` forms, foreign hosts answered `421`) and the fallback discovery-origin derivation
+   (`MCP_PUBLIC_BASE_URL` always wins when set); `MCP_ALLOWED_ORIGINS` accepts browser MCP clients
+   (CORS `*` is translated to Origin-not-validated; explicit origins are exact);
+4. no `307` redirect on either path form (`/memories/mcp` ↔ `/memories/mcp/`) and no `http://`
+   scheme downgrade behind the proxy.
+
+Recommended deployment env (mirrors the flux configmap prerequisites in `src/main.py`):
+
+```env
+MCP_ALLOWED_HOSTS=raganything.soludev.tech,127.0.0.1:*,localhost:*,[::1]:*
+MCP_PUBLIC_BASE_URL=https://raganything.soludev.tech
+MCP_AUTHORIZATION_SERVER=https://logto.soludev.tech/oidc
+JWT_AUDIENCES=<ui-app-id>,<opencode-app-id>
+```
+
+> **Deployment gate:** without the matching flux IngressRoute entries (`/.well-known` public route +
+> `Authorization: Bearer` direct-backend route) every production MCP request answers `421`/`401` —
+> do not deploy this branch before the flux slice lands.
 
 ### Per-user LLM credentials
 
