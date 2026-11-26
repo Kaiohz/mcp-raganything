@@ -1,5 +1,6 @@
 import asyncio
 import importlib.util
+import json
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -9,7 +10,10 @@ import httpx
 import pytest
 import pytest_asyncio
 from fastmcp import Client
+from fastmcp.client.client import CallToolResult
 from fastmcp.client.transports import StreamableHttpTransport
+from mcp.shared.exceptions import McpError
+from mcp.types import ErrorData, TextContent
 
 from domain.entities.indexing_result import (
     FileIndexingResult,
@@ -18,6 +22,23 @@ from domain.entities.indexing_result import (
     IndexingStatus,
 )
 from domain.services.auth.auth_service import AuthService
+
+#: The production proxy Host (Host-header stand-in for the TLS-terminating
+#: ingress; the test app itself runs in-process).
+_PRODUCTION_PROXY_HOST = "raganything.soludev.tech"
+
+#: MCP_ALLOWED_HOSTS seeded for the behavioral session: the public proxy
+#: host, the ``mcp_client_factory`` base-URL authority (the REAL MCP client
+#: below dials ``http://test<mount>``) and the dev/test loopback defaults
+#: (REQ-014). The transport-security + discovery allow-list is enforced at
+#: HTTP level, so the client host MUST stay in the list.
+_SEEDED_MCP_ALLOWED_HOSTS = (
+    _PRODUCTION_PROXY_HOST,
+    "test",
+    "127.0.0.1:*",
+    "localhost:*",
+    "[::1]:*",
+)
 
 # Load external fixtures from tests/fixtures/external.py without __init__.py
 _fixtures_path = Path(__file__).parent / "fixtures" / "external.py"
@@ -91,6 +112,23 @@ async def running_app(auth_directory):
         "WEB_SEARCH_TIMEOUT_SECONDS": "0.15",
         "CRAWL_OVERALL_TIMEOUT_SECONDS": "0.25",
         "SECRET_ENCRYPTION_KEY": "",
+        # feat-mcp-oauth2-dual-auth (REQ-010/REQ-014): the raganything config
+        # gains MCP_ALLOWED_HOSTS (transport-security allow-list) with the
+        # feature; the value below mirrors the production configmap shape
+        # (public proxy host + dev/test loopback entries). The ``test`` host
+        # is the base-URL authority of the ``mcp_client_factory`` REAL MCP
+        # client below — since the HTTP-level guard + transport security are
+        # enforced it must stay allow-listed, or every REAL-client probe
+        # would get 421. Pydantic BaseSettings ignores these env keys until
+        # the fields exist, so RED runs are unaffected. LOGTO_URL feeds the
+        # JWKS base; MCP_AUTHORIZATION_SERVER is the advertised issuer of the
+        # protected-resource metadata (REQ-002) — seeded EXPLICITLY because
+        # the ``<LOGTO_URL>/oidc`` fallback is resolved ONCE at config load
+        # (the AppConfig model validator): an import-time construction with
+        # no env seeding must still advertise the same issuer.
+        "MCP_ALLOWED_HOSTS": ", ".join(_SEEDED_MCP_ALLOWED_HOSTS),
+        "LOGTO_URL": "https://logto.soludev.tech",
+        "MCP_AUTHORIZATION_SERVER": "https://logto.soludev.tech/oidc",
     }
     with patch.dict(os.environ, environment):
         import main
@@ -109,6 +147,27 @@ async def running_app(auth_directory):
             with (
                 patch("main._run_alembic_upgrade", return_value=None),
                 patch.object(main.app_config, "SECRET_ENCRYPTION_KEY", ""),
+                # The MCP-OAuth2 settings are seeded at the OBJECT level too:
+                # in a full-suite run the unit-test modules import ``main``
+                # at COLLECTION time, so ``app_config`` is built BEFORE this
+                # fixture's env patch is applied and the env seeding alone
+                # could not reach it. The behavioral values match the env
+                # seeding above (REQ-002/REQ-014). MCP_AUTHORIZATION_SERVER
+                # is the RESOLVED advertised issuer (the model-validator
+                # fallback shape: <LOGTO_URL>/oidc).
+                patch.object(
+                    main.app_config,
+                    "MCP_ALLOWED_HOSTS",
+                    list(_SEEDED_MCP_ALLOWED_HOSTS),
+                ),
+                patch.object(
+                    main.app_config, "LOGTO_URL", "https://logto.soludev.tech"
+                ),
+                patch.object(
+                    main.app_config,
+                    "MCP_AUTHORIZATION_SERVER",
+                    "https://logto.soludev.tech/oidc",
+                ),
             ):
                 started = asyncio.Event()
                 stop = asyncio.Event()
@@ -164,6 +223,7 @@ def mcp_client_factory(running_app):
                 auth=auth,
                 follow_redirects=follow_redirects,
                 timeout=timeout or 5,
+                event_hooks={"response": [_surface_guard_rejection]},
                 **kwargs,
             )
 
@@ -178,6 +238,31 @@ def mcp_client_factory(running_app):
     return open_client
 
 
+async def _surface_guard_rejection(response: httpx.Response) -> None:
+    """Translate the HTTP-level MCP guard's 401 into the protocol error.
+
+    feat-mcp-oauth2-dual-auth (REQ-017) harness seam: since the HTTP-level
+    guard became the primary gate, credential rejections (missing, invalid
+    JWT, unknown or revoked key) answer HTTP 401 + the OAuth2 discovery
+    challenge BEFORE any MCP method runs — the mcp SDK transport surfaces
+    that as a raw ``httpx.HTTPStatusError`` raised inside the session
+    handshake. The behavioral contract (this suite + the other behavioral
+    suites) pins the PROTOCOL-level credential error the
+    ``McpApiKeyMiddleware`` raised when it was the gate:
+    ``McpError("Invalid or missing credentials")``. This hook converts the
+    guard's generic 401 detail into that SAME protocol error so the REAL
+    client observes the identical rejection contract across the migration.
+    """
+    if response.status_code != 401:
+        return
+    try:
+        content = await response.aread()
+        detail = json.loads(content).get("detail") or "Invalid or missing credentials"
+    except Exception:  # noqa: BLE001 — a non-JSON 401 keeps the generic text
+        detail = "Invalid or missing credentials"
+    raise McpError(error=ErrorData(code=401, message=str(detail)))
+
+
 @pytest.fixture
 def mcp_call(mcp_client_factory):
     async def call(
@@ -187,10 +272,22 @@ def mcp_call(mcp_client_factory):
         credential: str | None = "jwt-alice",
         headers: dict[str, str] | None = None,
     ):
-        async with mcp_client_factory(
-            mount, credential=credential, headers=headers
-        ) as client:
-            return await client.call_tool(tool, arguments, raise_on_error=False)
+        # Companion seam to _surface_guard_rejection: a guard-rejected
+        # handshake answers the tool CALL with the call-level error result
+        # (is_error=True, no tool execution → no upstream side effect) that
+        # the method-level middleware produced when it was the gate.
+        try:
+            async with mcp_client_factory(
+                mount, credential=credential, headers=headers
+            ) as client:
+                return await client.call_tool(tool, arguments, raise_on_error=False)
+        except McpError as exc:
+            return CallToolResult(
+                content=[TextContent(type="text", text=str(exc.error.message))],
+                structured_content=None,
+                meta=None,
+                is_error=True,
+            )
 
     return call
 

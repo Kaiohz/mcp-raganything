@@ -32,7 +32,7 @@ from infrastructure.database.rls_context import (
     current_credential,
     current_user_id,
 )
-from security import ComposableAgentsSecurity, McpApiKeyMiddleware
+from security import ComposableAgentsSecurity, McpApiKeyMiddleware, _cached_auth_context
 
 _MASTER_KEY = "super-secret-key"
 
@@ -372,3 +372,202 @@ class TestVerifyApiKeyBackwardCompat:
         assert security.verify_api_key(api_key_header=_MASTER_KEY) == _MASTER_KEY
         with pytest.raises(InvalidApiKeyError):
             security.verify_api_key(api_key_header="wrong")
+
+
+# ---------------------------------------------------------------------------
+# 5. Defense-in-depth handshake (code-review M-2): the middleware reuses the
+#    guard's verified principal for the SAME request's credential instead of
+#    re-deriving it — one DB lookup / one JWT verification per HTTP request.
+# ---------------------------------------------------------------------------
+
+
+class TestCachedAuthHandshake:
+    """The request-scoped cache written by ``authenticate_headers`` (the
+    seam the HTTP-level guard calls) lets ``_check_api_key`` short-circuit
+    when the presented credential is the one the guard already verified; a
+    DIFFERENT credential never short-circuits (defense-in-depth preserved)."""
+
+    def _middleware(self, auth_service: AsyncMock) -> "McpApiKeyMiddleware":
+        from security import McpApiKeyMiddleware
+
+        middleware = McpApiKeyMiddleware(master_key=_MASTER_KEY)
+        middleware.set_auth_service(auth_service)  # type: ignore[arg-type]
+        return middleware
+
+    def _tool_context(self):
+        from fastmcp.server.middleware import MiddlewareContext
+        from mcp.types import CallToolRequest, CallToolRequestParams
+
+        message = CallToolRequest(params=CallToolRequestParams(name="t", arguments={}))
+        return MiddlewareContext(message=message, method="tools/call")
+
+    async def _run_call_tool(self, middleware, call_next=None):
+        from fastapi import Request as FastAPIRequest
+        from fastmcp.server.dependencies import (
+            _current_http_request,  # pyright: ignore[reportPrivateImportUsage]
+        )
+
+        async def _next(_ctx):
+            return "ok"
+
+        scope = {"type": "http", "method": "POST", "headers": [], "path": "/"}
+        token = _current_http_request.set(FastAPIRequest(scope))
+        try:
+            return await middleware(self._tool_context(), call_next or _next)
+        finally:
+            _current_http_request.reset(token)
+
+    async def test_skips_reverification_when_the_guard_cached_the_same_credential(self):
+        svc = _make_auth_service_mock(api_key_user_id="user-alice")
+        mw = self._middleware(svc)
+
+        # The HTTP guard's pass: authenticates + caches the verified context.
+        ctx = await mw.authenticate_headers(None, "key-alice")
+        assert ctx is not None and ctx.user_id == "user-alice"
+        svc.authenticate.reset_mock()
+
+        # The middleware's defense-in-depth pass on the SAME request.
+        with patch(
+            "security.get_http_headers", return_value={"x-api-key": "key-alice"}
+        ):
+            result = await self._run_call_tool(mw)
+
+        assert result == "ok"
+        assert svc.authenticate.await_count == 0, (
+            "the middleware must NOT re-verify a credential the guard already "
+            "verified on this request (single authentication per request)"
+        )
+
+    async def test_foreign_credential_is_never_short_circuited(self):
+        """A credential different from the cached one keeps the FULL
+        re-verification: cross-request/session staleness can never be
+        short-circuited into another user's principal."""
+        svc = _make_auth_service_mock(
+            jwt_user_id="user-bob", api_key_user_id="user-alice"
+        )
+        mw = self._middleware(svc)
+
+        # The guard verified ALICE's API key on her request (cached).
+        ctx = await mw.authenticate_headers(None, "key-alice")
+        assert ctx is not None
+        svc.authenticate.reset_mock()
+
+        # BOB's tool call presents a DIFFERENT credential.
+        with patch(
+            "security.get_http_headers",
+            return_value={"authorization": "Bearer jwt-bob"},
+        ):
+            result = await self._run_call_tool(mw)
+
+        assert result == "ok"
+        svc.authenticate.assert_awaited_once()
+
+    async def test_no_cached_context_keeps_the_full_verification(self):
+        """A path NOT covered by the HTTP guard (no cached context yet) keeps
+        the middleware as the authenticator exactly as before."""
+        svc = _make_auth_service_mock(api_key_user_id="user-api-2")
+        mw = self._middleware(svc)
+        svc.authenticate.reset_mock()
+
+        with patch("security.get_http_headers", return_value={"x-api-key": "cpk_yyy"}):
+            result = await self._run_call_tool(mw)
+
+        assert result == "ok"
+        svc.authenticate.assert_awaited_once()
+
+    async def test_bearer_takes_precedence_for_the_cached_match(self):
+        """The presented-credential extraction mirrors the AuthService
+        precedence: a Bearer token wins over a colliding X-API-Key."""
+        svc = _make_auth_service_mock(jwt_user_id="user-jwt")
+        mw = self._middleware(svc)
+
+        await mw.authenticate_headers("Bearer my-jwt", "key-alice")
+        svc.authenticate.reset_mock()
+
+        with patch(
+            "security.get_http_headers",
+            return_value={"authorization": "Bearer my-jwt", "x-api-key": "key-bob"},
+        ):
+            result = await self._run_call_tool(mw)
+
+        assert result == "ok"
+        assert svc.authenticate.await_count == 0, (
+            "the Bearer token is the presented credential in the AuthService "
+            "order — a matching cached context short-circuits"
+        )
+
+
+class TestCachedAuthContextReset:
+    """Code-review MINOR-4: the handshake cache must be RESET at the start of
+    every ``authenticate_headers`` pass — a stale entry can never outlive its
+    request, so two SEQUENTIAL requests with different credentials on the SAME
+    middleware instance never share the cached context (and a denied request
+    leaves NO stale entry from the previous one)."""
+
+    async def test_denied_request_leaves_no_stale_entry(self):
+        """After Alice's request caches her context, a second request with a
+        DIFFERENT (denied) credential must leave the cache EMPTY — before the
+        reset the cache would still hold Alice's verified principal."""
+        svc = AsyncMock()
+
+        async def _authenticate(authorization: str | None, api_key: str | None):
+            if api_key == "key-alice":
+                return AuthContext(
+                    user_id="user-alice", method="api_key", raw_credential="key-alice"
+                )
+            return None
+
+        svc.authenticate.side_effect = _authenticate
+        mw = McpApiKeyMiddleware(master_key=_MASTER_KEY)
+        mw.set_auth_service(svc)
+
+        # Request 1: alice authenticates (the guard's pass caches her context).
+        ctx_first = await mw.authenticate_headers(None, "key-alice")
+        assert ctx_first is not None and ctx_first.raw_credential == "key-alice"
+        assert _cached_auth_context.get() is ctx_first
+
+        # Request 2: a DIFFERENT credential is DENIED (e.g. a revoked key).
+        ctx_second = await mw.authenticate_headers(None, "key-revoked")
+        assert ctx_second is None
+        assert _cached_auth_context.get() is None, (
+            "a denied request must not leave a stale entry from the previous request"
+        )
+
+    async def test_two_sequential_requests_never_reuse_the_previous_principal(
+        self,
+    ):
+        """Two sequential granted requests with different credentials: the
+        cache holds ONLY the second request's own principal — a foreign
+        credential (here: the previous request's one) can never be matched
+        against it."""
+        svc = AsyncMock()
+
+        async def _authenticate(authorization: str | None, api_key: str | None):
+            if api_key == "key-alice":
+                return AuthContext(
+                    user_id="user-alice", method="api_key", raw_credential="key-alice"
+                )
+            if api_key == "key-bob":
+                return AuthContext(
+                    user_id="user-bob", method="api_key", raw_credential="key-bob"
+                )
+            return None
+
+        svc.authenticate.side_effect = _authenticate
+        mw = McpApiKeyMiddleware(master_key=_MASTER_KEY)
+        mw.set_auth_service(svc)
+
+        # Request 1: alice authenticates (her context is cached).
+        ctx_alice = await mw.authenticate_headers(None, "key-alice")
+        assert ctx_alice is not None and ctx_alice.user_id == "user-alice"
+
+        # Request 2: bob's own credential — SAME middleware instance.
+        ctx_bob = await mw.authenticate_headers(None, "key-bob")
+        assert ctx_bob is not None and ctx_bob.user_id == "user-bob"
+        cached = _cached_auth_context.get()
+        assert cached is not None
+        assert cached is ctx_bob
+        assert cached.raw_credential == "key-bob", (
+            "alice's cached context from the previous request must be GONE — "
+            "the reset runs before this request's own re-caching"
+        )

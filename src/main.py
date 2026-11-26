@@ -2,13 +2,17 @@
 
 import asyncio
 import logging
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import asyncpg
 import uvicorn
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from starlette.routing import Route
+from starlette.types import ASGIApp
 
 from application.api.classical_indexing_routes import classical_indexing_router
 from application.api.classical_query_routes import classical_query_router
@@ -16,8 +20,14 @@ from application.api.file_routes import file_router
 from application.api.health_routes import health_router
 from application.api.mcp_classical_tools import mcp_classical
 from application.api.mcp_file_tools import mcp_files
+from application.api.mcp_guard import (
+    WELL_KNOWN_PROTECTED_RESOURCE_PATH,
+    McpAuthGuard,
+    public_discovery_origin,
+)
 from application.api.mcp_memory_tools import mcp_memories
 from application.api.mcp_registry_routes import mcp_registry_router
+from application.api.mcp_transport_security import McpTransportSecurityGuard
 from application.api.mcp_web_tools import mcp_web
 from application.error_handlers import (
     authentication_error_handler,
@@ -32,6 +42,7 @@ from application.error_handlers import (
     indexing_error_handler,
     invalid_api_key_handler,
     llm_not_configured_handler,
+    mcp_invalid_stored_config_handler,
     storage_error_handler,
     storage_not_found_handler,
     unsupported_format_handler,
@@ -51,6 +62,7 @@ from domain.errors.document import DocumentReadError, UnsupportedFormatError
 from domain.errors.file import FileError, FileTooLargeError, FileValidationError
 from domain.errors.indexing import IndexingError
 from domain.errors.llm import LlmNotConfiguredError
+from domain.errors.mcp import McpServerInvalidAuthModeError
 from domain.errors.security import AuthenticationError, InvalidApiKeyError
 from domain.errors.storage import StorageError, StorageNotFoundError
 from domain.errors.vector_store import VectorStoreConfigError, VectorStoreError
@@ -69,6 +81,37 @@ from security import ComposableAgentsSecurity, McpApiKeyMiddleware
 configure_logging(app_config)
 
 logger = logging.getLogger(__name__)
+
+#: The four built-in MCP mount paths (wired below). The per-mount
+#: protected-resource documents (QA BUG-002) are served for these paths plus
+#: the ``/generated/{name}/mcp`` pattern the registry mounts at runtime.
+MCP_MOUNT_PATHS = ("/files/mcp", "/classical/mcp", "/web/mcp", "/memories/mcp")
+
+#: The MCP resource advertised by the GLOBAL protected-resource metadata
+#: document (REQ-002-equivalent). QA BUG-002: one document cannot serve four
+#: distinct mounts, so the GLOBAL document keeps advertising the canonical
+#: files server while each mount's OWN document
+#: (``/.well-known/oauth-protected-resource/<mount>``) advertises
+#: ``https://<origin><mount>``.
+MCP_DISCOVERY_RESOURCE_PATH = "/files/mcp"
+
+
+def _is_mcp_mount_path(path: str) -> bool:
+    """Whether ``path`` is an MCP mount a per-mount discovery document serves.
+
+    The four built-in mounts plus the ``/generated/{name}/mcp`` pattern the
+    registry mounts at runtime (QA BUG-002) — everything else answers a plain
+    404 (no discovery document is manufactured for non-mount paths).
+
+    Args:
+        path: The candidate mount path below the well-known prefix.
+
+    Returns:
+        True when a per-mount protected-resource document is served for it.
+    """
+    return (
+        path in MCP_MOUNT_PATHS or re.fullmatch(r"/generated/.+/mcp", path) is not None
+    )
 
 
 def _run_alembic_upgrade() -> None:
@@ -152,10 +195,56 @@ mcp_classical.add_middleware(mcp_middleware)
 mcp_web.add_middleware(mcp_middleware)
 mcp_memories.add_middleware(mcp_middleware)
 
-mcp_files_app = mcp_files.http_app(path="/")
-mcp_classical_app = mcp_classical.http_app(path="/")
-mcp_web_app = mcp_web.http_app(path="/")
-mcp_memories_app = mcp_memories.http_app(path="/")
+# STATELESS transport (CRITICAL fix, code-review C-1): each HTTP request — and
+# the MCP tool task it dispatches — runs under its OWN task context, so the
+# RLS contextvars the HTTP guard sets on the ACCEPTED request's principal are
+# the ones the tool sees. In the fastmcp-default STATEFUL mode the tool task
+# inherits the SESSION CREATOR's context instead (a stale principal from an
+# earlier request — an actual cross-user isolation hazard when the
+# method-level middleware is not re-deriving it). Do NOT rely on the global
+# FASTMCP_STATELESS_HTTP env var: the fastmcp default is stateful, and the
+# prod configmap only sets it incidentally.
+mcp_files_app = mcp_files.http_app(path="/", stateless_http=True)
+mcp_classical_app = mcp_classical.http_app(path="/", stateless_http=True)
+mcp_web_app = mcp_web.http_app(path="/", stateless_http=True)
+mcp_memories_app = mcp_memories.http_app(path="/", stateless_http=True)
+
+
+def build_mcp_guard_stack(inner_app: ASGIApp, mount_path: str) -> ASGIApp:
+    """Compose one MCP mount's HTTP-level ASGI guard stack (REQ-014/015/017).
+
+    The stack (outermost first) is: ``McpAuthGuard`` — dual-auth HTTP guard
+    delegating to the wired dual-auth wiring (Bearer JWT + X-API-Key, RLS
+    contextvars) and answering unauthenticated requests with HTTP 401 + the
+    OAuth2 discovery challenge BEFORE any MCP method runs — then
+    ``McpTransportSecurityGuard`` — the explicit ``TransportSecuritySettings``
+    validation (Host allow-list — foreign Host → 421 — plus the Origin
+    allow-list mirroring the app's CORS policy, M-1) — then the FastMCP
+    ``http_app`` (STATELESS, so the guard's per-request RLS principal is the
+    one the tool task inherits, code-review C-1).
+
+    Host/origin lists are read from ``app_config`` at REQUEST time so the
+    configmap stays authoritative without a rebuild. The inner
+    ``McpApiKeyMiddleware`` (already mounted on every FastMCP server) stays
+    as defense-in-depth behind the HTTP guard: it reuses the guard's
+    verified principal for the same request's credential instead of
+    re-deriving it (single authentication per HTTP request, M-2).
+
+    Args:
+        inner_app: The FastMCP ``http_app`` to guard.
+        mount_path: The public mount path (e.g. ``/files/mcp`` or
+            ``/generated/{name}/mcp``) for the guard's path normalization.
+
+    Returns:
+        The guarded ASGI callable to route/mount. ``ASGIApp`` = a callable
+        ``(scope, receive, send) -> Awaitable[None]``.
+    """
+    return McpAuthGuard(
+        McpTransportSecurityGuard(inner_app, app_config),
+        mcp_middleware.authenticate_headers,
+        mount_path=mount_path,
+        settings=app_config,
+    )
 
 
 async def _initialize_mcp_registry(
@@ -218,6 +307,7 @@ def _initialize_dual_auth() -> None:
                     f"{app_config.LOGTO_URL}/oidc/jwks" if app_config.LOGTO_URL else ""
                 ),
                 audience=app_config.JWT_AUDIENCE,
+                audiences=app_config.JWT_AUDIENCES,
             )
             api_key_reader = AsyncpgApiKeyReader(pool=_mcp_pool)
             _deps.jwt_adapter = jwt_adapter
@@ -281,9 +371,42 @@ async def _close_startup_resources() -> None:
         await _mcp_pool.close()
 
 
+def _log_mcp_discovery_shape_warnings() -> None:
+    """Log (non-fatal) the MCP OAuth2 discovery-configuration shape.
+
+    Mirrors composable-agents' ``_log_mcp_discovery_shape_warnings`` (M-3):
+    a silent misconfiguration becomes a visible startup warning. The
+    metadata document only advertises an issuer/origin a PUBLIC MCP client
+    can reach: NOTHING advertised (both ``MCP_AUTHORIZATION_SERVER`` and
+    ``LOGTO_URL`` empty — the ``<LOGTO_URL>/oidc`` fallback is resolved ONCE
+    at startup by the ``AppConfig`` model validator, so
+    ``MCP_AUTHORIZATION_SERVER`` below carries the EFFECTIVE advertised
+    issuer, explicit or fallback alike) and a non-https authorization
+    server are warned for QA BUG-003; a non-https ``MCP_PUBLIC_BASE_URL``
+    origin is warned for NEW-1 (a scheme-less value already REFUSES startup
+    in ``AppConfig._validate_mcp_public_base_url``).
+    """
+    if not app_config.MCP_AUTHORIZATION_SERVER and not app_config.LOGTO_URL:
+        logger.warning(LogMessage.MCP_AUTHORIZATION_SERVER_NOT_ADVERTISED)
+    elif app_config.MCP_AUTHORIZATION_SERVER and not (
+        app_config.MCP_AUTHORIZATION_SERVER.startswith("https://")
+    ):
+        logger.warning(
+            LogMessage.MCP_AUTHORIZATION_SERVER_NOT_HTTPS,
+            app_config.MCP_AUTHORIZATION_SERVER,
+        )
+    if app_config.MCP_PUBLIC_BASE_URL and not (
+        app_config.MCP_PUBLIC_BASE_URL.startswith("https://")
+    ):
+        logger.warning(LogMessage.MCP_PUBLIC_BASE_URL_NOT_HTTPS)
+
+
 @asynccontextmanager
 async def combined_lifespan(app: FastAPI):
     """Combine database lifecycle with MCP lifespans and registry rehydration."""
+    # --- MCP OAuth2 discovery config shape warnings (M-3/QA BUG-003) ---
+    _log_mcp_discovery_shape_warnings()
+
     # --- Alembic migrations: own the mcp_servers table schema ---
     # Runs unconditionally (the schema must exist even if the registry is
     # disabled). Runs in a worker thread because Alembic's online mode drives
@@ -328,6 +451,11 @@ generated_mcp_runner = GeneratedMcpRunner(
     app=app,
     base_url=app_config.GENERATED_MCP_BASE_URL,
     middleware=[mcp_middleware],
+    # The generated /generated/{name}/mcp mounts get the SAME HTTP-level
+    # guard stack (auth + transport security) as the four static mounts
+    # (feat-mcp-oauth2-dual-auth, REQ-017); the FastMCP method-level
+    # middleware stays as defense-in-depth inside each generated server.
+    guard_factory=build_mcp_guard_stack,
 )
 app.state.generated_mcp_runner = generated_mcp_runner
 import dependencies as _deps  # noqa: E402
@@ -361,10 +489,165 @@ app.include_router(classical_query_router, prefix=REST_PATH, dependencies=_auth_
 # it is included without an additional prefix (only the auth dependency).
 app.include_router(mcp_registry_router, dependencies=_auth_dep)
 
-app.mount("/files/mcp", mcp_files_app)
-app.mount("/classical/mcp", mcp_classical_app)
-app.mount("/web/mcp", mcp_web_app)
-app.mount("/memories/mcp", mcp_memories_app)
+# --- Public OAuth2 discovery (REQ-002-equivalent) -----------------------------
+#
+# A PUBLIC (unauthenticated) route returning the static RFC 9728-style
+# protected-resource metadata document. MUST be registered BEFORE the MCP
+# mounts so it stays reachable regardless of later mount prefixes (it shares
+# no prefix with them — kept adjacent to the mount wiring for the same
+# discovery-chain readability). OPTIONS preflights on it are answered by the
+# app-wide CORS middleware without auth.
+
+
+async def _protected_resource_document(
+    request: Request, resource_path: str
+) -> Response:
+    """Derive the public origin and return one protected-resource document.
+
+    Single derivation shared by the global and per-mount documents
+    (QA BUG-002): one :func:`public_discovery_origin` derivation, one plain
+    404 fallback, one ``authorization_servers`` shape (the RESOLVED
+    ``MCP_AUTHORIZATION_SERVER`` — an explicit setting or the
+    ``<LOGTO_URL>/oidc`` fallback resolved once at startup by the
+    ``AppConfig`` model validator) — the list is EMPTY when neither is
+    configured.
+
+    Args:
+        request: The incoming request (its ``Host`` header is used only when
+            allow-listed by ``MCP_ALLOWED_HOSTS``).
+        resource_path: The advertised resource path (the canonical
+            ``MCP_DISCOVERY_RESOURCE_PATH`` for the global document, the
+            mount path itself for a per-mount document).
+
+    Returns:
+        The static RFC 9728-style JSON document, or a plain 404 (no
+        derivation detail) when no trustworthy origin can be derived.
+    """
+    origin = public_discovery_origin(
+        request.headers.get("host", ""),
+        configured_base_url=app_config.MCP_PUBLIC_BASE_URL,
+        allowed_hosts=list(app_config.MCP_ALLOWED_HOSTS),
+    )
+    if origin is None:
+        logger.warning(LogMessage.MCP_DISCOVERY_ORIGIN_UNAVAILABLE)
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND, content={"detail": "Not Found"}
+        )
+    return JSONResponse(
+        content={
+            "resource": f"{origin}{resource_path}",
+            "authorization_servers": (
+                [app_config.MCP_AUTHORIZATION_SERVER]
+                if app_config.MCP_AUTHORIZATION_SERVER
+                else []
+            ),
+        }
+    )
+
+
+@app.get(
+    WELL_KNOWN_PROTECTED_RESOURCE_PATH,
+    summary="OAuth2 protected-resource metadata (public discovery)",
+    description=(
+        "Unauthenticated RFC 9728-style protected-resource metadata for the "
+        "MCP OAuth2 discovery chain: the canonical resource identifier plus "
+        "the authorization servers accepting tokens for it. Each MCP mount "
+        "also serves its OWN metadata document at "
+        "'.well-known/oauth-protected-resource/<mount>' (QA BUG-002)."
+    ),
+    response_description="The static protected-resource metadata document.",
+    include_in_schema=False,
+)
+async def oauth_protected_resource(request: Request) -> Response:
+    """Return the canonical OAuth2 protected-resource metadata (public).
+
+    Args:
+        request: The incoming request (its ``Host`` header is used only when
+            allow-listed by ``MCP_ALLOWED_HOSTS``).
+
+    Returns:
+        ``{"resource": "https://<public-origin>/files/mcp",
+        "authorization_servers": [...]}`` — 404 (plain) when no trustworthy
+        origin can be derived.
+    """
+    return await _protected_resource_document(request, MCP_DISCOVERY_RESOURCE_PATH)
+
+
+@app.get(
+    WELL_KNOWN_PROTECTED_RESOURCE_PATH + "/{mount_path:path}",
+    summary="Per-mount OAuth2 protected-resource metadata (public discovery)",
+    description=(
+        "Unauthenticated RFC 9728-style protected-resource metadata for ONE "
+        "MCP mount: the document advertises that mount's OWN resource "
+        "identifier (QA BUG-002) plus the authorization servers accepting "
+        "tokens for it. Served for the four built-in mounts and the "
+        "/generated/{name}/mcp pattern."
+    ),
+    response_description="The mount-specific protected-resource metadata document.",
+    include_in_schema=False,
+)
+async def oauth_protected_resource_for_mount(
+    request: Request, mount_path: str
+) -> Response:
+    """Return the mount-specific OAuth2 protected-resource metadata (public).
+
+    Args:
+        request: The incoming request (its ``Host`` header is used only when
+            allow-listed by ``MCP_ALLOWED_HOSTS``).
+        mount_path: The mount path below the well-known prefix (its leading
+            ``/`` is already part of the URL).
+
+    Returns:
+        ``{"resource": "https://<public-origin><mount_path>",
+        "authorization_servers": [...]}``; a plain 404 when the path is not
+        an MCP mount or when no trustworthy origin can be derived.
+    """
+    if not _is_mcp_mount_path(f"/{mount_path}"):
+        # Not a mount (never a resource) → plain 404, like any unknown route.
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND, content={"detail": "Not Found"}
+        )
+    return await _protected_resource_document(request, f"/{mount_path}")
+
+
+# --- Protected MCP mounts (feat-mcp-oauth2-dual-auth) --------------------------
+#
+# PRODUCTION PREREQUISITE (code-review M-4, deliberately DEFERRED to the flux
+# wave-4 slice — no repo code change here): for this feature to be ALIVE in
+# production, `flux/prd/composables/raganything/configmap.yaml` MUST carry
+#   MCP_ALLOWED_HOSTS: "raganything.soludev.tech,127.0.0.1:*,localhost:*,[::1]:*"
+#   MCP_PUBLIC_BASE_URL: "https://raganything.soludev.tech"
+#   MCP_AUTHORIZATION_SERVER: "https://logto.soludev.tech/oidc"
+#   JWT_AUDIENCES: "<logto-opencode-app-id>"
+# and `flux/prd/composables/raganything/ingressroute.yaml` MUST add the
+# `PathPrefix(/.well-known)` public route (no forwardAuth) and the
+# `HeaderRegexp(Authorization, ^Bearer )` direct-backend route (priority 90),
+# mirroring the composable-agents slice. Without them every MCP request
+# answers 421 (localhost-only default list) and the 401 carries no
+# WWW-Authenticate challenge — see the review addendum.
+#
+# The HTTP-level guard stack (auth 401 + discovery challenge, then explicit
+# transport security) authenticates EVERY request — including ``initialize`` —
+# BEFORE any MCP method runs (REQ-001/017). The exact-path Route serves
+# POST <mount> directly — no Starlette Mount 307 and no ``http://`` scheme
+# downgrade behind the TLS-terminating proxy (REQ-015) — while the Mount
+# keeps serving "/<mount>/..." sub-paths; the guard rewrites both path forms
+# to "/" for the inner app. The ``McpApiKeyMiddleware`` stays mounted INSIDE
+# each FastMCP app (above) as defense-in-depth behind the HTTP guard.
+for _mount_path, _mcp_app in zip(
+    MCP_MOUNT_PATHS,
+    (mcp_files_app, mcp_classical_app, mcp_web_app, mcp_memories_app),
+    strict=True,
+):
+    _guarded = build_mcp_guard_stack(_mcp_app, _mount_path)
+    app.router.routes.append(
+        Route(
+            _mount_path,
+            _guarded,
+            name=f"mcp_{_mount_path.strip('/').replace('/', '_')}_endpoint",
+        )
+    )
+    app.mount(_mount_path, _guarded)
 
 app.add_exception_handler(StorageNotFoundError, storage_not_found_handler)
 app.add_exception_handler(StorageError, storage_error_handler)
@@ -384,6 +667,9 @@ app.add_exception_handler(ConfigError, config_error_handler)
 app.add_exception_handler(InvalidApiKeyError, invalid_api_key_handler)
 app.add_exception_handler(AuthenticationError, authentication_error_handler)
 app.add_exception_handler(LlmNotConfiguredError, llm_not_configured_handler)
+app.add_exception_handler(
+    McpServerInvalidAuthModeError, mcp_invalid_stored_config_handler
+)
 app.add_exception_handler(DomainError, domain_error_handler)
 
 

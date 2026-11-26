@@ -169,6 +169,7 @@ class LogMessage(StrEnum):
     LOG_UNHANDLED_DOMAIN_ERROR = "Unhandled domain error: %s"
     LOG_INVALID_API_KEY = "Invalid API key: %s"
     LOG_MCP_ERROR = "MCP error: %s"
+    LOG_MCP_INVALID_STORED_CONFIG = "MCP invalid stored configuration: %s"
     MCP_CONNECT_FAILED = "MCP connection to %s failed: %s"
     MCP_TOOLS_LOAD_FAILED = "MCP tool loading from %s failed: %s"
 
@@ -179,6 +180,44 @@ class LogMessage(StrEnum):
     AUTH_JWT_DECODE_FAILED = "JWT decode failed"
     AUTH_JWKS_FETCH_FAILED = "JWKS fetch failed"
     AUTH_CREDENTIALS_VALIDATED = "Credentials validated for user_id=%s method=%s"
+
+    # --- MCP HTTP-level guard (feat-mcp-oauth2-dual-auth) ---
+    # No credential material is ever interpolated (401s stay non-enumerating
+    # and the logs stay PII-free).
+    MCP_REQUEST_DENIED = "MCP request denied (missing or invalid credentials)"
+    MCP_DISCOVERY_ORIGIN_UNAVAILABLE = (
+        "MCP OAuth2 discovery origin unresolved: MCP_PUBLIC_BASE_URL is unset and "
+        "the request Host is not in MCP_ALLOWED_HOSTS — no discovery URL is advertised"
+    )
+    MCP_TRANSPORT_REJECTED = "MCP request rejected by transport security: %s"
+    # --- MCP OAuth2 discovery configuration shape (startup warnings, M-3 —
+    # mirrors the composable-agents QA BUG-003 / code-review NEW-1 pattern).
+    # The non-https messages deliberately do NOT interpolate the configured
+    # value: an operator may embed credentials in the URL.
+    MCP_AUTHORIZATION_SERVER_NOT_ADVERTISED = (
+        "MCP protected-resource metadata advertises NO authorization server: both "
+        "MCP_AUTHORIZATION_SERVER and LOGTO_URL are empty — MCP clients cannot complete "
+        "the OAuth2 discovery chain (REQ-002)"
+    )
+    MCP_AUTHORIZATION_SERVER_NOT_HTTPS = (
+        "MCP protected-resource metadata advertises the non-https authorization server '%s' "
+        "— a PUBLIC MCP client may not reach it (a container-internal LOGTO_URL fallback or "
+        "an explicit http value); set MCP_AUTHORIZATION_SERVER to the publicly reachable "
+        "issuer, e.g. https://logto.soludev.tech/oidc (QA BUG-003)"
+    )
+    MCP_PUBLIC_BASE_URL_NOT_HTTPS = (
+        "MCP discovery documents advertise a non-https public origin: MCP_PUBLIC_BASE_URL is an "
+        "http:// value — public MCP clients reach the resource over TLS; set the https:// public "
+        "origin, e.g. https://raganything.soludev.tech (a SCHEME-LESS value already refuses "
+        "startup). The configured value is never interpolated here on purpose: "
+        "an operator may embed credentials in the URL."
+    )
+
+    # --- Generated MCP runner (openapi_mcp) ---
+    MCP_EXACT_PATH_ROUTE_UNAVAILABLE = (
+        "MCP exact-path route unavailable for %s: the host app has no "
+        "router.routes list; the Mount-only 307 behavior applies"
+    )
 
     # --- MCP server registry (use cases / store / factory / runner) ---
     MCP_SERVER_CREATED_UC = "MCP server created (use case): name=%s tool_count=%d"
@@ -196,6 +235,13 @@ class LogMessage(StrEnum):
     MCP_RUNNER_MOUNTED = "Generated MCP server mounted: name=%s url=%s tool_count=%d"
     MCP_RUNNER_UNMOUNTED = "Generated MCP server unmounted: name=%s"
     MCP_RUNNER_MOUNT_FAILED = "Generated MCP server mount failed: name=%s error=%s"
+    MCP_RUNNER_LIFESPAN_CLOSE_FAILED = (
+        "Generated MCP lifespan close failed: name=%s error=%s"
+    )
+    MCP_TOOL_COUNT_FAILED = (
+        "Generated MCP tool count failed (the mounted server stays healthy): "
+        "name=%s error=%s"
+    )
     MCP_REHYDRATION_STARTED = "Rehydrating generated MCP servers from registry..."
     MCP_REHYDRATION_DONE = "Rehydration complete: mounted=%d skipped=%d"
     MCP_REHYDRATION_ENTRY_FAILED = (
@@ -205,6 +251,12 @@ class LogMessage(StrEnum):
         "Rehydration skipped %d generated MCP server(s) due to mount failures; "
         "they will be retried on the next startup."
     )
+    # list_all skip reasons (feat-mcp-oauth2 REQ-004): the two failure modes are
+    # labeled separately so a corrupted ``auth_mode`` value is never reported as
+    # a "secret decryption failed" miss. No PII — the server name and the
+    # exception detail (the unsupported non-secret mode value) only.
+    MCP_SERVER_SKIPPED_DECRYPT_FAILED = "Skipping MCP server from the catalog: secret decryption failed: server=%s error=%s"
+    MCP_REGISTRY_ENTRY_INVALID_AUTH_MODE = "Skipping MCP server from the catalog: invalid stored auth_mode: server=%s error=%s"
 
     # --- Web search tool (DDGS + Crawl4AI) ---
     # No query, URL or crawled content is interpolated (untrusted external data).

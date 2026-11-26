@@ -1,0 +1,13 @@
+# CHANGE RISK ratchet baseline (widest measurement 2026-11-25, feat-mcp-oauth2-dual-auth iter-2).
+# Format: src/path.py:func_name:<recorded CRAP> — keyed by path+NAME in
+# scripts/check_crap.py. The gate-output form 'path:line:name:crap' (an
+# offender line copied verbatim from the gate or the pytest-crap report) is
+# ALSO accepted and keyed the same way.
+# Entries mark functions that ALREADY exceeded CRAP 30 BEFORE the
+# feat-mcp-oauth2-dual-auth iteration-2 remediation; they are NOT charged to
+# this change. The gate still fails when one of them REGRESSES (score rises
+# above the recorded value).
+# Prune an entry whenever the function drops below the threshold.
+src/infrastructure/web_search/url_safety/adapter.py:_validate_resolved:41.54  # pre-existing (not charged to feat-mcp-oauth2-dual-auth)
+src/infrastructure/rag/classical_bm25_adapter.py:_ensure_bm25_index:39.70  # pre-existing (not charged to feat-mcp-oauth2-dual-auth)
+src/infrastructure/openapi_mcp/swagger2_converter.py:convert_swagger2_to_openapi3:30.18  # pre-existing borderline (not charged to feat-mcp-oauth2-dual-auth)

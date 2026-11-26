@@ -39,6 +39,16 @@ jobs:
     - name: Run all tests
       run: uv run pytest --cov-report=html
 
+    # CHANGE RISK gate (pytest-crap): report CRAP alongside coverage and FAIL
+    # on any function whose CRAP score exceeds 30. pytest-crap only reports;
+    # the second step enforces via scripts/check_crap.py reusing the same
+    # calculator (code-review C-2 remediation).
+    - name: Run all tests with CRAP measurement
+      run: uv run pytest --cov=src --crap --crap-threshold=30 --cov-report= --cov-report=xml:coverage.xml
+
+    - name: CRAP gate (no new offender, no baseline regression)
+      run: uv run python scripts/check_crap.py --source src --threshold 30 --baseline scripts/crap-baseline.txt
+
     - name: Trivy FS Scan (report)
       uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1
       with:

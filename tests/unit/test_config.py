@@ -7,12 +7,169 @@ NOTE: The project loads .env via dotenv, so tests that need to verify
 fallback behavior must explicitly override or remove env vars.
 """
 
+from typing import Any
 from unittest.mock import patch
 
 import pytest
 from pydantic import ValidationError
 
-from config import DatabaseConfig, LLMConfig
+from config import AppConfig, DatabaseConfig, LLMConfig
+
+
+def _env(value: str) -> Any:
+    """A raw environment-variable value: ALWAYS a string at runtime.
+
+    Pydantic types the constructor input by the FIELD annotation
+    (``list[str]``) while the ``NoDecode`` before-validators parse the raw
+    CSV string — the production path these tests exercise. An untyped passthrough
+    keeps the runtime shape (the string) visible without fighting the
+    synthesized ``__init__`` signature.
+    """
+    return value
+
+
+class TestMcpCsvListCoercion:
+    """The CSV env parsing of MCP_ALLOWED_HOSTS / JWT_AUDIENCES /
+    MCP_ALLOWED_ORIGINS (REQ-003/REQ-014/M-1) — code-review C-2.
+
+    The env-string branch is the PRODUCTION path (an env var is always a
+    string) and was never executed by any test: the behavioral conftest
+    seeds the value on the already-built ``app_config`` object, so the
+    validator never runs there. The two failure modes it guards are silent
+    total outages (a JSON-style or empty list matches no Host → 421 for
+    EVERY MCP request with DNS-rebinding protection enabled).
+    """
+
+    def test_csv_string_is_split_and_stripped(self):
+        """The production multi-value CSV string branch: split + per-entry strip."""
+        cfg = AppConfig(
+            MCP_ALLOWED_HOSTS=_env("raganything.soludev.tech, 127.0.0.1:* ,localhost:*")
+        )
+        assert cfg.MCP_ALLOWED_HOSTS == [
+            "raganything.soludev.tech",
+            "127.0.0.1:*",
+            "localhost:*",
+        ]
+
+    def test_json_style_value_is_refused(self):
+        """An ALLOWED_ORIGINS-style JSON value stays ONE entry that matches
+        nothing → refused at startup (silent 421 outage instead)."""
+        with pytest.raises(ValidationError, match="JSON-style"):
+            AppConfig(MCP_ALLOWED_HOSTS=_env('["raganything.soludev.tech"]'))
+
+    def test_partially_json_value_is_refused(self):
+        """A value no quote/brace on the WHOLE string but carrying JSON
+        punctuation on a split entry (``'[a, b]'``) is refused too."""
+        with pytest.raises(ValidationError, match="JSON-style"):
+            AppConfig(MCP_ALLOWED_HOSTS=_env("[a, b]"))
+
+    def test_ipv6_loopback_literal_is_not_json_punctuated(self):
+        """The legitimate ``[::1]`` IPv6 literal stays accepted (the only
+        bracket-wrapped shape a host list may legitimately contain)."""
+        cfg = AppConfig(MCP_ALLOWED_HOSTS=_env("[::1]:*"))
+        assert cfg.MCP_ALLOWED_HOSTS == ["[::1]:*"]
+
+    def test_empty_env_string_is_refused(self):
+        with pytest.raises(ValidationError, match="must not be empty"):
+            AppConfig(MCP_ALLOWED_HOSTS=_env("   "))
+
+    def test_empty_python_list_is_refused(self):
+        """The Python API path cannot hide an empty allow-list either."""
+        with pytest.raises(ValidationError, match="must not be empty"):
+            AppConfig(MCP_ALLOWED_HOSTS=[])
+
+    def test_jwt_audiences_tolerates_empty(self):
+        """Legacy parity: an empty JWT_AUDIENCES keeps the single-audience
+        behavior (an empty value is NOT refused)."""
+        assert AppConfig(JWT_AUDIENCES=_env("")).JWT_AUDIENCES == []
+
+    def test_jwt_audiences_blank_entries_are_dropped(self):
+        """Whitespace-only CSV entries never produce phantom audiences."""
+        assert AppConfig(JWT_AUDIENCES=_env("  ,  open-code-app  ,")).JWT_AUDIENCES == [
+            "open-code-app"
+        ]
+
+    def test_mcp_allowed_origins_csv_string_is_split(self):
+        """M-1: the Origin allow-list parses as CSV (never JSON)."""
+        cfg = AppConfig(
+            MCP_ALLOWED_ORIGINS=_env(
+                "https://composable-ui.soludev.tech, https://localhost:*"
+            )
+        )
+        assert cfg.MCP_ALLOWED_ORIGINS == [
+            "https://composable-ui.soludev.tech",
+            "https://localhost:*",
+        ]
+
+    def test_mcp_allowed_origins_default_is_empty_inherits_cors(self):
+        """An unset MCP_ALLOWED_ORIGINS stays empty — the transport guard
+        then inherits the app's ALLOWED_ORIGINS CORS policy."""
+        cfg = AppConfig()
+        assert cfg.MCP_ALLOWED_ORIGINS == []
+        assert cfg.ALLOWED_ORIGINS == ["*"]
+
+
+class TestMcpPublicBaseUrlSetting:
+    """M-3 (mirrors composable-agents' NEW-1 validator): the advertised
+    discovery origin MUST be an absolute http(s) URL. A scheme-less value
+    would publish a malformed ``resource_metadata`` URL the discovery chain
+    cannot fetch."""
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "raganything.soludev.tech",
+            "//raganything.soludev.tech",
+            "example.com/mcp",
+        ],
+    )
+    def test_scheme_less_value_refuses_startup(self, value):
+        with pytest.raises(ValidationError, match="MCP_PUBLIC_BASE_URL"):
+            AppConfig(MCP_PUBLIC_BASE_URL=value)
+
+    def test_refusal_message_explains_the_silently_broken_chain(self):
+        with pytest.raises(ValidationError, match="malformed"):
+            AppConfig(MCP_PUBLIC_BASE_URL="example.com")
+
+    def test_trailing_slash_and_whitespace_are_stripped(self):
+        cfg = AppConfig(MCP_PUBLIC_BASE_URL="  https://raganything.soludev.tech/  ")
+        assert cfg.MCP_PUBLIC_BASE_URL == "https://raganything.soludev.tech"
+
+    def test_http_value_is_accepted_for_dev(self):
+        cfg = AppConfig(MCP_PUBLIC_BASE_URL="http://raganything.local:8000")
+        assert cfg.MCP_PUBLIC_BASE_URL == "http://raganything.local:8000"
+
+    def test_blank_value_is_treated_as_unset(self):
+        assert AppConfig(MCP_PUBLIC_BASE_URL="   ").MCP_PUBLIC_BASE_URL == ""
+
+
+class TestMcpAuthorizationServerSetting:
+    """M-3 (mirrors composable-agents' QA BUG-003 validator): the advertised
+    issuer MUST be absolute; a present-but-relative value would publish the
+    malformed ``["/oidc"]`` document."""
+
+    def test_relative_value_refuses_startup(self):
+        with pytest.raises(ValidationError, match="MCP_AUTHORIZATION_SERVER"):
+            AppConfig(MCP_AUTHORIZATION_SERVER="/oidc")
+
+    def test_internal_issuer_stays_accepted_but_is_warned_at_startup(self):
+        """A present http:// value is dev/QA-legal (the non-fatal half of
+        M-3) — the strict https refusal is a startup WARNING, pinned in
+        ``tests/unit/test_mcp_authorization_server_setting.py``."""
+        cfg = AppConfig(MCP_AUTHORIZATION_SERVER="http://logto:3001/oidc")
+        assert cfg.MCP_AUTHORIZATION_SERVER == "http://logto:3001/oidc"
+
+    def test_blank_value_is_treated_as_unset(self):
+        """A blank value means "unset": with ``LOGTO_URL`` empty too (both
+        explicit — the env must not leak into the assertion) NOTHING is
+        advertised. The FALLBACK resolution itself is pinned in
+        ``tests/unit/test_mcp_authorization_server_setting.py``."""
+        assert (
+            AppConfig(
+                MCP_AUTHORIZATION_SERVER="   ", LOGTO_URL=""
+            ).MCP_AUTHORIZATION_SERVER
+            == ""
+        )
 
 
 class TestLLMConfigApiKey:

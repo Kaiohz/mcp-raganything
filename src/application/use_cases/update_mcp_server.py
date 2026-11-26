@@ -137,7 +137,15 @@ class UpdateMcpServerUseCase:
         mounted_url = await self._runner.mount(
             updated.name, spec, headers=updated.headers
         )
-        tool_count = await self._runner.count_tools(updated.name)
+        try:
+            tool_count = await self._runner.count_tools(updated.name)
+        except Exception as e:  # noqa: BLE001 — the mounted server must survive the count
+            # QA BUG-001 (same guard as the create path): the count annotates
+            # an already-mounted, healthy server — a count failure must not
+            # fail the update nor leave the mount unregistered. 0 = count
+            # unavailable; refreshed by the next update.
+            logger.warning(LogMessage.MCP_TOOL_COUNT_FAILED, updated.name, e)
+            tool_count = 0
 
         to_save = updated.model_copy(
             update={
