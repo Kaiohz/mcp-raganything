@@ -56,6 +56,13 @@ mock_llm = _external.mock_llm
 auth_directory = _external.auth_directory
 web_external = _external.web_external
 memory_external = _external.memory_external
+# The autouse RESETTERS are exported too: every behavioral suite observes the
+# doubles through fresh per-test state (a suite that re-applies its own
+# reset — e.g. scope_rag_memories' ``reset_feature_externals`` — simply
+# resets twice). Without the global reset, an earlier suite's recorded
+# upstream requests leak into a later double-observing suite's assertions.
+reset_memory_external = _external.reset_memory_external
+reset_web_external = _external.reset_web_external
 
 
 @pytest.fixture

@@ -73,12 +73,21 @@ def _row(
     }
 
 
+def _mock_transaction_cm(conn: AsyncMock) -> None:
+    """Attach a real async context manager to ``conn.transaction`` (C4 seam)."""
+    transaction_cm = AsyncMock()
+    transaction_cm.__aenter__.return_value = None
+    transaction_cm.__aexit__.return_value = None
+    conn.transaction = MagicMock(return_value=transaction_cm)
+
+
 @pytest.fixture
 def mock_conn() -> AsyncMock:
     """A mock asyncpg.Connection."""
     conn = AsyncMock()
     conn.execute = AsyncMock(return_value="OK")
     conn.fetchrow = AsyncMock(return_value=None)
+    _mock_transaction_cm(conn)
     return conn
 
 

@@ -35,11 +35,16 @@ async def save(mcp_call, name="preferences", content="remember this", **kwargs):
     )
 
 
-async def test_memories_mount_exposes_only_the_approved_tool(mcp_list):
+async def test_memories_mount_exposes_only_the_approved_tools(mcp_list):
     tools = await mcp_list(MEMORY_MOUNT)
 
-    assert [tool.name for tool in tools] == ["save_memory"]
-    schema = tools[0].inputSchema
+    # scope-rag-memories (REQ-013): the four scoped memory tools are the
+    # server's complete approved surface — save/list/get/delete — and none
+    # of them exposes scope/user parameters.
+    names = sorted(tool.name for tool in tools)
+    assert names == ["delete_memory", "get_memory", "list_memories", "save_memory"]
+    save_tool = next(tool for tool in tools if tool.name == "save_memory")
+    schema = save_tool.inputSchema
     assert set(schema["properties"]) == {"name", "content", "if_exists"}
     assert set(schema["required"]) == {"name", "content"}
     assert schema["properties"]["if_exists"]["default"] == "fail"
@@ -52,7 +57,7 @@ async def test_memories_mount_exposes_only_the_approved_tool(mcp_list):
         assert forbidden not in schema["properties"]
     # The documented response contract must be advertised, not a loose
     # additionalProperties object (REQ-011).
-    output_properties = tools[0].outputSchema["properties"]
+    output_properties = save_tool.outputSchema["properties"]
     assert set(output_properties) == {"path", "action", "chars"}
     assert output_properties["action"]["enum"] == [
         "created",
