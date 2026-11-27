@@ -73,6 +73,7 @@ def _row(
         "env_encrypted": env_encrypted,
         "auth_token_encrypted": auth_token_encrypted,
         "tool_count": tool_count,
+        "tool_names_json": "[]",
         "source_type": source_type,
         "openapi_url": openapi_url,
         "auth_mode": auth_mode,

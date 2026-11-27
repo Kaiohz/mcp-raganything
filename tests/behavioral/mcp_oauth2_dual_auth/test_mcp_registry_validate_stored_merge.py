@@ -312,7 +312,8 @@ class TestValidateStoredEntry:
         keys = target.probe.api_key_values()
         assert keys, "the probe must have reached the real target server"
         assert set(keys) == {STORED_API_KEY}
-        assert set(fix_resp.json().keys()) == {"tool_count"}
+        assert set(fix_resp.json().keys()) == {"tool_count", "tool_names"}
+        assert fix_resp.json()["tool_names"] == ["ping"]
 
     async def test_dirty_url_and_auth_mode_override_secrets_stay_stored(
         self,
@@ -537,7 +538,7 @@ class TestValidateStoredEntry:
         # Assert 2 — 200 with the REAL tool count, the stored key on the wire
         assert by_alias.status_code == 200, by_alias.text
         assert by_alias.json()["tool_count"] >= 1
-        assert by_alias.json() == {"tool_count": 1}
+        assert by_alias.json() == {"tool_count": 1, "tool_names": ["ping"]}
         alias_keys = target.probe.api_key_values()
         assert alias_keys, "the alias probe must have reached the real target"
         assert set(alias_keys) == {STORED_API_KEY}

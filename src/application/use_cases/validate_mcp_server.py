@@ -11,6 +11,7 @@ Both raise :class:`McpServerUnreachableError` if the validation fails.
 """
 
 import logging
+from typing import NamedTuple
 
 from domain.entities.mcp_server_config import McpServerConfig
 from domain.errors.mcp import (
@@ -24,6 +25,13 @@ from domain.ports.mcp_tool_loader import McpToolLoader
 from domain.ports.openapi_mcp_factory import OpenApiMcpFactory
 
 logger = logging.getLogger(__name__)
+
+
+class ValidationProbe(NamedTuple):
+    """Discovered tool metadata from one validation probe (no persistence)."""
+
+    count: int
+    tool_names: list[str]
 
 
 class ValidateMcpServerUseCase:
@@ -42,14 +50,14 @@ class ValidateMcpServerUseCase:
         self._tool_loader = tool_loader
         self._openapi_factory = openapi_factory
 
-    async def execute(self, config: McpServerConfig) -> int:
-        """Validate an external MCP server connection and return the tool count.
+    async def execute(self, config: McpServerConfig) -> ValidationProbe:
+        """Validate an external MCP server connection and list its tools.
 
         Args:
             config: The MCP server connection configuration to validate.
 
         Returns:
-            The number of tools discovered on the server.
+            The validation probe: the number of tools and their names.
 
         Raises:
             McpServerUnreachableError: If the server cannot be reached or
@@ -69,13 +77,16 @@ class ValidateMcpServerUseCase:
             ) from e
 
         count = len(tools)
+        tool_names = [str(t.name) for t in tools if getattr(t, "name", None)]
         logger.info(LogMessage.MCP_SERVER_VALIDATED_UC, config.name, count)
-        return count
+        return ValidationProbe(count=count, tool_names=tool_names)
 
-    async def execute_openapi(self, openapi_url: str, headers: dict[str, str]) -> int:
+    async def execute_openapi(
+        self, openapi_url: str, headers: dict[str, str]
+    ) -> ValidationProbe:
         """Dry-run validation of an OpenAPI spec (no mount, no persistence).
 
-        Fetches the spec, builds an in-process FastMCP server, and counts its
+        Fetches the spec, builds an in-process FastMCP server, and lists its
         tools. Nothing is mounted or saved.
 
         Args:
@@ -83,7 +94,7 @@ class ValidateMcpServerUseCase:
             headers: Upstream auth headers to send when fetching the spec.
 
         Returns:
-            The number of tools the built server exposes.
+            The validation probe: the number of tools and their names.
 
         Raises:
             OpenApiFetchError: If the spec cannot be fetched.
@@ -93,6 +104,7 @@ class ValidateMcpServerUseCase:
         spec = await self._openapi_factory.fetch_spec(openapi_url, headers=headers)
         mcp = await self._openapi_factory.build_mcp(spec, base_url="", headers=headers)
         count = await self._openapi_factory.count_tools(mcp)
+        tool_names = await self._openapi_factory.list_tool_names(mcp)
 
         logger.info(LogMessage.MCP_SERVER_VALIDATED_UC, openapi_url, count)
-        return count
+        return ValidationProbe(count=count, tool_names=tool_names)

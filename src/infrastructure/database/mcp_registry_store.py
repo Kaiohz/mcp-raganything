@@ -50,6 +50,26 @@ from infrastructure.database.rls_context import current_user_id, set_rls_context
 logger = logging.getLogger(__name__)
 
 
+def _coerce_tool_names(value: Any) -> list[str]:
+    """Coerce the persisted ``tool_names_json`` column into a list of names.
+
+    Defensive (the 006 migration defaults to ``'[]'``, but rows migrated via
+    other paths may carry non-JSON): any unparseable value degrades to an
+    empty list (metadata only — a corrupted column must neither lose the row
+    nor abort the list/get).
+    """
+    if isinstance(value, list):
+        return [str(name) for name in value if name is not None]
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (ValueError, TypeError):
+            return []
+        if isinstance(parsed, list):
+            return [str(name) for name in parsed if name is not None]
+    return []
+
+
 def _coerce_auth_mode(value: Any) -> McpAuthMode:
     """Coerce a persisted ``auth_mode`` value into the domain enum.
 
@@ -128,6 +148,7 @@ class McpRegistryStore(McpServerRegistryStore):
             if entry.auth_token is not None
             else None
         )
+        tool_names_json = json.dumps(entry.tool_names)
         user_id = current_user_id.get() or ""
 
         if user_id:
@@ -139,9 +160,9 @@ class McpRegistryStore(McpServerRegistryStore):
             sql = """
             INSERT INTO mcp_servers
                 (name, transport, url, headers_encrypted, env_encrypted,
-                 auth_token_encrypted, tool_count, created_at, updated_at,
-                 source_type, openapi_url, user_id, auth_mode)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                 auth_token_encrypted, tool_count, tool_names_json, created_at,
+                 updated_at, source_type, openapi_url, user_id, auth_mode)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             ON CONFLICT (name) DO UPDATE SET
                 transport            = EXCLUDED.transport,
                 url                  = EXCLUDED.url,
@@ -149,6 +170,7 @@ class McpRegistryStore(McpServerRegistryStore):
                 env_encrypted        = EXCLUDED.env_encrypted,
                 auth_token_encrypted = EXCLUDED.auth_token_encrypted,
                 tool_count           = EXCLUDED.tool_count,
+                tool_names_json      = EXCLUDED.tool_names_json,
                 updated_at           = now(),
                 source_type          = EXCLUDED.source_type,
                 openapi_url          = EXCLUDED.openapi_url,
@@ -161,9 +183,9 @@ class McpRegistryStore(McpServerRegistryStore):
             sql = """
             INSERT INTO mcp_servers
                 (name, transport, url, headers_encrypted, env_encrypted,
-                 auth_token_encrypted, tool_count, created_at, updated_at,
-                 source_type, openapi_url, user_id, auth_mode)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                 auth_token_encrypted, tool_count, tool_names_json, created_at,
+                 updated_at, source_type, openapi_url, user_id, auth_mode)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             ON CONFLICT (name) DO UPDATE SET
                 transport            = EXCLUDED.transport,
                 url                  = EXCLUDED.url,
@@ -171,6 +193,7 @@ class McpRegistryStore(McpServerRegistryStore):
                 env_encrypted        = EXCLUDED.env_encrypted,
                 auth_token_encrypted = EXCLUDED.auth_token_encrypted,
                 tool_count           = EXCLUDED.tool_count,
+                tool_names_json      = EXCLUDED.tool_names_json,
                 updated_at           = now(),
                 source_type          = EXCLUDED.source_type,
                 openapi_url          = EXCLUDED.openapi_url,
@@ -192,6 +215,7 @@ class McpRegistryStore(McpServerRegistryStore):
                 env_encrypted,
                 auth_token_encrypted,
                 entry.tool_count,
+                tool_names_json,
                 entry.created_at,
                 entry.updated_at,
                 entry.source_type,
@@ -240,8 +264,8 @@ class McpRegistryStore(McpServerRegistryStore):
         params: tuple[Any, ...] = (name, user_id) if user_id is not None else (name,)
         sql = f"""
         SELECT name, transport, url, headers_encrypted, env_encrypted,
-               auth_token_encrypted, tool_count, created_at, updated_at,
-               source_type, openapi_url, user_id, auth_mode
+               auth_token_encrypted, tool_count, tool_names_json, created_at,
+               updated_at, source_type, openapi_url, user_id, auth_mode
         FROM mcp_servers
         {where};
         """
@@ -281,8 +305,8 @@ class McpRegistryStore(McpServerRegistryStore):
             params = ()
         sql = f"""
         SELECT name, transport, url, headers_encrypted, env_encrypted,
-               auth_token_encrypted, tool_count, created_at, updated_at,
-               source_type, openapi_url, user_id, auth_mode
+               auth_token_encrypted, tool_count, tool_names_json, created_at,
+               updated_at, source_type, openapi_url, user_id, auth_mode
         FROM mcp_servers
         {where}
         ORDER BY name;
@@ -405,6 +429,7 @@ class McpRegistryStore(McpServerRegistryStore):
             auth_token=auth_token,
             auth_mode=_coerce_auth_mode(row["auth_mode"]),
             tool_count=row["tool_count"],
+            tool_names=_coerce_tool_names(row["tool_names_json"]),
             source_type=row["source_type"],
             openapi_url=row["openapi_url"],
             created_at=row["created_at"],

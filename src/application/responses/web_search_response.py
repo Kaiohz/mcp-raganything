@@ -1,8 +1,9 @@
 """Response models for the ``web_search`` MCP tool (REQ-006 contract).
 
 These models mirror the domain report 1:1 so the thin tool layer maps a
-domain entity with a direct ``**model_dump()`` transformation. They carry no
-``chars``/``truncated`` output-size fields by design: complete Crawl4AI
+domain entity with a direct ``**model_dump()`` transformation. The
+``truncated`` flag reports which explored pages were cut at the configured
+``WEB_SEARCH_PAGE_MAX_CHARS`` cap; without a cap the complete Crawl4AI
 Markdown is always returned.
 """
 
@@ -22,7 +23,13 @@ class CrawlResult(BaseModel):
     )
     markdown: str | None = Field(
         default=None,
-        description="Complete Crawl4AI Markdown for successful pages; never truncated",
+        description="Crawl4AI Markdown for successful pages; cut at "
+        "WEB_SEARCH_PAGE_MAX_CHARS characters when a cap is configured",
+    )
+    truncated: bool = Field(
+        default=False,
+        description="True when the Markdown was cut at the configured "
+        "per-page character cap",
     )
     error: str | None = Field(default=None, description="Safe, concise failure reason")
 

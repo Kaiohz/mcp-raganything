@@ -1,4 +1,4 @@
-"""DuckDuckGo search adapter (pinned ``ddgs==9.16.1``).
+"""Multi-backend ddgs search adapter (pinned ``ddgs==9.16.1``).
 
 Runs the synchronous DDGS SDK on a dedicated bounded ``ThreadPoolExecutor``
 (never the default executor, never the event loop) behind a process-wide
@@ -8,8 +8,15 @@ while its worker thread is still running: release happens only when the
 thread actually finishes, so a saturated process never starts work above its
 configured ceiling.
 
-``DDGS`` is imported as a module-level symbol so tests can patch the adapter
-locally without touching the library namespace.
+Backends come from ``WEB_SEARCH_BACKENDS`` (ordered list). Each search tries
+the backends in order; the first backend returning entries wins. A backend
+answering "No results found." (ddgs collapses DuckDuckGo's HTTP 202 anti-bot
+challenge and a genuine empty result set into that message) or failing with
+an exception is skipped for the next backend; when no backend returns
+entries the search maps to ``[]`` if at least one backend ran cleanly and
+re-raises the last backend failure otherwise (distinct sanitized provider
+error). ``DDGS`` is imported as a module-level symbol so tests can patch the
+adapter locally without touching the library namespace.
 """
 
 import asyncio
@@ -40,10 +47,12 @@ def _mark_completed(loop: asyncio.AbstractEventLoop, event: asyncio.Event) -> No
 
 
 class DDGSSearchAdapter(WebSearchPort):
-    """Search DuckDuckGo through DDGS with bounded, dedicated capacity.
+    """Search the public web through DDGS with bounded, dedicated capacity.
 
     Attributes:
         _timeout: Outer timeout (seconds) around the complete search op.
+        _backends: Ordered ddgs backends; the first one returning entries
+            wins (``WEB_SEARCH_BACKENDS``).
         _executor: Dedicated thread pool (``WEB_SEARCH_EXECUTOR_WORKERS``).
         _semaphore: Process-wide cap on active DDGS calls in flight.
     """
@@ -53,8 +62,12 @@ class DDGSSearchAdapter(WebSearchPort):
         timeout_seconds: float,
         max_concurrency: int,
         executor_workers: int,
+        backends: list[str],
     ) -> None:
+        if not backends:
+            raise ValueError("DDGSSearchAdapter requires at least one backend")
         self._timeout = timeout_seconds
+        self._backends = list(backends)
         self._executor: ThreadPoolExecutor = ThreadPoolExecutor(
             max_workers=executor_workers,
             thread_name_prefix="raganything-ddgs",
@@ -73,7 +86,7 @@ class DDGSSearchAdapter(WebSearchPort):
             max_results: Requested result count (1..10).
 
         Returns:
-            Provider pages in DuckDuckGo order; entries without a usable URL
+            Provider pages in provider order; entries without a usable URL
             are dropped.
 
         Raises:
@@ -141,35 +154,60 @@ class DDGSSearchAdapter(WebSearchPort):
         task = asyncio.get_running_loop().create_task(_release())
         pending_releases.add(task)
 
-    @staticmethod
-    def _search_blocking(query: str, max_results: int) -> list[dict]:
-        """Synchronous DDGS call executed inside the dedicated executor.
+    def _search_blocking(self, query: str, max_results: int) -> list[dict]:
+        """Synchronous DDGS calls executed inside the dedicated executor.
 
-        A fresh DDGS client is created per search operation; the explicit
-        ``backend="duckduckgo"`` and requested ``max_results`` are the only
-        search parameters passed to the provider.
+        A fresh DDGS client is created per backend attempt; the explicit
+        ``backend`` (from the ordered fallback chain) and requested
+        ``max_results`` are the only search parameters passed to the provider.
 
-        Empty-result mapping (ddgs 9.16.1 evidence: ``BaseSearchEngine.request``
-        returns ``None`` for ANY non-200 response — including DuckDuckGo's HTTP
-        202 anti-bot challenge page — and ``DDGS._search_sync`` then raises
-        ``DDGSException("No results found.")`` with no distinguishing signal
-        when every engine returns nothing). The adapter therefore keeps the
-        genuine-empty ``[]`` mapping (AC-22) and logs a warning so operators
-        know an empty result set may also mean the provider is challenging or
-        unreachable from this network; connection and timeout failures surface
-        as distinct sanitized provider errors instead.
+        Fallback semantics (each backend gets exactly one attempt):
+        * a backend returning entries wins immediately;
+        * ``DDGSException`` with the "no results found" message or any other
+          exception → sanitized warning (never the exception text), next
+          backend;
+        * no backend returned entries → ``[]`` when at least one backend ran
+          cleanly (genuine-empty mapping, AC-22), otherwise the LAST backend
+          failure propagates so the tool surfaces its existing sanitized
+          provider-error wording.
+
+        Empty-result evidence (ddgs 9.16.1): ``BaseSearchEngine.request``
+        returns ``None`` for ANY non-200 response — including DuckDuckGo's
+        HTTP 202 anti-bot challenge page — and ``DDGS._search_sync`` then
+        raises ``DDGSException("No results found.")`` with no distinguishing
+        signal when every engine returns nothing.
         """
-        client = DDGS()
-        try:
-            results = client.text(query, backend="duckduckgo", max_results=max_results)
-            if not results:
-                logger.warning(LogMessage.WEB_SEARCH_PROVIDER_NO_RESULTS, max_results)
-            return results
-        except DDGSException as exc:
-            if "no results found" in str(exc).lower():
-                logger.warning(LogMessage.WEB_SEARCH_PROVIDER_NO_RESULTS, max_results)
-                return []
-            raise
+        last_error: Exception | None = None
+        clean_empty_run = False
+        for backend in self._backends:
+            try:
+                results = DDGS().text(query, backend=backend, max_results=max_results)
+            except DDGSException as exc:
+                if "no results found" in str(exc).lower():
+                    logger.warning(
+                        LogMessage.WEB_SEARCH_BACKEND_NO_RESULTS,
+                        backend,
+                        max_results,
+                    )
+                    continue
+                last_error = exc
+                logger.warning(LogMessage.WEB_SEARCH_BACKEND_FAILED, backend)
+                continue
+            except Exception as exc:  # noqa: BLE001 — per-backend isolation
+                last_error = exc
+                logger.warning(LogMessage.WEB_SEARCH_BACKEND_FAILED, backend)
+                continue
+            if results:
+                return results
+            clean_empty_run = True
+            logger.warning(
+                LogMessage.WEB_SEARCH_BACKEND_NO_RESULTS, backend, max_results
+            )
+        # At least one backend answered cleanly-but-empty: the genuine-empty
+        # contract wins over surfacing a later backend's failure.
+        if clean_empty_run or last_error is None:
+            return []
+        raise last_error
 
     @staticmethod
     def _map_entries(raw_entries: list[dict]) -> list[WebSearchPage]:

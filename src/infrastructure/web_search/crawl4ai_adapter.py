@@ -81,12 +81,15 @@ class Crawl4AIWebCrawlerAdapter(WebCrawlerPort):
         rate_limit_min_delay_seconds: float,
         rate_limit_max_delay_seconds: float,
         url_safety: UrlSafetyPort,
+        max_page_chars: int = 0,
     ) -> None:
         self._max_sessions = max_sessions_per_batch
         self._memory_threshold = memory_threshold_percent
         self._page_timeout_ms = page_timeout_ms
         self._overall_timeout = overall_timeout_seconds
         self._url_safety = url_safety
+        # 0 disables the cap: the complete-Markdown contract is preserved.
+        self._max_page_chars = max_page_chars
         self._rate_limiter = RateLimiter(
             base_delay=(
                 rate_limit_min_delay_seconds,
@@ -226,12 +229,27 @@ class Crawl4AIWebCrawlerAdapter(WebCrawlerPort):
                 else final_reason,
             )
             return
+        bounded = self._bounded_markdown(_extract_markdown(result))
         outcomes[index] = WebCrawlOutcome(
             url=requested,
             status=WebCrawlStatus.SUCCESS,
             final_url=final_url,
-            markdown=_extract_markdown(result),
+            markdown=bounded[0],
+            truncated=bounded[1],
             error=None,
+        )
+
+    def _bounded_markdown(self, markdown: str) -> tuple[str, bool]:
+        """Bound the successful outcome's Markdown at the configured cap.
+
+        A configured (non-zero) cap cuts the Markdown and flags it
+        ``truncated``: an uncapped value (0) passes the complete Markdown
+        through untouched. Returns ``(markdown, truncated)``.
+        """
+        truncated = bool(self._max_page_chars) and len(markdown) > self._max_page_chars
+        return (
+            markdown[: self._max_page_chars] if truncated else markdown,
+            truncated,
         )
 
     @staticmethod

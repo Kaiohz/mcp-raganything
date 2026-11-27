@@ -30,14 +30,17 @@ async def web_search(
     max_results: int = 5,
     explore_top_n: int = 3,
 ) -> WebSearchResponse:
-    """Search the public web with DuckDuckGo and explore the top results.
+    """Search the public web across ddgs backends and explore top results.
 
-    Performs a DuckDuckGo text search, validates every result URL against the
-    public-destination policy, and explores up to ``explore_top_n`` URL-safe
-    results concurrently with asynchronous crawling. Each explored page
-    returns its complete Markdown—no character caps, slicing or truncation is
-    applied to web output. Crawled pages are never indexed into storage and
-    never trigger automatic memory writes.
+    Tries the configured ``WEB_SEARCH_BACKENDS`` backends in order (the first
+    one returning entries wins) to ride out single-provider anti-bot
+    challenges, validates every result URL against the public-destination
+    policy, and explores up to ``explore_top_n`` URL-safe results
+    concurrently with asynchronous crawling. Each explored page returns its
+    Markdown — cut at ``WEB_SEARCH_PAGE_MAX_CHARS`` characters with the
+    ``truncated`` flag set when the configured cap applies (default:
+    complete, uncapped Markdown). Crawled pages are never indexed into
+    storage and never trigger automatic memory writes.
 
     Args:
         query: Search query (trimmed; blank queries are rejected).
@@ -46,10 +49,10 @@ async def web_search(
             for search-only responses.
 
     Returns:
-        The :class:`WebSearchResponse` contract: results in DuckDuckGo order,
+        The :class:`WebSearchResponse` contract: results in provider order,
         each with its exploration outcome (``not_explored``, ``success`` with
-        complete Markdown — possibly empty — or ``failed`` with a safe,
-        concise reason). No ``chars``/``truncated`` fields exist.
+        Markdown — possibly empty or ``truncated`` — or ``failed`` with a
+        safe, concise reason).
 
     Raises:
         ToolError: Sanitized validation, provider, timeout or crawl errors.

@@ -267,6 +267,7 @@ class McpServerValidateResponse(BaseModel):
     """Response body for the validate endpoint."""
 
     tool_count: int
+    tool_names: list[str] = Field(default_factory=list)
 
 
 def _validate_merged_spec(
@@ -463,15 +464,19 @@ async def validate_mcp_server(
     _validate_merged_spec(
         url=spec.url, openapi_url=spec.openapi_url, source_type=spec.source_type
     )
+    tool_count = 0
+    tool_names: list[str] = []
     if spec.source_type == "openapi":
         fetch_headers = {
             **spec.headers,
             **user_credential_headers(spec.auth_mode, caller),
         }
-        tool_count = await use_case.execute_openapi(
+        probe = await use_case.execute_openapi(
             openapi_url=spec.openapi_url or "",
             headers=fetch_headers,
         )
+        tool_count = probe.count
+        tool_names = probe.tool_names
     else:
         config = McpServerConfig(
             name=body.id or "validate",
@@ -486,8 +491,10 @@ async def validate_mcp_server(
             config = config.model_copy(
                 update={"headers": {**config.headers, **injected}}
             )
-        tool_count = await use_case.execute(config)
-    return McpServerValidateResponse(tool_count=tool_count)
+        probe = await use_case.execute(config)
+        tool_count = probe.count
+        tool_names = probe.tool_names
+    return McpServerValidateResponse(tool_count=tool_count, tool_names=tool_names)
 
 
 @mcp_registry_router.get("", status_code=status.HTTP_200_OK)

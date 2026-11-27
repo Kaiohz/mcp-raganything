@@ -936,13 +936,13 @@ web_search(query: str, max_results: int = 5, explore_top_n: int = 3)
 ```
 
 - `query` is required and must be non-blank; `max_results` is `1..10` and `explore_top_n` is `0..5`.
-- DuckDuckGo is selected explicitly with `ddgs==9.16.1` (`backend="duckduckgo"`). Synchronous provider work runs in a dedicated bounded executor, never on the event loop.
+- Search runs through `ddgs==9.16.1` with the ordered backend chain from `WEB_SEARCH_BACKENDS` (default `duckduckgo`): the first backend returning entries wins, a cleanly-empty backend is skipped for the next one, and a backend failure is logged sanitized and skipped too. When no backend returns entries, the response is `[]` if at least one backend ran cleanly, otherwise the last provider failure surfaces as the usual sanitized provider error. Synchronous provider work runs in a dedicated bounded executor, never on the event loop.
 - Up to `explore_top_n` safe results are crawled concurrently through streaming `AsyncWebCrawler.arun_many()` with `crawl4ai==0.9.5`.
 - Each batch uses a fresh `MemoryAdaptiveDispatcher`, a shared `RateLimiter`, process-wide concurrency limits, robots.txt checks, `CacheMode.BYPASS`, and finite page/overall timeouts.
 - Only public HTTP/HTTPS destinations are eligible. Credentials, non-global DNS results, private/loopback/link-local/metadata targets, and unsafe final redirects are rejected.
 - Crawled content is untrusted input and is never indexed into RAG or automatically saved as memory.
 
-Each result contains `title`, `url`, `snippet`, and `crawl:{status,final_url,markdown,error}`. Status is `not_explored`, `success`, or `failed`. Successful pages return the **complete Crawl4AI Markdown**; there are no character limits, slicing, `chars`, or `truncated` fields. A failed page does not discard other results.
+Each result contains `title`, `url`, `snippet`, and `crawl:{status,final_url,markdown,truncated,error}`. Status is `not_explored`, `success`, or `failed`. Successful pages return the **complete Crawl4AI Markdown** by default; with `WEB_SEARCH_PAGE_MAX_CHARS` configured (default `0` = uncapped), the Markdown is cut at the cap and `truncated` is `True`. A failed page does not discard other results.
 
 ```bash
 # MCP tools/call (streamable HTTP). The same headers work for tools/list.
@@ -1354,9 +1354,11 @@ All configuration is via environment variables, loaded through Pydantic Settings
 
 | Variable | Default | Description |
 |---|---:|---|
+| `WEB_SEARCH_BACKENDS` | `duckduckgo` | Ordered ddgs backends, comma-separated (e.g. `google,duckduckgo`); first non-empty wins — riding out single-provider anti-bot challenges |
+| `WEB_SEARCH_PAGE_MAX_CHARS` | `0` | Per-explored-page Markdown cap (characters); `0` = complete Markdown, ≥1 cuts crawled pages and sets `truncated` |
 | `WEB_SEARCH_EXECUTOR_WORKERS` | `4` | Dedicated DDGS executor workers |
 | `WEB_SEARCH_MAX_CONCURRENCY` | `4` | Process-wide active DDGS calls |
-| `WEB_SEARCH_TIMEOUT_SECONDS` | `10` | Outer DDGS timeout |
+| `WEB_SEARCH_TIMEOUT_SECONDS` | `10` | Outer DDGS timeout (whole backend fallback chain included) |
 | `CRAWL_MAX_CONCURRENT_BATCHES` | `2` | Process-wide concurrent crawl batches |
 | `CRAWL_MAX_SESSIONS_PER_BATCH` | `2` | Dispatcher page sessions per batch |
 | `CRAWL_MEMORY_THRESHOLD_PERCENT` | `80` | MemoryAdaptiveDispatcher threshold |

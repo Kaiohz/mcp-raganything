@@ -95,7 +95,14 @@ class UpdateMcpServerUseCase:
             )
             try:
                 tools = await self._tool_loader.load_tools([config])
-                to_save = updated.model_copy(update={"tool_count": len(tools)})
+                to_save = updated.model_copy(
+                    update={
+                        "tool_count": len(tools),
+                        "tool_names": [
+                            str(t.name) for t in tools if getattr(t, "name", None)
+                        ],
+                    }
+                )
             except (McpConnectionError, McpToolLoadError) as e:
                 raise McpServerUnreachableError(
                     ErrorMessage.MCP_SERVER_UNREACHABLE.format(error=e)
@@ -146,10 +153,12 @@ class UpdateMcpServerUseCase:
             # unavailable; refreshed by the next update.
             logger.warning(LogMessage.MCP_TOOL_COUNT_FAILED, updated.name, e)
             tool_count = 0
+        tool_names = await self._runner.list_tool_names(updated.name)
 
         to_save = updated.model_copy(
             update={
                 "tool_count": tool_count,
+                "tool_names": tool_names,
                 "url": mounted_url,
                 "source_type": "openapi",
                 "openapi_url": updated.openapi_url,

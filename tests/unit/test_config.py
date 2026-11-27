@@ -7,6 +7,7 @@ NOTE: The project loads .env via dotenv, so tests that need to verify
 fallback behavior must explicitly override or remove env vars.
 """
 
+import os
 from typing import Any
 from unittest.mock import patch
 
@@ -351,3 +352,56 @@ class TestDatabaseConfigStatementCacheSize:
     def test_can_set_to_custom_value(self) -> None:
         config = DatabaseConfig(POSTGRES_STATEMENT_CACHE_SIZE=50)
         assert config.POSTGRES_STATEMENT_CACHE_SIZE == 50
+
+
+class TestWebSearchConfig:
+    """Tests for the WEB_SEARCH_BACKENDS / WEB_SEARCH_PAGE_MAX_CHARS config."""
+
+    def test_backends_default_is_duckduckgo(self) -> None:
+        from config import WebSearchConfig
+
+        removed = {"WEB_SEARCH_BACKENDS", "WEB_SEARCH_PAGE_MAX_CHARS"}
+        with patch.dict(os.environ, {}):
+            for key in removed:
+                os.environ.pop(key, None)
+            config = WebSearchConfig()
+            assert config.WEB_SEARCH_BACKENDS == ["duckduckgo"]
+            assert config.WEB_SEARCH_PAGE_MAX_CHARS == 0
+
+    def test_backends_csv_value_splits_and_strips(self) -> None:
+        from config import WebSearchConfig
+
+        with patch.dict(os.environ, {"WEB_SEARCH_BACKENDS": "google, duckduckgo"}):
+            config = WebSearchConfig()
+            assert config.WEB_SEARCH_BACKENDS == ["google", "duckduckgo"]
+
+    def test_present_but_empty_backends_fall_back_to_duckduckgo(self) -> None:
+        from config import WebSearchConfig
+
+        with patch.dict(os.environ, {"WEB_SEARCH_BACKENDS": " , "}):
+            config = WebSearchConfig()
+            assert config.WEB_SEARCH_BACKENDS == ["duckduckgo"]
+
+    def test_json_style_backends_value_refused(self) -> None:
+        from config import WebSearchConfig
+
+        with (
+            patch.dict(os.environ, {"WEB_SEARCH_BACKENDS": '["google"]'}),
+            pytest.raises(ValidationError),
+        ):
+            WebSearchConfig()
+
+    def test_page_cap_accepts_zero_and_positive(self) -> None:
+        from config import WebSearchConfig
+
+        with patch.dict(os.environ, {"WEB_SEARCH_PAGE_MAX_CHARS": "30000"}):
+            assert WebSearchConfig().WEB_SEARCH_PAGE_MAX_CHARS == 30000
+
+    def test_negative_page_cap_refused(self) -> None:
+        from config import WebSearchConfig
+
+        with (
+            patch.dict(os.environ, {"WEB_SEARCH_PAGE_MAX_CHARS": "-5"}),
+            pytest.raises(ValidationError),
+        ):
+            WebSearchConfig()

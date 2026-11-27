@@ -152,12 +152,16 @@ def _build_web_search_adapter() -> DDGSSearchAdapter:
         timeout_seconds=config.WEB_SEARCH_TIMEOUT_SECONDS,
         max_concurrency=config.WEB_SEARCH_MAX_CONCURRENCY,
         executor_workers=config.WEB_SEARCH_EXECUTOR_WORKERS,
+        backends=config.WEB_SEARCH_BACKENDS,
     )
 
 
 def _build_web_crawler_adapter() -> Crawl4AIWebCrawlerAdapter:
     """Create the crawl adapter from validated settings (lazy singleton)."""
     config = CrawlConfig()  # type: ignore
+    # The page cap is a search-output bound owned by WebSearchConfig; the
+    # crawler adapter enforces it when building each successful outcome.
+    search_config = WebSearchConfig()  # type: ignore
     return Crawl4AIWebCrawlerAdapter(
         max_concurrent_batches=config.CRAWL_MAX_CONCURRENT_BATCHES,
         max_sessions_per_batch=config.CRAWL_MAX_SESSIONS_PER_BATCH,
@@ -167,6 +171,7 @@ def _build_web_crawler_adapter() -> Crawl4AIWebCrawlerAdapter:
         rate_limit_min_delay_seconds=config.CRAWL_RATE_LIMIT_MIN_DELAY_SECONDS,
         rate_limit_max_delay_seconds=config.CRAWL_RATE_LIMIT_MAX_DELAY_SECONDS,
         url_safety=url_safety_adapter,
+        max_page_chars=search_config.WEB_SEARCH_PAGE_MAX_CHARS,
     )
 
 

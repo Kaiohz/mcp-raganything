@@ -18,7 +18,12 @@ from infrastructure.web_search.ddgs_adapter import DDGSSearchAdapter
 
 
 def _adapter() -> DDGSSearchAdapter:
-    return DDGSSearchAdapter(timeout_seconds=5.0, max_concurrency=2, executor_workers=2)
+    return DDGSSearchAdapter(
+        timeout_seconds=5.0,
+        max_concurrency=2,
+        executor_workers=2,
+        backends=["duckduckgo"],
+    )
 
 
 def _fake_ddgs(monkeypatch, results=None, error: Exception | None = None):

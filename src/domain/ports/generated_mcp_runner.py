@@ -53,6 +53,23 @@ class GeneratedMcpRunnerPort(ABC):
         """
         ...
 
+    async def list_tool_names(self, name: str) -> list[str]:
+        """List the tool NAMES exposed by a mounted generated MCP server.
+
+        Default (non-abstract) implementation is empty so lightweight fakes
+        of this port keep working; the real runner overrides it. Used to
+        persist ``tool_names`` on registry entries (metadata only — never
+        raises into the create/update flow that annotates them).
+
+        Args:
+            name: The unique server name.
+
+        Returns:
+            The tool names (empty when the mount is unknown or listing fails
+            in the implementation).
+        """
+        return []
+
     @abstractmethod
     async def close(self) -> None:
         """Close all mounted servers and release their resources at shutdown."""

@@ -168,6 +168,19 @@ class FastMcpOpenApiFactory(OpenApiMcpFactory):
         tools = await mcp.list_tools()  # type: ignore[attr-defined]
         return len(tools)
 
+    async def list_tool_names(self, mcp: Any) -> list[str]:
+        """List the tool NAMES exposed by a built FastMCP server.
+
+        Same public listing API as :meth:`count_tools` (the
+        ``mcp.list_tools()`` contract survives FastMCP internals churn);
+        returns the names for the registry's ``tool_names`` metadata.
+        """
+        try:
+            tools = await mcp.list_tools()  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001 — annotating metadata must not raise
+            return []
+        return [str(tool.name) for tool in tools if getattr(tool, "name", None)]
+
 
 def _normalise_spec_version(spec: dict, spec_url: str) -> dict:
     """Return an OpenAPI 3.x document, converting Swagger 2.0 if needed.

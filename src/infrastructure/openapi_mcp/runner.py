@@ -201,6 +201,21 @@ class GeneratedMcpRunner(GeneratedMcpRunnerPort):
         tools = await mount.mcp.list_tools(run_middleware=False)
         return len(tools)
 
+    async def list_tool_names(self, name: str) -> list[str]:
+        """List the tool NAMES of a mounted generated MCP server.
+
+        Same in-process public listing as :meth:`count_tools` (middleware
+        bypassed — QA BUG-001), returning the names for the registry's
+        ``tool_names`` metadata.
+        """
+        if name not in self._mounts:
+            return []
+        try:
+            tools = await self._mounts[name].mcp.list_tools(run_middleware=False)
+        except Exception:  # noqa: BLE001 — annotating metadata must not raise
+            return []
+        return [str(tool.name) for tool in tools if getattr(tool, "name", None)]
+
     async def close(self) -> None:
         """Close all mounted servers and release their resources at shutdown."""
         # ``unmount`` pops from ``_mounts``, so iterate over a snapshot copy.
