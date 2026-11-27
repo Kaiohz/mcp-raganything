@@ -52,9 +52,16 @@ class AsyncpgApiKeyReader(ApiKeyRepositoryPort):
         FROM api_keys
         WHERE key_hash = $1 AND revoked_at IS NULL;
         """
-        async with self._pool.acquire() as conn:
+        async with (
+            self._pool.acquire() as conn,
+            conn.transaction(),
+        ):
             # Privileged auth read: bypass RLS to resolve the user identity.
-            # Done BEFORE the SELECT so the FORCE RLS policy does not hide rows.
+            # Code-review C4: ``SET LOCAL`` is transaction-LOCAL and asyncpg
+            # runs bare statements in implicit transactions — both statements
+            # therefore live in ONE explicit transaction, or the bypass would
+            # evaporate before the SELECT and the FORCE RLS policy would hide
+            # every row.
             await conn.execute("SET LOCAL row_security = off")
             row = await conn.fetchrow(sql, key_hash)
 

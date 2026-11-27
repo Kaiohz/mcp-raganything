@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import re
+from collections.abc import Callable
 from typing import Literal
 
 from application.responses.classical_query_response import (
@@ -13,7 +14,11 @@ from domain.logging.messages import LogMessage
 from domain.ports.bm25_engine import BM25EnginePort
 from domain.ports.llm_port import LLMPort
 from domain.ports.vector_store_port import SearchResult, VectorStorePort
-from infrastructure.database.rls_context import current_user_id
+from domain.services.scope import resolve_agent_scope
+from infrastructure.database.rls_context import (
+    current_agent_scope,
+    current_user_id,
+)
 from infrastructure.rag.rrf_combiner import RRFCombiner
 
 logger = logging.getLogger(__name__)
@@ -26,6 +31,11 @@ class ClassicalQueryUseCase:
     - **vector**: multi-query expansion → parallel similarity search → LLM judge scoring.
     - **hybrid**: same, but combines BM25 and vector results via Reciprocal Rank Fusion (RRF)
       before LLM judge scoring. Falls back to vector-only if BM25 is unavailable.
+
+    The effective namespace is the caller's SCOPE composed in front of the
+    client-supplied ``working_dir`` (``{user_id}/{agent_slug}/{working_dir}``,
+    scope-rag-memories REQ-006) with the ``user_id`` metadata filter kept as
+    defense-in-depth (REQ-007).
     """
 
     def __init__(
@@ -35,12 +45,45 @@ class ClassicalQueryUseCase:
         config: ClassicalRAGConfig,
         bm25_engine: BM25EnginePort | None = None,
         rrf_k: int = 60,
+        space_recorder: Callable[[str], None] | None = None,
     ) -> None:
         self.vector_store = vector_store
         self.llm = llm
         self.config = config
         self.bm25_engine = bm25_engine
         self.rrf_combiner = RRFCombiner(k=rrf_k)
+        self._space_recorder = space_recorder
+
+    def _compose_scoped_working_dir(self, working_dir: str) -> str | None:
+        """Compose the caller-scoped working_dir, or ``None`` in legacy mode.
+
+        Synchronous by design (Sonar python:S7503): the composition and the
+        scope validation behind it contain no I/O — they read in-memory
+        request state and record the use synchronously — so awaiting a
+        no-op coroutine would add protocol overhead without any async
+        benefit. The composition happens BEFORE any vector/boundary
+        operation, so an invalid ``X-Composable-Agent`` value rejects the
+        query with zero searches (REQ-002).
+
+        Args:
+            working_dir: The client-supplied working_dir.
+
+        Returns:
+            The composed working_dir with the ``working_dir/`` suffix
+            normalization preserved, or ``None`` when no authenticated user
+            is wired (legacy unscoped path).
+
+        Raises:
+            AgentScopeInvalidError: On an invalid agent-scope header value.
+        """
+        user_id = current_user_id.get()
+        if user_id is None:
+            return None
+        scope = resolve_agent_scope(user_id, current_agent_scope.get())
+        composed = scope.scoped_working_dir(working_dir)
+        if self._space_recorder is not None:
+            self._space_recorder(composed)
+        return composed
 
     @staticmethod
     def _extract_json_array(text: str) -> list[str]:
@@ -105,6 +148,10 @@ class ClassicalQueryUseCase:
         Returns:
             ClassicalQueryResponse with ranked chunks and query provenance.
         """
+        composed = self._compose_scoped_working_dir(working_dir)
+        if composed is not None:
+            working_dir = composed
+
         working_dir = working_dir if working_dir.endswith("/") else f"{working_dir}/"
 
         # Per-user RAG isolation: when the RLS contextvar is set, filter the
@@ -178,11 +225,9 @@ class ClassicalQueryUseCase:
         ]
         search_results = await asyncio.gather(*search_tasks)
 
-        all_results: dict[str, SearchResult] = {}
-        for results in search_results:
-            for r in results:
-                if r.chunk_id and r.chunk_id not in all_results:
-                    all_results[r.chunk_id] = r
+        all_results: dict[str, SearchResult] = self._dedupe_search_results(
+            search_results
+        )
 
         scored_chunks = await self._score_and_filter(
             query, all_results, relevance_threshold, enable_llm_judge
@@ -195,6 +240,34 @@ class ClassicalQueryUseCase:
             chunks=scored_chunks,
             mode="vector",
         )
+
+    @staticmethod
+    def _dedupe_search_results(
+        search_results: list[list[SearchResult]],
+    ) -> dict[str, SearchResult]:
+        """Collapse the multi-query fan-out into one entry per chunk.
+
+        The same underlying chunk surfaces once per query variation: in
+        pgvector the chunk has ONE stable id (the ``chunk_id`` dedupe), and a
+        result re-hit is additionally recognised by its
+        ``(file_path, content)`` signature — a corpus re-indexed variation
+        never duplicates a row in the response.
+        """
+        all_results: dict[str, SearchResult] = {}
+        seen_chunks: set[str] = set()
+        seen_equivalents: dict[tuple[str, str], str] = {}
+        for results in search_results:
+            for r in results:
+                if not r.chunk_id or r.chunk_id in seen_chunks:
+                    continue
+                signature = (r.file_path, r.content)
+                canonical = seen_equivalents.get(signature)
+                if canonical is not None and canonical in all_results:
+                    continue  # the same chunk surfaced by another variation
+                seen_equivalents.setdefault(signature, r.chunk_id)
+                seen_chunks.add(r.chunk_id)
+                all_results[r.chunk_id] = r
+        return all_results
 
     async def _execute_hybrid(
         self,
@@ -299,16 +372,12 @@ class ClassicalQueryUseCase:
 
     @staticmethod
     def _dedupe_vector_hits(vector_result: object) -> list[SearchResult]:
-        if isinstance(vector_result, Exception):
+        if isinstance(vector_result, Exception) or not isinstance(vector_result, list):
             logger.error(
                 LogMessage.CLASSICAL_VECTOR_SEARCH_FAILED_HYBRID, vector_result
             )
             return []
-        all_results: dict[str, SearchResult] = {}
-        for results in vector_result:  # type: ignore[union-attr]
-            for r in results:
-                if r.chunk_id and r.chunk_id not in all_results:
-                    all_results[r.chunk_id] = r
+        all_results = ClassicalQueryUseCase._dedupe_search_results(vector_result)
         return list(all_results.values())
 
     async def _score_and_filter(

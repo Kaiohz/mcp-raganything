@@ -35,3 +35,9 @@ class MemoryUpstreamError(MemoryStoreError):
     """Upstream Store File API failure, timeout or malformed response."""
 
     status_code = ErrorCode.BAD_GATEWAY
+
+
+class MemoryNotFoundError(MemoryStoreError):
+    """The addressed memory file does not exist in the caller's namespace."""
+
+    status_code = ErrorCode.NOT_FOUND

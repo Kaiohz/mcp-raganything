@@ -27,6 +27,7 @@ receives; the assertions are about what the registry transmitted.
 import socket
 import threading
 import time
+from collections.abc import Iterator
 
 import httpx
 import pytest
@@ -114,7 +115,7 @@ def _build_probe_target() -> _ProbeTarget:
 
 
 @pytest.fixture
-def mcp_probe_target() -> _ProbeTarget:
+def mcp_probe_target() -> Iterator[_ProbeTarget]:
     """Serve the REAL probe MCP server with uvicorn on a local TCP socket.
 
     Runs in its own daemon thread (an independent event loop) so the app's

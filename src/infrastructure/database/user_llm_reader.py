@@ -79,7 +79,11 @@ class AsyncpgUserLlmReader(UserLlmSettingsRepositoryPort):
         FROM user_llm_settings
         WHERE user_id = $1;
         """
-        async with self._pool.acquire() as conn:
+        async with self._pool.acquire() as conn, conn.transaction():
+            # Code-review C4: transaction-LOCAL statements must share ONE
+            # explicit transaction with the SELECT they protect (asyncpg
+            # implicit per-statement transactions otherwise reset the
+            # ``SET LOCAL`` bypass before the SELECT runs).
             await conn.execute("SET LOCAL row_security = off")
             row = await conn.fetchrow(sql, user_id)
 
@@ -118,7 +122,7 @@ class AsyncpgUserLlmReader(UserLlmSettingsRepositoryPort):
         FROM user_llm_settings
         WHERE user_id = $1;
         """
-        async with self._pool.acquire() as conn:
+        async with self._pool.acquire() as conn, conn.transaction():
             await conn.execute("SET LOCAL row_security = off")
             row = await conn.fetchrow(sql, user_id)
 

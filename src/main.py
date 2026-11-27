@@ -1,6 +1,7 @@
 """Main entry point for the MCP service."""
 
 import asyncio
+import inspect
 import logging
 import re
 from contextlib import asynccontextmanager
@@ -29,6 +30,7 @@ from application.api.mcp_memory_tools import mcp_memories
 from application.api.mcp_registry_routes import mcp_registry_router
 from application.api.mcp_transport_security import McpTransportSecurityGuard
 from application.api.mcp_web_tools import mcp_web
+from application.api.space_routes import space_router
 from application.error_handlers import (
     authentication_error_handler,
     classical_error_handler,
@@ -70,6 +72,7 @@ from domain.logging.messages import LogMessage
 from domain.services.auth.auth_service import AuthService
 from infrastructure.database.api_key_reader import AsyncpgApiKeyReader
 from infrastructure.database.mcp_registry_store import McpRegistryStore
+from infrastructure.database.rag_space_repository import AsyncpgRagSpaceRepository
 from infrastructure.database.user_llm_reader import AsyncpgUserLlmReader
 from infrastructure.logging import RequestIdMiddleware, configure_logging
 from infrastructure.openapi_mcp.rehydration import rehydrate_openapi_servers
@@ -145,47 +148,65 @@ rest_security = ComposableAgentsSecurity(master_key=app_config.API_KEY)
 _mcp_pool: asyncpg.Pool | None = None
 
 
+async def _close_shutdown_adapter(adapter: object, failure_log: LogMessage) -> None:
+    """Close ONE lazily-built process-wide adapter (idempotent, never raises).
+
+    The adapter may close synchronously (the DDGS search executor) or
+    asynchronously; a failure is logged and swallowed — shutdown must never
+    mask the resources still to be released.
+    """
+    close = getattr(adapter, "close", None)
+    if close is None:
+        return
+    try:
+        result = close()
+        if inspect.isawaitable(result):
+            await result
+    except Exception:
+        logger.exception(failure_log)
+
+
+def _shutdown_adapters() -> list[tuple[object, LogMessage]]:
+    """Collect every process-wide adapter to close at shutdown (with the
+    centralized failure message)."""
+    import dependencies as _deps
+
+    return [
+        (classical_bm25_adapter, LogMessage.APP_BM25_CLOSE_FAILED),
+        (classical_vector_store, LogMessage.APP_CLASSICAL_VS_CLOSE_FAILED),
+        # The web/memory adapters are lazy singletons; access them through the
+        # dependencies module at call time so shutdown sees the built
+        # instances.
+        (_deps.web_crawler_adapter, LogMessage.CRAWLER_CLOSE_FAILED),
+        (_deps.web_search_adapter, LogMessage.WEB_SEARCH_EXECUTOR_CLOSE_FAILED),
+        (_deps.memory_store_adapter, LogMessage.MEMORY_STORE_CLOSE_FAILED),
+        # Code-review 🟡-3: the drop-capable vector adapter builds its own
+        # SQLAlchemy PGEngine on first cascade drop — closed here so no pool
+        # outlives the process.
+        (_deps.vector_table_manager, LogMessage.APP_CLASSICAL_VS_CLOSE_FAILED),
+    ]
+
+
 @asynccontextmanager
 async def db_lifespan(_app: FastAPI):
     """Close process-wide resources and connection pools on shutdown.
 
     Closes the shared web crawler (if it was lazily created), the dedicated
-    DDGS search executor and any dangling memory-store HTTP client, in
-    addition to the classical RAG adapters. Every close is idempotent so
-    repeated shutdowns are harmless.
+    DDGS search executor, any dangling memory-store HTTP client and the
+    drop-capable vector adapter, in addition to the classical RAG adapters.
+    Every close is idempotent so repeated shutdowns are harmless. The
+    background space-write tasks are drained FIRST (code-review iteration-4
+    🟡-3): they must not hit the closing asyncpg pool.
     """
     yield
 
     logger.info(LogMessage.APP_SHUTDOWN_INITIATED)
-    if classical_bm25_adapter is not None:
-        try:
-            await classical_bm25_adapter.close()
-        except Exception:
-            logger.exception(LogMessage.APP_BM25_CLOSE_FAILED)
-    if classical_vector_store is not None:
-        try:
-            await classical_vector_store.close()
-        except Exception:
-            logger.exception(LogMessage.APP_CLASSICAL_VS_CLOSE_FAILED)
-    # The web/memory adapters are lazy singletons; access them through the
-    # dependencies module at call time so shutdown sees the built instances.
     import dependencies as _deps
 
-    if _deps.web_crawler_adapter is not None:
-        try:
-            await _deps.web_crawler_adapter.close()
-        except Exception:
-            logger.exception(LogMessage.CRAWLER_CLOSE_FAILED)
-    if _deps.web_search_adapter is not None:
-        try:
-            _deps.web_search_adapter.close()
-        except Exception:
-            logger.exception(LogMessage.WEB_SEARCH_EXECUTOR_CLOSE_FAILED)
-    if _deps.memory_store_adapter is not None:
-        try:
-            await _deps.memory_store_adapter.close()
-        except Exception:
-            logger.exception(LogMessage.MEMORY_STORE_CLOSE_FAILED)
+    await _deps.drain_space_touch_tasks()
+    for adapter, failure_log in _shutdown_adapters():
+        if adapter is not None:
+            await _close_shutdown_adapter(adapter, failure_log)
     logger.info(LogMessage.APP_SHUTDOWN_COMPLETE)
 
 
@@ -273,6 +294,10 @@ async def _initialize_mcp_registry(
             )
             store = McpRegistryStore(pool=_mcp_pool, cipher=cipher)
             _deps.mcp_registry_store = store
+            # RLS-protected rag_spaces repository (scope-rag-memories REQ-009):
+            # wired on the SAME shared pool; unwired when the registry (and
+            # therefore the pool) is disabled.
+            _deps.rag_space_repository = AsyncpgRagSpaceRepository(pool=_mcp_pool)
             runner = getattr(app.state, "generated_mcp_runner", None)
             if runner is not None:
                 await rehydrate_openapi_servers(
@@ -488,6 +513,9 @@ app.include_router(classical_query_router, prefix=REST_PATH, dependencies=_auth_
 # mcp_registry_router already carries the full /api/v1/mcp/servers prefix, so
 # it is included without an additional prefix (only the auth dependency).
 app.include_router(mcp_registry_router, dependencies=_auth_dep)
+# RAG spaces (scope-rag-memories REQ-010): idempotent create, caller-scoped
+# list, cascade delete — all authenticated through verify_credentials.
+app.include_router(space_router, prefix=REST_PATH, dependencies=_auth_dep)
 
 # --- Public OAuth2 discovery (REQ-002-equivalent) -----------------------------
 #

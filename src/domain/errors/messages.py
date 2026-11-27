@@ -133,3 +133,21 @@ class ErrorMessage(StrEnum):
     MEMORY_STORE_INVALID_RESPONSE = "The memory service returned an invalid response."
     MEMORY_STORE_PATH_ESCAPE = "Memory storage path must stay inside /memories/."
     MEMORY_SAVE_FAILED = "Saving the memory failed. Try again later."
+    MEMORY_OPERATION_FAILED = "The memory operation failed. Try again later."
+    MEMORY_NOT_FOUND = "Memory not found: {name}"
+
+    # --- Caller scope / RAG spaces ---
+    AGENT_SCOPE_INVALID = (
+        "Invalid agent scope: the '{header}' header value {value!r} does not "
+        "match the required pattern ^[a-z0-9][a-z0-9-]{{0,99}}$"
+    )
+    SPACE_NOT_FOUND = "RAG space not found for agent '{agent_slug}'."
+    SPACE_AGENT_SLUG_RESERVED = (
+        "The agent slug '{agent_slug}' is reserved and cannot be stored as a "
+        "RAG space: the personal scope names the caller's own tree, which is "
+        "never provisioned as a space."
+    )
+    SPACE_LIMIT_EXCEEDED = (
+        "Too many RAG spaces for this user: the maximum of {limit} live "
+        "spaces has been reached. Delete a space before creating another."
+    )

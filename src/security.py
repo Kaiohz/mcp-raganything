@@ -44,10 +44,12 @@ from fastmcp.exceptions import ToolError
 from fastmcp.server.dependencies import get_http_headers
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 
+from domain.constants import AGENT_HEADER
 from domain.entities.auth.auth_context import AuthContext
 from domain.errors.messages import ErrorMessage
 from domain.errors.security import AuthenticationError, InvalidApiKeyError
 from infrastructure.database.rls_context import (
+    current_agent_scope,
     current_auth_method,
     current_credential,
     current_user_id,
@@ -174,6 +176,21 @@ class ComposableAgentsSecurity:
         unset or asyncpg pool not available) and avoids a RuntimeError at
         request time.
 
+        **SECURITY NOTE (security review FINDING-2, deployment control):** the
+        legacy fallback sets NO user context, so the per-user/per-agent scope
+        isolation of the file/RAG surfaces is conditional on dual-auth being
+        WIRED. This is a deployment-controlled escape hatch, NOT a production
+        configuration: production MUST wire the ``AuthService`` (the lifespan
+        does it before uvicorn serves) and verify ``LOGTO_URL`` + the asyncpg
+        pool are available in the configmap. A deployment that boots WITHOUT
+        dual auth silently runs the UNSCOPED legacy surface — recommended
+        future hardening: fail-closed at the router level (refuse unscoped
+        file ops when dual-auth is not wired, behind an explicit env flag)
+        instead of the silent legacy fallback. Verified: while dual-auth IS
+        wired, an authenticated request always receives a non-empty
+        ``current_user_id`` and every file operation composes its scope
+        prefix (pinned by the behavioral suite).
+
         Args:
             request: The incoming FastAPI request (headers are read from it).
 
@@ -192,6 +209,12 @@ class ComposableAgentsSecurity:
 
         authorization = request.headers.get("authorization")
         api_key = request.headers.get("x-api-key")
+        # The agent scope travels in X-Composable-Agent (scope-rag-memories
+        # REQ-001); the RAW value is captured here and validated lazily at the
+        # first scoped storage operation (an invalid value is then rejected
+        # 422 with zero storage operations, REQ-002). user_id is NEVER derived
+        # from it — only this slug is.
+        agent_header = request.headers.get(AGENT_HEADER)
 
         ctx = await self._auth_service.authenticate(
             authorization=authorization,
@@ -204,6 +227,7 @@ class ComposableAgentsSecurity:
         current_user_id.set(ctx.user_id)
         current_credential.set(ctx.raw_credential)
         current_auth_method.set(ctx.method)
+        current_agent_scope.set(agent_header)
         return ctx
 
 
@@ -259,10 +283,14 @@ class McpApiKeyMiddleware(Middleware):
         headers: dict[str, str] = get_http_headers(include_all=True) or {}
         authorization = headers.get("authorization")
         api_key = headers.get("x-api-key")
+        agent_header = headers.get(AGENT_HEADER)
 
         # NOTE: ``get_http_headers()`` (default) strips ``authorization``; the
         # dual-auth middleware must see the raw ``Authorization: Bearer`` and
-        # ``X-API-Key`` headers, hence ``include_all=True``.
+        # ``X-API-Key`` headers, hence ``include_all=True``. The agent slug
+        # header (lowercase key, scope-rag-memories REQ-001) is forwarded to
+        # the shared seam the same way so whichever layer authenticates the
+        # request records the caller scope identically.
 
         # 1. The guard verified this exact credential → skip the duplicate
         #    work (M-2: one authentication per HTTP request). The cache is
@@ -274,7 +302,7 @@ class McpApiKeyMiddleware(Middleware):
 
         # 2+3. Dual-auth path (JWT + per-user API key), shared with the ASGI
         #       HTTP guard so both layers behave identically (REQ-017).
-        ctx = await self.authenticate_headers(authorization, api_key)
+        ctx = await self.authenticate_headers(authorization, api_key, agent_header)
         if ctx is not None:
             return
         if self._auth_service is not None:
@@ -314,7 +342,10 @@ class McpApiKeyMiddleware(Middleware):
             raise ToolError("Invalid or missing API key")
 
     async def authenticate_headers(
-        self, authorization: str | None, api_key: str | None
+        self,
+        authorization: str | None,
+        api_key: str | None,
+        agent_header: str | None = None,
     ) -> AuthContext | None:
         """Authenticate raw request headers at the HTTP level (REQ-017).
 
@@ -328,11 +359,20 @@ class McpApiKeyMiddleware(Middleware):
         it instead of re-deriving it (one DB lookup / one JWT verification
         per HTTP request).
 
+        The RAW ``X-Composable-Agent`` value is recorded on the
+        ``current_agent_scope`` contextvar (scope-rag-memories REQ-001) so
+        the tool layer resolves the caller scope; an invalid value is NOT
+        enforced here — it is rejected (ToolError/422, no storage operation)
+        at the first scoped use so an MCP discovery rejection never turns a
+        scope typo into an HTTP 401 credential challenge (REQ-002).
+
         Args:
             authorization: Raw ``Authorization`` header value (``None`` if
                 absent); only ``Bearer`` (JWT) is recognised — API keys
                 travel only in ``X-API-Key``.
             api_key: Raw ``X-API-Key`` header value (``None`` if absent).
+            agent_header: Raw ``X-Composable-Agent`` header value (``None``
+                if absent → the ``personal`` scope).
 
         Returns:
             The authenticated :class:`AuthContext` with the RLS contextvars
@@ -363,6 +403,7 @@ class McpApiKeyMiddleware(Middleware):
         current_user_id.set(ctx.user_id)
         current_credential.set(ctx.raw_credential)
         current_auth_method.set(ctx.method)
+        current_agent_scope.set(agent_header)
         _cached_auth_context.set(ctx)
         return ctx
 

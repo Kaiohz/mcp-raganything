@@ -12,6 +12,14 @@ audit logging without re-reading the request headers.
 ``current_auth_method`` records which authentication method produced the
 context (``"jwt"`` or ``"api_key"``).
 
+``current_agent_scope`` holds the RAW ``X-Composable-Agent`` header value of
+the request (scope-rag-memories spec REQ-001). It is set by the same
+authentication seams after a successful dual-auth and validated lazily by the
+caller-scope resolution (:mod:`domain.services.scope`) at the first scoped
+storage operation — an invalid value is rejected (422/ToolError) without any
+storage operation (REQ-002). ``None`` means "no header" (the ``personal``
+scope).
+
 ``bypass_rls`` is set to ``True`` by the ``system_rls_context`` async context
 manager so that background jobs (cron, migrations) and privileged auth reads
 (e.g. the ``AsyncpgApiKeyReader`` reading the FORCE RLS-protected ``api_keys``
@@ -33,6 +41,11 @@ current_credential: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 # Authentication method that produced the current context ("jwt" or "api_key").
 current_auth_method: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "current_auth_method", default=None
+)
+# RAW X-Composable-Agent header value (None = absent → the "personal" scope).
+# Validated lazily at the first scoped use (REQ-001/REQ-002).
+current_agent_scope: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "current_agent_scope", default=None
 )
 # When True, the RLS helper emits ``SET LOCAL row_security = off`` so that
 # system/migration queries and privileged auth reads can read across all users.
@@ -67,9 +80,17 @@ async def system_rls_context() -> AsyncIterator[None]:
 async def set_rls_context(conn: Any, user_id: str | None) -> None:
     """Set the PostgreSQL RLS GUC ``app.user_id`` on a raw asyncpg connection.
 
-    Called by ``McpRegistryStore`` (and any other asyncpg usage) right after
-    acquiring a connection so that Row-Level Security policies on
-    ``mcp_servers`` filter rows per authenticated user.
+    Called by ``McpRegistryStore`` and ``AsyncpgRagSpaceRepository`` (and any
+    other asyncpg usage) right after acquiring a connection so that Row-Level
+    Security policies filter rows per authenticated user.
+
+    **GUC lifetime (code-review C4):** the setting is transaction-LOCAL
+    (``is_local=true``). asyncpg runs each bare statement in an implicit
+    single-statement transaction, so callers MUST emit the statement that
+    needs the policy INSIDE the same explicit ``conn.transaction()`` block —
+    otherwise the setting evaporates with the implicit transaction before the
+    next statement is executed and the policy silently degenerates to
+    ``user_id = NULL``. Every repository in this service follows that pattern.
 
     Behaviour:
     - When ``user_id`` is set and ``bypass_rls`` is False → emit
@@ -80,7 +101,8 @@ async def set_rls_context(conn: Any, user_id: str | None) -> None:
     - When ``user_id`` is None → no-op (legacy/tests path; RLS not engaged).
 
     Args:
-        conn: A raw asyncpg connection (already acquired from the pool).
+        conn: A raw asyncpg connection (already acquired from the pool, and
+            already inside the transaction the RLS statement will run in).
         user_id: The authenticated user_id (from the RLS contextvar). None
             disables the GUC emission.
     """

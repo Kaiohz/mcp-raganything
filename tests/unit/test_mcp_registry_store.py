@@ -62,7 +62,7 @@ def _row(
     tool_count: int = 3,
     source_type: str = "external",
     openapi_url: str | None = None,
-    auth_mode: str = "headers",
+    auth_mode: str | None = "headers",
 ) -> dict:
     return {
         "name": name,
@@ -101,6 +101,19 @@ def mock_cipher() -> AsyncMock:
     return cipher
 
 
+def _mock_transaction_cm(conn: AsyncMock) -> None:
+    """Attach a real async context manager to ``conn.transaction``.
+
+    The repositories run the RLS GUC and their statement inside ONE explicit
+    asyncpg transaction (the GUC is transaction-LOCAL — code-review C4); the
+    mock connection must therefore mirror the production seam.
+    """
+    transaction_cm = AsyncMock()
+    transaction_cm.__aenter__.return_value = None
+    transaction_cm.__aexit__.return_value = None
+    conn.transaction = MagicMock(return_value=transaction_cm)
+
+
 @pytest.fixture
 def mock_conn() -> AsyncMock:
     """A mock asyncpg.Connection."""
@@ -109,6 +122,7 @@ def mock_conn() -> AsyncMock:
     conn.fetchrow = AsyncMock(return_value=None)
     conn.fetch = AsyncMock(return_value=[])
     conn.execute = AsyncMock(return_value="OK")
+    _mock_transaction_cm(conn)
     return conn
 
 

@@ -35,10 +35,14 @@ from dependencies import (
     get_list_files_use_case,
     get_list_folders_use_case,
     get_read_file_use_case,
+    get_request_agent_scope,
     get_upload_file_use_case,
     minio_adapter,
     minio_config,
+    track_space_usage,
 )
+from domain.entities.agent_scope import AgentScope
+from domain.errors.base import DomainError
 from domain.errors.storage import StorageNotFoundError
 from domain.logging.messages import LogMessage
 from infrastructure.database.rls_context import current_user_id
@@ -204,20 +208,69 @@ def _validate_prefix(prefix: str) -> str:
     return normalized
 
 
+def _scoped_prefix(prefix: str) -> str:
+    """Compose the storage prefix under the caller's scope (legacy fallback).
+
+    The caller-scope composition (scope-rag-memories REQ-003) applies ONLY to
+    an authenticated context: with no user id the legacy unscoped behaviour
+    is preserved. An invalid ``X-Composable-Agent`` value is converted to a
+    sanitized ``ToolError`` BEFORE any storage operation (REQ-002).
+
+    **SECURITY NOTE (security review FINDING-2, deployment control):** the
+    unscoped legacy path is reachable ONLY while dual-auth is NOT wired (the
+    FastMCP middleware fails closed without a wired ``AuthService``); see
+    ``security.verify_credentials`` for the deployment note and the
+    recommended fail-closed hardening.
+
+    Args:
+        prefix: The validated client-relative prefix.
+
+    Returns:
+        The scoped prefix, or the unchanged input in the legacy path.
+
+    Raises:
+        ToolError: On an invalid agent-scope header value.
+    """
+    try:
+        scope: AgentScope = get_request_agent_scope()
+    except DomainError as error:
+        raise ToolError(error.detail) from None
+    if not scope.user_id:
+        return prefix
+    return scope.scoped_prefix(prefix)
+
+
+def _scoped_object_path(object_path: str) -> str:
+    """Compose a full object key under the caller's scope (see above)."""
+    try:
+        scope: AgentScope = get_request_agent_scope()
+    except DomainError as error:
+        raise ToolError(error.detail) from None
+    if not scope.user_id:
+        return object_path
+    return scope.scoped_object_path(object_path)
+
+
 @mcp_files.tool()
 async def list_files(
     prefix: str = "", recursive: bool = True
 ) -> list[FileInfoResponse]:
-    """List files in MinIO storage under a given prefix.
+    """List files in storage under the caller's scoped prefix.
+
+    The client-supplied ``prefix`` is relative to the caller's scope — the
+    tool composes ``<user_id>/<agent_slug>/`` in front of it, so a listing
+    never spans another user's or another agent's objects.
 
     Args:
-        prefix: MinIO prefix/path to filter files by (e.g. 'documents/')
+        prefix: Storage prefix/path relative to the caller's scope.
         recursive: Whether to list files in subdirectories (default True)
 
     Returns:
-        List of file objects with object_name, size, and last_modified
+        List of file objects with the FULL object_name, size, and
+        last_modified
     """
-    prefix = _validate_prefix(prefix)
+    prefix = _scoped_prefix(_validate_prefix(prefix))
+    track_space_usage()
     use_case = get_list_files_use_case()
     files = await use_case.execute(prefix=prefix, recursive=recursive)
     return [FileInfoResponse(**asdict(f)) for f in files]
@@ -225,35 +278,50 @@ async def list_files(
 
 @mcp_files.tool()
 async def list_folders(prefix: str = "") -> list[str]:
-    """List folders in MinIO storage under a given prefix.
+    """List folders in storage under the caller's scoped prefix.
+
+    The returned folder names are relative to the caller's scope (the full
+    bucket keys never leak outside the scope).
 
     Args:
-        prefix: MinIO prefix/path to list folders under (e.g. 'documents/')
+        prefix: Storage prefix/path relative to the caller's scope.
 
     Returns:
-        List of folder prefix strings (e.g. ['docs/', 'photos/'])
+        List of folder prefix strings within the caller's scope (e.g.
+        ['docs/', 'photos/'])
     """
-    prefix = _validate_prefix(prefix)
+    prefix = _scoped_prefix(_validate_prefix(prefix))
+    track_space_usage()
     use_case = get_list_folders_use_case()
-    return await use_case.execute(prefix=prefix)
+    folders = await use_case.execute(prefix=prefix)
+    try:
+        scope: AgentScope = get_request_agent_scope()
+    except DomainError as error:
+        raise ToolError(error.detail) from None
+    if scope.user_id:
+        return scope.relativize_folders(folders)
+    return folders
 
 
 @mcp_files.tool()
 async def read_file(file_path: str) -> FileContentResponse:
-    """Read and extract text content from a file stored in MinIO.
+    """Read and extract text content from one file in the caller's scope.
 
-    Supports 91 file formats including PDF, Office documents, images, HTML, etc.
-    Uses Kreuzberg for document intelligence extraction.
+    Supports 91 file formats including PDF, Office documents, images, HTML,
+    etc. Uses Kreuzberg for document intelligence extraction.
 
     Args:
-        file_path: Path to the file in MinIO bucket (e.g. 'documents/report.pdf')
+        file_path: Path to the file, relative to the caller's scope (e.g.
+            'documents/report.pdf')
 
     Returns:
         Extracted text content with metadata and any detected tables
     """
+    scoped_path = _scoped_object_path(file_path)
+    track_space_usage()
     use_case = get_read_file_use_case()
     try:
-        result = await use_case.execute(file_path=file_path)
+        result = await use_case.execute(file_path=scoped_path)
     except StorageNotFoundError:
         raise ToolError(f"File not found: {file_path}") from None
     except Exception:

@@ -38,6 +38,9 @@ class LogMessage(StrEnum):
     # --- Delete cascade (MinIO → pgvector) ---
     DELETE_FILE_STARTED = "Delete file started: bucket=%s object=%s working_dir=%s"
     DELETE_FILE_MINIO_DONE = "MinIO object deleted: bucket=%s object=%s"
+    DELETE_FILE_WORKING_DIR_FALLBACK = (
+        "working_dir not provided for delete_file, falling back to %s"
+    )
     DELETE_FILE_VECTORS_DONE = (
         "Vectors deleted for file: working_dir=%s file_path=%s count=%d"
     )
@@ -207,8 +210,8 @@ class LogMessage(StrEnum):
     )
     MCP_PUBLIC_BASE_URL_NOT_HTTPS = (
         "MCP discovery documents advertise a non-https public origin: MCP_PUBLIC_BASE_URL is an "
-        "http:// value — public MCP clients reach the resource over TLS; set the https:// public "
-        "origin, e.g. https://raganything.soludev.tech (a SCHEME-LESS value already refuses "
+        "'http'-scheme value — public MCP clients reach the resource over TLS; set the 'https' "
+        "public origin, e.g. https://raganything.soludev.tech (a SCHEME-LESS value already refuses "
         "startup). The configured value is never interpolated here on purpose: "
         "an operator may embed credentials in the URL."
     )
@@ -292,3 +295,18 @@ class LogMessage(StrEnum):
     MEMORY_STORE_CLOSE_FAILED = "Memory store HTTP client close failed"
     MEMORY_IDENTITY_MISSING = "Memory save rejected: no user identity or credential"
     MEMORY_SAVE_UNEXPECTED = "Unexpected memory save failure"
+    MEMORY_LIST_UNEXPECTED = "Unexpected memory list failure"
+    MEMORY_READ_UNEXPECTED = "Unexpected memory read failure"
+    MEMORY_DELETE_UNEXPECTED = "Unexpected memory delete failure"
+
+    # --- Caller scope / RAG spaces (scope-rag-memories spec) ---
+    SCOPE_RESOLVED = "Caller scope resolved: user_id=%s agent_slug=%s"
+    SPACE_PROVISIONING_FAILED = (
+        "RAG space record write failed (best-effort, request not blocked): "
+        "agent_slug=%s error=%s"
+    )
+    SPACE_CREATED = "RAG space created: user_id=%s agent_slug=%s working_dir=%s"
+    SPACE_DELETED = (
+        "RAG space deleted (cascade): user_id=%s agent_slug=%s tracked_tables=%d"
+    )
+    SPACE_TABLE_DROPPED = "RAG space vector table dropped: working_dir=%s"

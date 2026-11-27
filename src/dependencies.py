@@ -13,8 +13,10 @@ is None (legacy/tests, no auth wired), the factories fall back to the
 existing tests keep passing.
 """
 
+import asyncio
 import logging
 import os
+import time
 
 from pydantic import SecretStr
 
@@ -27,13 +29,20 @@ from application.use_cases.classical_index_folder_use_case import (
 from application.use_cases.classical_query_use_case import ClassicalQueryUseCase
 from application.use_cases.create_folder_use_case import CreateFolderUseCase
 from application.use_cases.create_mcp_server import CreateMcpServerUseCase
+from application.use_cases.create_rag_space import CreateRagSpaceUseCase
 from application.use_cases.delete_file_use_case import DeleteFileUseCase
 from application.use_cases.delete_folder_use_case import DeleteFolderUseCase
 from application.use_cases.delete_mcp_server import DeleteMcpServerUseCase
+from application.use_cases.delete_memory_use_case import DeleteMemoryUseCase
+from application.use_cases.delete_rag_space import DeleteRagSpaceUseCase
+from application.use_cases.ensure_rag_space import EnsureRagSpaceUseCase
 from application.use_cases.get_mcp_server import GetMcpServerUseCase
+from application.use_cases.get_memory_use_case import GetMemoryUseCase
 from application.use_cases.list_files_use_case import ListFilesUseCase
 from application.use_cases.list_folders_use_case import ListFoldersUseCase
 from application.use_cases.list_mcp_servers import ListMcpServersUseCase
+from application.use_cases.list_memories_use_case import ListMemoriesUseCase
+from application.use_cases.list_rag_spaces import ListRagSpacesUseCase
 from application.use_cases.liveness_check_use_case import LivenessCheckUseCase
 from application.use_cases.read_file_use_case import ReadFileUseCase
 from application.use_cases.save_memory_use_case import SaveMemoryUseCase
@@ -52,11 +61,15 @@ from config import (
     MinioConfig,
     WebSearchConfig,
 )
+from domain.constants import PERSONAL_AGENT_SLUG
+from domain.entities.agent_scope import AgentScope
 from domain.entities.auth.auth_context import AuthContext
 from domain.entities.memory import MemoryCredential
+from domain.errors.base import DomainError
 from domain.errors.config import DependencyNotInitializedError
 from domain.errors.llm import LlmNotConfiguredError
 from domain.errors.messages import ErrorMessage
+from domain.logging.messages import LogMessage
 from domain.ports.auth.api_key_repository import ApiKeyRepositoryPort
 from domain.ports.auth.jwt_service import JwtServicePort
 from domain.ports.bm25_engine import BM25EnginePort
@@ -65,12 +78,16 @@ from domain.ports.llm_port import LLMPort
 from domain.ports.mcp_server_registry_store import McpServerRegistryStore
 from domain.ports.mcp_tool_loader import McpToolLoader
 from domain.ports.openapi_mcp_factory import OpenApiMcpFactory
+from domain.ports.rag_space_repository import RagSpaceRepository
 from domain.ports.user_llm_settings_repository import UserLlmSettingsRepositoryPort
 from domain.ports.vector_store_port import VectorStorePort
+from domain.ports.vector_table_manager import VectorTableManagerPort
 from domain.services.auth.auth_service import AuthService
 from domain.services.llm.credential_resolver import UserLlmCredentialResolver
+from domain.services.scope import resolve_agent_scope
 from infrastructure.database.asyncpg_health_adapter import AsyncpgHealthAdapter
 from infrastructure.database.rls_context import (
+    current_agent_scope,
     current_auth_method,
     current_credential,
     current_user_id,
@@ -242,6 +259,296 @@ def get_request_auth_context() -> AuthContext | None:
 def get_save_memory_use_case() -> SaveMemoryUseCase:
     """Return the save-memory use case (MemoryStorePort wired)."""
     return SaveMemoryUseCase(store=get_memory_store_adapter())
+
+
+def get_list_memories_use_case() -> ListMemoriesUseCase:
+    """Return the list-memories use case (MemoryStorePort wired)."""
+    return ListMemoriesUseCase(store=get_memory_store_adapter())
+
+
+def get_get_memory_use_case() -> GetMemoryUseCase:
+    """Return the get-memory use case (MemoryStorePort wired)."""
+    return GetMemoryUseCase(store=get_memory_store_adapter())
+
+
+def get_delete_memory_use_case() -> DeleteMemoryUseCase:
+    """Return the delete-memory use case (MemoryStorePort wired)."""
+    return DeleteMemoryUseCase(store=get_memory_store_adapter())
+
+
+# --- Caller scope (user × agent) + RAG spaces (scope-rag-memories) ------------
+#
+# The RAW ``X-Composable-Agent`` header value travels on the
+# ``current_agent_scope`` RLS contextvar (set by ``verify_credentials`` / the
+# MCP guard); the scope resolution below validates it at the FIRST scoped
+# storage operation (REQ-002) and composes every key/namespace/memory path
+# (REQ-003/006/012). The space REPOSITORY is wired lazily by ``main.lifespan``
+# (it needs the asyncpg pool).
+
+
+rag_space_repository: RagSpaceRepository | None = None
+
+
+def get_request_agent_scope() -> AgentScope:
+    """Resolve the request's caller scope (REQ-001) and validate the slug.
+
+    Reads ``current_user_id`` and the RAW ``current_agent_scope`` contextvar;
+    the user id is NEVER derived from a client-supplied header or parameter
+    (REQ-002) — the slug header only contributes ``agent_slug``.
+
+    Returns:
+        The :class:`AgentScope` (empty ``user_id`` in the legacy
+        unauthenticated path; ``personal`` when no header is present).
+
+    Raises:
+        AgentScopeInvalidError: When the raw header value is invalid
+            (mapped to 422 on REST / ``ToolError`` on MCP — before any
+            storage operation).
+    """
+    return resolve_agent_scope(current_user_id.get(), current_agent_scope.get())
+
+
+# --- Background space-touch state (declared BEFORE its users, code-review
+# --- 🟢 iteration-4: module-level names resolve at call time, but keeping the
+# --- mutable tracking state next to the functions that mutate it keeps the
+# --- coalescing design auditable in one place).
+_space_touch_inflight: set[tuple[str, str]] = set()
+_space_touch_tasks: set[asyncio.Task[None]] = set()
+_seen_space_working_dirs: set[tuple[str, str, str]] = set()
+#: Refresh/seen-touches are throttled to at most ONE scheduled write per space
+#: per cooldown window (perf NFR: the ``last_used_at`` update is COALESCED).
+_SPACE_TOUCH_COOLDOWN_SECONDS = 60.0
+_last_space_touch: dict[tuple[str, str], float] = {}
+
+_SPACE_TOUCH_DRAIN_TIMEOUT_SECONDS = 5.0
+
+
+def _request_scope_for_tracking() -> "AgentScope | None":
+    """The scope to book-keep, or ``None`` when tracking must be skipped.
+
+    Tracking is bookkeeping and can never break a request: an unresolvable
+    scope (already rejected 422/ToolError by the operation itself) and every
+    non-bookkeeping scope (no authenticated user, ``personal``) yield ``None``.
+    """
+    try:
+        scope = get_request_agent_scope()
+    except DomainError:
+        return None
+    if not scope.user_id or scope.agent_slug == PERSONAL_AGENT_SLUG:
+        return None
+    return scope
+
+
+def _coalesce_space_touch(key: tuple[str, str], working_dir: str | None) -> bool:
+    """Whether THIS touch must schedule a record write (or is absorbed).
+
+    A NEW (never-seen) ``working_dir`` is NEVER absorbed — REQ-008 tracking
+    must be lossless, so its write is ALWAYS scheduled, EVEN while another
+    write for the same space is in flight (the UPSERT merges the directory
+    atomically and idempotently; an overlapping refresh write is harmless).
+    This is the code-review C6 fix: the predicate is matched to its docstring.
+
+    An already-seen ``working_dir`` (and every pure refresh) is coalesced:
+    absorbed behind the in-flight write, otherwise throttled to at most ONE
+    scheduled write per space per ``_SPACE_TOUCH_COOLDOWN_SECONDS`` window.
+    """
+    if working_dir is not None:
+        marker = key + (working_dir,)
+        is_new_working_dir = marker not in _seen_space_working_dirs
+        _seen_space_working_dirs.add(marker)
+        if is_new_working_dir:
+            # REQ-008: the tracking write for a NEW namespace is never
+            # coalesced away — the cascade delete must be able to drop it.
+            _space_touch_inflight.add(key)
+            return True
+
+    if key in _space_touch_inflight:
+        return False
+    now = time.monotonic()
+    if now - _last_space_touch.get(key, 0.0) < _SPACE_TOUCH_COOLDOWN_SECONDS:
+        return False
+    _last_space_touch[key] = now
+    _space_touch_inflight.add(key)
+    return True
+
+
+def track_space_usage(working_dir: str | None = None) -> None:
+    """Schedule a best-effort, COALESCED space write (REQ-011 + perf NFR).
+
+    Synchronous by design (Sonar python:S7503): the function is a scheduler
+    — it only resolves the in-memory scope state and hands a background task
+    to the event loop, zero I/O on the request's critical path — so awaiting
+    a no-op coroutine would add protocol overhead without any async benefit.
+    The actual record write happens off-request in
+    :func:`_execute_space_touch`, mirroring the "no additional query on
+    file/RAG hot paths; the lazy space-record write is fire-and-forget with
+    the ``last_used_at`` update coalesced or best-effort" non-functional
+    requirement. A failed record write never blocks nor breaks the request.
+
+    No repository wired (dev/test) → no-op. No authenticated user, or the
+    ``personal`` scope → no-op (the personal tree carries no space record).
+    """
+    repository = rag_space_repository
+    if repository is None:
+        return
+    scope = _request_scope_for_tracking()
+    if scope is None:
+        return
+    key = (scope.user_id, scope.agent_slug)
+    if not _coalesce_space_touch(key, working_dir):
+        return
+    task = asyncio.create_task(_execute_space_touch(repository, key, working_dir))
+    _space_touch_tasks.add(task)
+    task.add_done_callback(_space_touch_tasks.discard)
+
+
+async def _execute_space_touch(
+    repository: RagSpaceRepository,
+    key: tuple[str, str],
+    working_dir: str | None,
+) -> None:
+    """Run one background space write for ``(user_id, agent_slug)``.
+
+    Best-effort by contract: the :class:`EnsureRagSpaceUseCase` already
+    swallows record-write failures with a warning (REQ-011); the defensive
+    catch keeps an unexpected scheduling failure from ever reaching the event
+    loop's crash handler. The in-flight marker is always released so later
+    uses are coalesced, never starved.
+
+    When the record write could not be persisted (the ensure use case yielded
+    no record), the seen-``working_dir`` markers of that space are dropped so
+    a later scoped use retries the lazy provision (REQ-011's "eventually")
+    instead of being coalesced away forever.
+    """
+    user_id, agent_slug = key
+    try:
+        space = await EnsureRagSpaceUseCase(repository).execute(
+            user_id=user_id, agent_slug=agent_slug, working_dir=working_dir
+        )
+    except Exception as exc:  # noqa: BLE001 — fire-and-forget by contract
+        logger.warning(LogMessage.SPACE_PROVISIONING_FAILED, agent_slug, str(exc))
+        space = None
+    finally:
+        _space_touch_inflight.discard(key)
+    if space is None:
+        _forget_space_working_dirs(key)
+
+
+def _forget_space_working_dirs(key: tuple[str, str]) -> None:
+    """Drop the seen-``working_dir`` markers of ONE space (bounded size).
+
+    Markers are in-memory only; they are dropped when a space is deleted
+    (:func:`forget_space_tracking` — a recreated space re-records its
+    namespaces from zero) or when a write failed (retry on the next scoped
+    use), keeping the set proportional to the LIVE spaces' ``working_dirs``.
+    """
+    for tracked in [
+        tracked for tracked in _seen_space_working_dirs if tracked[:2] == key
+    ]:
+        _seen_space_working_dirs.discard(tracked)
+
+
+def forget_space_tracking(user_id: str, agent_slug: str) -> None:
+    """Forget every in-memory tracking marker of a deleted RAG space.
+
+    Called by the cascade-delete route (code-review iteration-4 🟡-4): the
+    seen-markers set stays bounded to the LIVE spaces instead of growing
+    forever with deleted-and-recreated ones.
+    """
+    _forget_space_working_dirs((user_id or "", agent_slug or ""))
+
+
+async def drain_space_touch_tasks() -> None:
+    """Await the pending background space writes (best-effort, bounded).
+
+    Called from the application shutdown hook BEFORE the asyncpg pool is
+    closed (code-review iteration-4 🟡-3): without the drain a pending
+    provisioning write would hit the closed pool (silently swallowed) and
+    asyncio would emit "Task was destroyed but it is pending!". Per Sonar
+    python:S7483 an ASYNC function must not accept a timeout parameter —
+    the caller owns the timeout policy through a timeout context manager —
+    so the drain bounds itself with :data:`_SPACE_TOUCH_DRAIN_TIMEOUT_SECONDS`
+    via :func:`asyncio.timeout`; tasks still pending after the timeout are
+    cancelled so teardown always completes.
+    """
+    pending = [task for task in _space_touch_tasks if not task.done()]
+    if not pending:
+        return
+    try:
+        async with asyncio.timeout(_SPACE_TOUCH_DRAIN_TIMEOUT_SECONDS):
+            await asyncio.wait(pending)
+    except TimeoutError:
+        pass  # bounded best-effort drain: stragglers are cancelled below
+    for task in pending:
+        if not task.done():
+            task.cancel()
+
+
+def get_create_rag_space_use_case() -> CreateRagSpaceUseCase:
+    """Return the idempotent space-create use case (repository required)."""
+    return CreateRagSpaceUseCase(repository=_required_rag_space_repository())
+
+
+def get_list_rag_spaces_use_case() -> ListRagSpacesUseCase:
+    """Return the space-list use case (repository required)."""
+    return ListRagSpacesUseCase(repository=_required_rag_space_repository())
+
+
+def get_delete_rag_space_use_case() -> DeleteRagSpaceUseCase:
+    """Return the space-cascade-delete use case (MinIO + tables + record)."""
+    return DeleteRagSpaceUseCase(
+        repository=_required_rag_space_repository(),
+        storage=minio_adapter,
+        bucket=minio_config.MINIO_BUCKET,
+        vector_tables=get_vector_table_manager(),
+    )
+
+
+def _required_rag_space_repository() -> RagSpaceRepository:
+    """Return the space repository or fail with the 503 mapping error."""
+    if rag_space_repository is None:
+        raise DependencyNotInitializedError(
+            "RAG space repository is not initialized; the application lifespan "
+            "must create the asyncpg pool before serving requests."
+        )
+    return rag_space_repository
+
+
+vector_table_manager: VectorTableManagerPort | None = None
+
+
+def get_vector_table_manager() -> VectorTableManagerPort:
+    """Return the drop-capable vector adapter singleton (code-review 🟡-3).
+
+    A fresh adapter per delete request would lazily build (and never close) a
+    new SQLAlchemy ``PGEngine`` pool — a leaked pool per cascade delete. The
+    manager is therefore cached at module level and closed by the application
+    shutdown hook (``main.lifespan`` → ``db_lifespan``). It reuses the legacy
+    singleton's shared ``PGEngine`` when available (same pooling rationale as
+    ``get_vector_store_for_user``); its own engine — when it has to build one
+    — is lazily resolved inside the adapter on first drop and released at
+    shutdown.
+    """
+    global vector_table_manager
+    if vector_table_manager is not None:
+        return vector_table_manager
+    from infrastructure.vector_store.langchain_pgvector_adapter import (
+        LangchainPgvectorAdapter,
+    )
+
+    shared_engine = (
+        getattr(classical_vector_store, "_engine", None)
+        if classical_vector_store is not None
+        else None
+    )
+    vector_table_manager = LangchainPgvectorAdapter(
+        connection_string=db_config.DATABASE_URL,
+        table_prefix=classical_rag_config.CLASSICAL_TABLE_PREFIX,
+        embedding_dimension=llm_config.EMBEDDING_DIM,
+        embedding_service=None,
+        engine=shared_engine,
+    )
+    return vector_table_manager
 
 
 classical_bm25_adapter: BM25EnginePort | None = None
@@ -459,6 +766,7 @@ async def get_classical_index_file_use_case() -> ClassicalIndexFileUseCase:
         storage=minio_adapter,
         bucket=minio_config.MINIO_BUCKET,
         output_dir=app_config.OUTPUT_DIR,
+        space_recorder=track_space_usage,
     )
 
 
@@ -469,6 +777,7 @@ async def get_classical_index_folder_use_case() -> ClassicalIndexFolderUseCase:
         storage=minio_adapter,
         bucket=minio_config.MINIO_BUCKET,
         output_dir=app_config.OUTPUT_DIR,
+        space_recorder=track_space_usage,
     )
 
 
@@ -481,6 +790,7 @@ async def get_classical_query_use_case() -> ClassicalQueryUseCase:
         config=classical_rag_config,
         bm25_engine=classical_bm25_adapter,
         rrf_k=classical_rag_config.CLASSICAL_RRF_K,
+        space_recorder=track_space_usage,
     )
 
 

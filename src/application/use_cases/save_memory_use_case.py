@@ -15,7 +15,7 @@ from domain.entities.memory import (
     MemoryAction,
     MemoryCredential,
     SavedMemory,
-    memory_path,
+    memory_scope_path,
     normalize_memory_name,
 )
 from domain.errors.memory_store import (
@@ -63,19 +63,24 @@ class SaveMemoryUseCase:
         if_exists: MemoryExistsMode,
         user_id: str,
         credential: MemoryCredential,
+        agent_slug: str | None = None,
     ) -> SavedMemory:
         """Validate, resolve the overwrite policy and persist the memory.
 
         Args:
-            name: Logical memory name (normalized to ``/memories/<stem>.md``).
+            name: Logical memory name (flat personal stem, or explicitly
+                ``{agent_slug}/<stem>`` inside an agent scope — REQ-012).
             content: Exact content to store (must be non-empty).
             if_exists: ``fail`` / ``append`` / ``replace``.
             user_id: Authenticated caller id (gates the call; never stored
                 nor forwarded).
             credential: The caller's own forwardable credential.
+            agent_slug: The caller's agent slug; ``None`` keeps the flat
+                personal namespace (REQ-012/REQ-014).
 
         Returns:
-            The :class:`SavedMemory` for the successful upstream PUT.
+            The :class:`SavedMemory` for the successful upstream PUT (its
+            ``path`` is the SCOPED store path).
 
         Raises:
             MemoryIdentityError: Fail-closed without identity/credential
@@ -101,9 +106,10 @@ class SaveMemoryUseCase:
         if not isinstance(content, str) or not content:
             raise MemoryValidationError(ErrorMessage.MEMORY_CONTENT_REQUIRED)
 
-        stem = normalize_memory_name(name)
+        stem = normalize_memory_name(name, agent_slug=agent_slug)
+        path = memory_scope_path(stem, agent_slug)
         started = time.monotonic()
-        existing = await self._store.read(stem, credential)
+        existing = await self._store.read(stem, credential, agent_slug=agent_slug)
         action: MemoryAction
         if existing is None:
             final_content = content
@@ -116,7 +122,7 @@ class SaveMemoryUseCase:
         else:
             final_content = content
             action = "replaced"
-        await self._store.write(stem, final_content, credential)
+        await self._store.write(stem, final_content, credential, agent_slug=agent_slug)
         logger.info(
             LogMessage.MEMORY_SAVE_COMPLETED,
             action,
@@ -124,7 +130,7 @@ class SaveMemoryUseCase:
             (time.monotonic() - started) * 1000,
         )
         return SavedMemory(
-            path=memory_path(stem),
+            path=path,
             action=action,
             chars=len(final_content),
         )
