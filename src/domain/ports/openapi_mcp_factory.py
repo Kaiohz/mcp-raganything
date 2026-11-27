@@ -79,3 +79,12 @@ class OpenApiMcpFactory(ABC):
             The number of tools the server exposes.
         """
         ...
+
+    async def list_tool_names(self, mcp: Any) -> list[str]:
+        """List the tool NAMES exposed by a built FastMCP server.
+
+        Default (non-abstract) implementation is empty so lightweight fakes
+        of this port keep working; the real factory overrides it via the same
+        public listing API used by ``count_tools`` (metadata only).
+        """
+        return []

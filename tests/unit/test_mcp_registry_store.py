@@ -60,6 +60,7 @@ def _row(
     env_encrypted: str = "ENC_ENV",
     auth_token_encrypted: str | None = "ENC_TOKEN",
     tool_count: int = 3,
+    tool_names: list[str] | None = None,
     source_type: str = "external",
     openapi_url: str | None = None,
     auth_mode: str | None = "headers",
@@ -72,6 +73,7 @@ def _row(
         "env_encrypted": env_encrypted,
         "auth_token_encrypted": auth_token_encrypted,
         "tool_count": tool_count,
+        "tool_names_json": json.dumps(tool_names or []),
         "source_type": source_type,
         "openapi_url": openapi_url,
         "auth_mode": auth_mode,
@@ -703,3 +705,72 @@ class TestCorruptedAuthMode:
 
         # Assert
         assert result.auth_mode is McpAuthMode.USER_TOKEN
+
+
+class TestToolNamesPersistence:
+    """``tool_names`` (non-secret metadata, 006 migration) round-trips."""
+
+    async def test_save_sends_names_as_plain_json(
+        self, store: McpRegistryStore, mock_conn: AsyncMock, mock_cipher: AsyncMock
+    ):
+        entry = _entry()
+        entry = entry.model_copy(update={"tool_names": ["ping", "list_files"]})
+
+        await store.save(entry)
+
+        # The names travel as a plain JSON string (never cipher-round).
+        params = mock_conn.execute.await_args.args
+        assert params[8] == '["ping", "list_files"]'
+        cipher_args = [c.args[0] for c in mock_cipher.encrypt.await_args_list]
+        assert all("ping" not in v for v in cipher_args)
+
+    async def test_get_rehydrates_names_from_row(
+        self, store: McpRegistryStore, mock_conn: AsyncMock
+    ):
+        mock_conn.fetchrow = AsyncMock(
+            return_value=_row(
+                tool_names=["ping", "list_files"],
+                headers_encrypted="ENC({})",
+                env_encrypted="ENC({})",
+                auth_token_encrypted=None,
+            )
+        )
+
+        entry = await store.get("web-search")
+
+        assert entry.tool_names == ["ping", "list_files"]
+
+    async def test_get_defaults_to_empty_names_on_legacy_row(
+        self, store: McpRegistryStore, mock_conn: AsyncMock
+    ):
+        row = _row(
+            headers_encrypted="ENC({})",
+            env_encrypted="ENC({})",
+            auth_token_encrypted=None,
+        )
+        # A row physically lacking the column value (pre-006 migrated cell
+        # read as NULL): the mapping degrades to [] without failing.
+        row["tool_names_json"] = None
+        mock_conn.fetchrow = AsyncMock(return_value=row)
+
+        entry = await store.get("web-search")
+
+        assert entry.tool_names == []
+
+    async def test_corrupted_names_json_degrades_to_empty(
+        self, store: McpRegistryStore, mock_conn: AsyncMock
+    ):
+        row = _row(
+            tool_names=["ping"],
+            headers_encrypted="ENC({})",
+            env_encrypted="ENC({})",
+            auth_token_encrypted=None,
+        )
+        # Corrupt the JSON payload directly (a non-JSON column survives via
+        # defensive coercion — the row is never lost over metadata).
+        row["tool_names_json"] = "not-json"
+        mock_conn.fetchrow = AsyncMock(return_value=row)
+
+        entry = await store.get("web-search")
+
+        assert entry.tool_names == []

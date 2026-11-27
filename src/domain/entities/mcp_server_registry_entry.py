@@ -37,6 +37,9 @@ class RegisteredMcpServer(BaseModel):
             user's credential at load/validate time). Non-secret metadata:
             echoed unmasked in every masked projection, unlike the secrets.
         tool_count: Number of tools discovered during the last validation.
+        tool_names: Names of the tools discovered during the last
+            validation/create/update probe (non-secret metadata, echoed
+            unmasked like ``tool_count``; empty for unknown/legacy rows).
         source_type: Origin of the server — ``"external"`` (plain MCP server
             reached over the network) or ``"openapi"`` (server built in-process
             from an OpenAPI spec via FastMCP and mounted under
@@ -57,6 +60,7 @@ class RegisteredMcpServer(BaseModel):
     auth_token: str | None = None
     auth_mode: McpAuthMode = McpAuthMode.HEADERS
     tool_count: int = 0
+    tool_names: list[str] = Field(default_factory=list)
     source_type: str = "external"
     openapi_url: str | None = None
     created_at: datetime

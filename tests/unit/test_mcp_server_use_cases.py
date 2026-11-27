@@ -910,16 +910,20 @@ class TestValidateMcpServerUseCase:
     def use_case(self, mock_loader) -> ValidateMcpServerUseCase:
         return ValidateMcpServerUseCase(tool_loader=mock_loader)
 
-    async def test_returns_tool_count_from_loader(self, use_case, mock_loader):
+    async def test_returns_probe_with_names_from_loader(self, use_case, mock_loader):
         # Arrange
-        mock_loader.load_tools.return_value = ["a", "b", "c"]
+        tools = [MagicMock(name=f"tool_{i}") for i in range(3)]
+        for index, tool in enumerate(tools):
+            tool.name = f"tool_{index}"
+        mock_loader.load_tools.return_value = tools
         config = _config()
 
         # Act
         result = await use_case.execute(config)
 
         # Assert
-        assert result == 3
+        assert result.count == 3
+        assert result.tool_names == ["tool_0", "tool_1", "tool_2"]
 
     async def test_raises_unreachable_on_connection_error(self, use_case, mock_loader):
         # Arrange
@@ -964,13 +968,14 @@ class TestValidateMcpServerUseCaseOpenApi:
         # Assert
         mock_factory.build_mcp.assert_awaited_once()
 
-    async def test_returns_tool_count_from_factory_count_tools(
+    async def test_returns_probe_with_names_from_the_factory(
         self, use_case, mock_factory
     ):
         # Arrange
         mock_factory.fetch_spec.return_value = {"openapi": "3.0.3"}
         mock_factory.build_mcp.return_value = MagicMock()
         mock_factory.count_tools.return_value = 6
+        mock_factory.list_tool_names.return_value = [f"op_{i}" for i in range(6)]
 
         # Act
         result = await use_case.execute_openapi(
@@ -978,7 +983,8 @@ class TestValidateMcpServerUseCaseOpenApi:
         )
 
         # Assert
-        assert result == 6
+        assert result.count == 6
+        assert result.tool_names == [f"op_{i}" for i in range(6)]
 
     async def test_does_not_mount_or_persist(
         self, use_case, mock_factory, mock_store, mock_runner

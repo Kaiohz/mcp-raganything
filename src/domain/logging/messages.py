@@ -277,8 +277,7 @@ class LogMessage(StrEnum):
         "trying the next backend"
     )
     WEB_SEARCH_BACKEND_FAILED = (
-        "ddgs backend %s failed; trying the next backend "
-        "(details are never logged)"
+        "ddgs backend %s failed; trying the next backend (details are never logged)"
     )
     WEB_SEARCH_UNEXPECTED = "Unexpected web search failure"
     WEB_SEARCH_TIMED_OUT = "Web search timed out after %.2fs"

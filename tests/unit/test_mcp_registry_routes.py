@@ -28,7 +28,10 @@ from application.use_cases.delete_mcp_server import DeleteMcpServerUseCase
 from application.use_cases.get_mcp_server import GetMcpServerUseCase
 from application.use_cases.list_mcp_servers import ListMcpServersUseCase
 from application.use_cases.update_mcp_server import UpdateMcpServerUseCase
-from application.use_cases.validate_mcp_server import ValidateMcpServerUseCase
+from application.use_cases.validate_mcp_server import (
+    ValidateMcpServerUseCase,
+    ValidationProbe,
+)
 from dependencies import (
     get_create_mcp_server_use_case,
     get_delete_mcp_server_use_case,
@@ -151,8 +154,12 @@ def mock_create_use_case() -> AsyncMock:
 @pytest.fixture
 def mock_validate_use_case() -> AsyncMock:
     uc = AsyncMock(spec=ValidateMcpServerUseCase)
-    uc.execute = AsyncMock(return_value=2)
-    uc.execute_openapi = AsyncMock(return_value=2)
+    uc.execute = AsyncMock(
+        return_value=ValidationProbe(count=2, tool_names=["tool_0", "tool_1"])
+    )
+    uc.execute_openapi = AsyncMock(
+        return_value=ValidationProbe(count=2, tool_names=["tool_0", "tool_1"])
+    )
     return uc
 
 
@@ -589,7 +596,11 @@ class TestValidateMcpServerRoute:
         self, client: AsyncClient, mock_validate_use_case: AsyncMock
     ):
         # Arrange
-        mock_validate_use_case.execute = AsyncMock(return_value=5)
+        mock_validate_use_case.execute = AsyncMock(
+            return_value=ValidationProbe(
+                count=5, tool_names=[f"tool_{i}" for i in range(5)]
+            )
+        )
         body = {"url": "http://localhost:3001/mcp"}
 
         # Act
@@ -618,7 +629,11 @@ class TestValidateMcpServerRoute:
         self, client: AsyncClient, mock_validate_use_case: AsyncMock
     ):
         # Arrange
-        mock_validate_use_case.execute_openapi = AsyncMock(return_value=10)
+        mock_validate_use_case.execute_openapi = AsyncMock(
+            return_value=ValidationProbe(
+                count=10, tool_names=[f"tool_{i}" for i in range(10)]
+            )
+        )
         body = {
             "source_type": "openapi",
             "openapi_url": "https://x.example.com/openapi.json",
@@ -635,7 +650,11 @@ class TestValidateMcpServerRoute:
         self, client: AsyncClient, mock_validate_use_case: AsyncMock
     ):
         # Arrange
-        mock_validate_use_case.execute_openapi = AsyncMock(return_value=3)
+        mock_validate_use_case.execute_openapi = AsyncMock(
+            return_value=ValidationProbe(
+                count=3, tool_names=[f"tool_{i}" for i in range(3)]
+            )
+        )
         body = {
             "source_type": "openapi",
             "openapi_url": "https://x.example.com/openapi.json",
@@ -820,7 +839,11 @@ class TestValidateStoredMerge:
     ):
         # Arrange — the edit-dialog shape: id + masked-empty credential fields
         mock_get_use_case.execute = AsyncMock(return_value=self._stored_with_secrets())
-        mock_validate_use_case.execute = AsyncMock(return_value=5)
+        mock_validate_use_case.execute = AsyncMock(
+            return_value=ValidationProbe(
+                count=5, tool_names=[f"tool_{i}" for i in range(5)]
+            )
+        )
         body = {
             "id": "web-search",
             "name": "web-search",  # ignored (extra) — id is the reference
@@ -838,7 +861,7 @@ class TestValidateStoredMerge:
         # Assert — the probe ran with the STORED (decrypted) values
         assert resp.status_code == 200, resp.text
         assert resp.json()["tool_count"] == 5
-        assert set(resp.json().keys()) == {"tool_count"}  # no secret echo
+        assert set(resp.json().keys()) == {"tool_count", "tool_names"}  # no secret echo
         config = mock_validate_use_case.execute.await_args.args[0]
         assert config.name == "web-search"
         assert config.url == "https://stored.example.com/mcp"
@@ -852,7 +875,11 @@ class TestValidateStoredMerge:
         # Arrange — the stored entry keeps its secrets; the payload is the
         # masked projection (empty editors) sent by the REQ-016 UI
         mock_get_use_case.execute = AsyncMock(return_value=self._stored_with_secrets())
-        mock_validate_use_case.execute = AsyncMock(return_value=2)
+        mock_validate_use_case.execute = AsyncMock(
+            return_value=ValidationProbe(
+                count=2, tool_names=[f"tool_{i}" for i in range(2)]
+            )
+        )
         body = {
             "id": "web-search",
             "url": "https://stored.example.com/mcp",
@@ -877,7 +904,11 @@ class TestValidateStoredMerge:
     ):
         # Arrange — the user edited url + key + token in the dialog
         mock_get_use_case.execute = AsyncMock(return_value=self._stored_with_secrets())
-        mock_validate_use_case.execute = AsyncMock(return_value=7)
+        mock_validate_use_case.execute = AsyncMock(
+            return_value=ValidationProbe(
+                count=7, tool_names=[f"tool_{i}" for i in range(7)]
+            )
+        )
         body = {
             "id": "web-search",
             "url": "https://changed.example.com/mcp",
@@ -903,7 +934,11 @@ class TestValidateStoredMerge:
         mock_get_use_case.execute = AsyncMock(
             return_value=self._stored_with_secrets(auth_mode=McpAuthMode.USER_TOKEN)
         )
-        mock_validate_use_case.execute = AsyncMock(return_value=2)
+        mock_validate_use_case.execute = AsyncMock(
+            return_value=ValidationProbe(
+                count=2, tool_names=[f"tool_{i}" for i in range(2)]
+            )
+        )
         app.dependency_overrides[get_request_auth_context] = lambda: AuthContext(
             user_id="user-alice", method="jwt", raw_credential="caller-jwt"
         )
@@ -924,7 +959,11 @@ class TestValidateStoredMerge:
         # Arrange 2 — an EXPLICIT mode wins over the stored one
         app.dependency_overrides[get_request_auth_context] = lambda: None
         body2 = {"id": "web-search", "auth_mode": "headers"}
-        mock_validate_use_case.execute = AsyncMock(return_value=2)
+        mock_validate_use_case.execute = AsyncMock(
+            return_value=ValidationProbe(
+                count=2, tool_names=[f"tool_{i}" for i in range(2)]
+            )
+        )
 
         # Act 2
         resp2 = await client.post(f"{BASE_URL}/validate", json=body2)
@@ -956,7 +995,11 @@ class TestValidateStoredMerge:
         # Arrange — NO registry at all (the store is disabled): the legacy
         # stateless candidate probe must keep working untouched
         app.dependency_overrides.pop(get_get_mcp_server_use_case_optional, None)
-        mock_validate_use_case.execute = AsyncMock(return_value=4)
+        mock_validate_use_case.execute = AsyncMock(
+            return_value=ValidationProbe(
+                count=4, tool_names=[f"tool_{i}" for i in range(4)]
+            )
+        )
         body = {"url": "https://target.example.com/mcp"}
 
         # Act
@@ -977,7 +1020,11 @@ class TestValidateStoredMerge:
                 ErrorMessage.MCP_SERVER_NOT_FOUND.format(name="ransom")
             )
         )
-        mock_validate_use_case.execute = AsyncMock(return_value=2)
+        mock_validate_use_case.execute = AsyncMock(
+            return_value=ValidationProbe(
+                count=2, tool_names=[f"tool_{i}" for i in range(2)]
+            )
+        )
         body = {"id": "ransom"}
 
         # Act
@@ -1006,7 +1053,11 @@ class TestValidateStoredMerge:
                 updated_at=_now(),
             )
         )
-        mock_validate_use_case.execute_openapi = AsyncMock(return_value=9)
+        mock_validate_use_case.execute_openapi = AsyncMock(
+            return_value=ValidationProbe(
+                count=9, tool_names=[f"tool_{i}" for i in range(9)]
+            )
+        )
         body = {"id": "petstore"}
 
         # Act
@@ -1029,7 +1080,11 @@ class TestValidateStoredMerge:
         ``id`` (the two halves of the wire contract speak both names)."""
         # Arrange — the edit-dialog shape with the UI's field name
         mock_get_use_case.execute = AsyncMock(return_value=self._stored_with_secrets())
-        mock_validate_use_case.execute = AsyncMock(return_value=5)
+        mock_validate_use_case.execute = AsyncMock(
+            return_value=ValidationProbe(
+                count=5, tool_names=[f"tool_{i}" for i in range(5)]
+            )
+        )
         body = {
             "server_id": "web-search",
             "name": "web-search",
@@ -1055,7 +1110,11 @@ class TestValidateStoredMerge:
     ):
         # Arrange — both forms in one payload: ``id`` is the primary name
         mock_get_use_case.execute = AsyncMock(return_value=self._stored_with_secrets())
-        mock_validate_use_case.execute = AsyncMock(return_value=5)
+        mock_validate_use_case.execute = AsyncMock(
+            return_value=ValidationProbe(
+                count=5, tool_names=[f"tool_{i}" for i in range(5)]
+            )
+        )
         body = {"id": "web-search", "server_id": "server-ghost"}
 
         # Act
@@ -1568,7 +1627,11 @@ class TestAuthModeEcho:
         self, client: AsyncClient, mock_validate_use_case: AsyncMock
     ):
         # Arrange
-        mock_validate_use_case.execute = AsyncMock(return_value=2)
+        mock_validate_use_case.execute = AsyncMock(
+            return_value=ValidationProbe(
+                count=2, tool_names=[f"tool_{i}" for i in range(2)]
+            )
+        )
         body = {
             "url": "http://localhost:3001/mcp",
             "auth_mode": "user_token",
