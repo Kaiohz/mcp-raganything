@@ -24,9 +24,9 @@ import hashlib
 import json
 import os
 import shutil
-import socket
 import subprocess
 import tempfile
+import time
 import uuid
 from unittest.mock import patch
 
@@ -38,14 +38,24 @@ from cryptography.fernet import Fernet
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
 POSTGRES_IMAGE = "pgvector/pgvector:pg16"
-MINIO_IMAGE = "minio/minio:latest"
 PG_USER = "raganything"
 PG_PASSWORD = "raganything"
 PG_DB = "raganything"
-MINIO_ROOT_USER = "minioadmin"
-MINIO_ROOT_SECRET = "minioadmin"
+
 MINIO_BUCKET = "raganything"
 EMBEDDING_DIM = 8
+
+#: The object storage for the infra-backed suites is RustFS (the platform
+#: switched from the tracked-compose MinIO legacy; QA loop-back iteration 13):
+#: official image ``rustfs/rustfs:latest``, S3/MinIO-API drop-in with the
+#: platform's own credentials and health endpoint (``/minio/health/live``).
+RUSTFS_IMAGE = "rustfs/rustfs:latest"
+RUSTFS_ROOT_USER = "rustfsadmin"
+RUSTFS_ROOT_PASSWORD = "rustfsadmin"
+#: Docker Hub pulls are flaky on GH-hosted runners (rate limiting); each
+#: image is pre-pulled with 3 attempts and a 10 s backoff before giving up.
+_PULL_ATTEMPTS = 3
+_PULL_ATTEMPT_BACKOFF_SECONDS = 10.0
 
 SKIP_REASON = (
     "Docker engine unavailable in this environment: the infra-backed suites "
@@ -55,11 +65,15 @@ SKIP_REASON = (
 
 
 class Cluster:
-    """Handles for one throwaway Postgres(pgvector) + MinIO pair."""
+    """Handles for one throwaway Postgres(pgvector) + RustFS object store."""
 
     def __init__(self, pg_port: int, minio_port: int) -> None:
         self.pg_port = pg_port
         self.minio_port = minio_port
+        # The S3 credentials of the object-store container (RustFS), carried
+        # on the cluster so the migration-script harness env stays in sync.
+        self.minio_access = RUSTFS_ROOT_USER
+        self.minio_secret = RUSTFS_ROOT_PASSWORD
         self.pg_host = "127.0.0.1"
         self.pg_dsn = (
             f"postgresql://{PG_USER}:{PG_PASSWORD}@127.0.0.1:{pg_port}/{PG_DB}"
@@ -105,6 +119,53 @@ def _docker_available() -> bool:
     return probe.returncode == 0
 
 
+def _image_is_local(image: str) -> bool:
+    """Whether the docker daemon can already resolve the image WITHOUT pulling."""
+    probe = subprocess.run(
+        ["docker", "image", "inspect", image],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    return probe.returncode == 0
+
+
+def _pull_image(reference: str) -> str | None:
+    """Pull one image once; return an error description on failure (or None)."""
+    attempted = subprocess.run(
+        ["docker", "pull", reference], capture_output=True, text=True, timeout=600
+    )
+    if attempted.returncode == 0:
+        return None
+    detail = (attempted.stderr or attempted.stdout).strip()
+    return detail or f"docker pull {reference!r} failed (rc={attempted.returncode})"
+
+
+def _ensure_docker_image(image: str) -> str:
+    """Make one container image locally available and return its reference.
+
+    Images already present locally resolve instantly (local runs are
+    unaffected). Missing images are pulled with ``_PULL_ATTEMPTS`` retries
+    and a backoff — Docker Hub rate limiting fails transiently on GH-hosted
+    runners, so the spaced retries are enough for all involved public images
+    (no mirror machinery needed; kept portable and dependency-free).
+    """
+    if _image_is_local(image):
+        return image
+    last_error = "no pull attempt made"
+    for attempt_index in range(_PULL_ATTEMPTS):
+        error = _pull_image(image)
+        if error is None:
+            return image
+        last_error = error
+        if attempt_index + 1 < _PULL_ATTEMPTS:
+            time.sleep(_PULL_ATTEMPT_BACKOFF_SECONDS)
+    raise RuntimeError(
+        f"Docker image {image!r} could not be made available "
+        f"after {_PULL_ATTEMPTS} attempts: {last_error}"
+    )
+
+
 def _run(cmd: list[str], timeout: float = 300) -> str:
     completed = subprocess.run(
         cmd, capture_output=True, text=True, timeout=timeout, check=True
@@ -136,16 +197,26 @@ def _await_postgres(container: str, timeout_seconds: float = 90) -> None:
 
 
 def _await_minio(host: str, port: int, timeout_seconds: float = 90) -> None:
+    """Wait until the object store answers its LIVE health probe.
+
+    RustFS (like MinIO) serves ``GET /minio/health/live`` on the S3 port —
+    the platform's own readiness contract (``init-rustfs.sh``), so the wait
+    probes the HTTP health path instead of a bare TCP connect.
+    """
     import time
+    import urllib.request
 
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         try:
-            with socket.create_connection((host, port), timeout=2):
+            probe = urllib.request.urlopen(
+                f"http://{host}:{port}/minio/health/live", timeout=2
+            )
+            if probe.status == 200:
                 return
         except OSError:
             time.sleep(0.5)
-    raise RuntimeError(f"MinIO endpoint {host}:{port} never became reachable")
+    raise RuntimeError(f"object store at {host}:{port} never became healthy")
 
 
 def _minio_client(cluster: Cluster):
@@ -153,8 +224,8 @@ def _minio_client(cluster: Cluster):
 
     return Minio(
         f"127.0.0.1:{cluster.minio_port}",
-        access_key=MINIO_ROOT_USER,
-        secret_key=MINIO_ROOT_SECRET,
+        access_key=RUSTFS_ROOT_USER,
+        secret_key=RUSTFS_ROOT_PASSWORD,
         secure=False,
     )
 
@@ -245,8 +316,9 @@ def cluster():
 
     token = uuid.uuid4().hex[:8]
     pg_container = f"raganything-test-pg-{token}"
-    minio_container = f"raganything-test-minio-{token}"
+    rustfs_container = f"raganything-test-rustfs-{token}"
     try:
+        postgres_image = _ensure_docker_image(POSTGRES_IMAGE)
         _run(
             [
                 "docker",
@@ -262,31 +334,30 @@ def cluster():
                 f"POSTGRES_DB={PG_DB}",
                 "--publish",
                 "127.0.0.1::5432",
-                POSTGRES_IMAGE,
+                postgres_image,
             ]
         )
         _await_postgres(pg_container)
         pg_port = _published_host_port(pg_container, "5432/tcp")
 
+        rustfs_image = _ensure_docker_image(RUSTFS_IMAGE)
         _run(
             [
                 "docker",
                 "run",
                 "-d",
                 "--name",
-                minio_container,
+                rustfs_container,
                 "-e",
-                f"MINIO_ROOT_USER={MINIO_ROOT_USER}",
+                f"RUSTFS_ACCESS_KEY={RUSTFS_ROOT_USER}",
                 "-e",
-                f"MINIO_ROOT_PASSWORD={MINIO_ROOT_SECRET}",
+                f"RUSTFS_SECRET_KEY={RUSTFS_ROOT_PASSWORD}",
                 "--publish",
                 "127.0.0.1::9000",
-                MINIO_IMAGE,
-                "server",
-                "/data",
+                rustfs_image,
             ]
         )
-        minio_port = _published_host_port(minio_container, "9000/tcp")
+        minio_port = _published_host_port(rustfs_container, "9000/tcp")
         cluster_obj = Cluster(pg_port=pg_port, minio_port=minio_port)
         _await_minio("127.0.0.1", minio_port)
 
@@ -295,7 +366,7 @@ def cluster():
             client.make_bucket(MINIO_BUCKET)
         yield cluster_obj
     finally:
-        for container in (minio_container, pg_container):
+        for container in (rustfs_container, pg_container):
             subprocess.run(
                 ["docker", "rm", "-f", container], capture_output=True, timeout=60
             )
@@ -384,8 +455,8 @@ async def cluster_app(cluster, auth_directory):
         "MCP_AUTHORIZATION_SERVER": "https://logto.soludev.tech/oidc",
         "DATABASE_URL": cluster.pg_dsn,
         "MINIO_HOST": cluster.minio_host,
-        "MINIO_ACCESS": MINIO_ROOT_USER,
-        "MINIO_SECRET": MINIO_ROOT_SECRET,
+        "MINIO_ACCESS": RUSTFS_ROOT_USER,
+        "MINIO_SECRET": RUSTFS_ROOT_PASSWORD,
     }
 
     patches = _SessionPatches()
@@ -408,8 +479,8 @@ async def cluster_app(cluster, auth_directory):
         patches.apply(dependencies.minio_config, "MINIO_SECURE", False)
         real_minio = MinioAdapter(
             host=cluster.minio_host,
-            access=MINIO_ROOT_USER,
-            secret=MINIO_ROOT_SECRET,
+            access=RUSTFS_ROOT_USER,
+            secret=RUSTFS_ROOT_PASSWORD,
             secure=False,
         )
         patches.apply(dependencies, "minio_adapter", real_minio)
@@ -531,8 +602,8 @@ def script_env(cluster: Cluster) -> dict[str, str]:
         {
             "DATABASE_URL": cluster.pg_dsn,
             "MINIO_HOST": cluster.minio_host,
-            "MINIO_ACCESS": MINIO_ROOT_USER,
-            "MINIO_SECRET": MINIO_ROOT_SECRET,
+            "MINIO_ACCESS": RUSTFS_ROOT_USER,
+            "MINIO_SECRET": RUSTFS_ROOT_PASSWORD,
             "MINIO_BUCKET": MINIO_BUCKET,
             "MIGRATION_BASE_URL": getattr(
                 cluster, "http_base_url", "http://127.0.0.1:0"

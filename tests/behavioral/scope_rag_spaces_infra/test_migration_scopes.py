@@ -58,8 +58,8 @@ def script_runner(cluster):
             {
                 "DATABASE_URL": cluster.pg_dsn,
                 "MINIO_HOST": cluster.minio_host,
-                "MINIO_ACCESS": "minioadmin",
-                "MINIO_SECRET": "minioadmin",
+                "MINIO_ACCESS": cluster.minio_access,
+                "MINIO_SECRET": cluster.minio_secret,
                 "MINIO_BUCKET": "raganything",
                 "MIGRATION_BASE_URL": getattr(
                     cluster, "http_base_url", "http://127.0.0.1:0"
@@ -198,8 +198,8 @@ async def test_dry_run_writes_the_triage_report_file(
             {
                 "DATABASE_URL": cluster.pg_dsn,
                 "MINIO_HOST": cluster.minio_host,
-                "MINIO_ACCESS": "minioadmin",
-                "MINIO_SECRET": "minioadmin",
+                "MINIO_ACCESS": cluster.minio_access,
+                "MINIO_SECRET": cluster.minio_secret,
                 "MINIO_BUCKET": "raganything",
                 "MIGRATION_BASE_URL": getattr(
                     cluster, "http_base_url", "http://127.0.0.1:0"
