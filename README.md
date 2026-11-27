@@ -250,9 +250,67 @@ Decryption is done by `AsyncpgUserLlmReader` using the existing `FernetSecretCip
 
 When `current_user_id` is `None` (e.g. local dev with auth disabled), the factories fall back to the static `LLMConfig` env vars (`OPEN_ROUTER_API_KEY`, `CHAT_MODEL`, `EMBEDDING_MODEL`, etc.). This preserves the legacy local-dev workflow.
 
-### Per-user RAG isolation
+### Agent & personal scopes (`X-Composable-Agent`)
 
-Classical RAG chunks are tagged with `user_id` in their `langchain_metadata` at index time. At query time, the langchain-postgres metadata filter `{"user_id": current_user_id}` is applied so a user only retrieves their own chunks. This is an **application-level** filter — RLS is **not** applied on the dynamic `classical_rag_*` tables because `PGVectorStore` uses its own connection pool and the `app.user_id` GUC is not propagated there (same conclusion as the LangGraph store in composable-agents).
+Every authenticated request also carries a **scope slug** that isolates an agent's RAG corpus, files and memories inside the caller's own data:
+
+1. The scope value is read from the `X-Composable-Agent` HTTP header. **Absent → `personal`** (the user's own default space — old clients keep working).
+2. The value must match `^[a-z0-9][a-z0-9-]{0,99}$`; an invalid value is rejected with **422** (REST) / `ToolError` (MCP) before any storage operation.
+3. The `user_id` always comes from the authenticated credential (JWT / `X-API-Key`) — never from a header — so cross-user access is impossible by construction. Two clients presenting the same header value are always isolated per user.
+4. Every file operation is prefixed `{user_id}/{agent_slug}/…`, every `working_dir` is composed `{user_id}/{agent_slug}/{working_dir}`, and memories live under `/memories/{agent_slug}/{name}.md` (personal: `/memories/{name}.md`). Intra-user spoofing of the header (claiming another of **your own** agents' slugs) is accepted and documented — everything stays inside the same account.
+
+External MCP clients (OpenCode, Claude Code, …) configure the header per scope — e.g. one MCP server entry per scope with different `headers` in `opencode.jsonc`, all pointing at the same URL:
+
+```jsonc
+{
+  "mcp": {
+    "servers": {
+      "rag-opencode": { "type": "http", "url": "<MCP_URL>", "headers": { "X-API-Key": "<user-key>", "X-Composable-Agent": "opencode" } },
+      "rag-personal": { "type": "http", "url": "<MCP_URL>", "headers": { "X-API-Key": "<user-key>" } }
+    }
+  }
+}
+```
+
+Platform agents (composable-agents) inject the header automatically at tool-load time; the built-in assistant always uses `personal`.
+
+### RAG spaces API (`rag_spaces`)
+
+Workspace records live in the RLS-protected `rag_spaces` table (migration `005_create_rag_spaces_table`, unique `(user_id, agent_slug)`); a space is auto-created lazily on first scoped use and every composed `working_dir` is tracked so delete cascades can drop its pgvector tables.
+
+```bash
+# Idempotently provision a space (200 on existing)
+curl -X POST https://<host>/api/v1/spaces \
+  -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
+  -d '{"agent_slug": "opencode"}'
+
+# List the caller's spaces
+curl https://<host>/api/v1/spaces -H "Authorization: Bearer <token>"
+
+# Cascade-delete a space: MinIO objects under {user_id}/{agent_slug}/,
+# tracked classical_rag_* tables and the record (404 if it never existed)
+curl -X DELETE https://<host>/api/v1/spaces/opencode -H "Authorization: Bearer <token>"
+```
+
+Invalid slugs (`personal`, non-matching charset) are rejected with 422; per-user live-space count is capped (`MAX_SPACES_PER_USER`). The composable-agents agent lifecycle provisions/deprovisions these spaces automatically.
+
+### Scoped memories tools + data migration
+
+The dedicated Memories MCP server exposes four tools — `save_memory`, `list_memories`, `get_memory`, `delete_memory` — all resolving the caller scope from `X-Composable-Agent` (see above): agent memories are stored at `/memories/{agent_slug}/{name}.md` and validated with the same slug rule (one segment; deeper nesting rejected).
+
+Pre-existing (pre-feature) data must be migrated so it lands in the `personal` tree — a maintenance-window task, run **after deploying** this backend and **before** composable-agents (deployment order):
+
+```bash
+# 1. Dry-run first (default) — prints the report, mutates nothing
+uv run python scripts/migrate_scopes.py
+
+# 2. Review the report (untagged objects are moved to _unscoped/ and listed)
+
+# 3. Execute
+uv run python scripts/migrate_scopes.py --apply
+```
+
+The script moves mapped MinIO objects to `{user_id}/personal/…`, carries chunks (content + embeddings + metadata) into the recomposed tables so queries keep working, drops the old tables, and ignores `chat_tmp/` objects.
 
 ### Shared tables
 
@@ -1120,6 +1178,10 @@ Since branch `feat/dual-auth-rls-llm-peruser`, the `mcp_servers` table is **row-
 - **Migration 003** runs `ALTER TABLE mcp_servers ENABLE ROW LEVEL SECURITY` + `FORCE ROW LEVEL SECURITY` and creates a policy `mcp_servers_user_isolation` that restricts rows to `user_id = current_setting('app.user_id')`.
 
 `McpRegistryStore` sets the GUC `app.user_id = <current_user_id>` on the asyncpg connection before any query, so every read/write is automatically scoped to the authenticated user. The middleware resolves `current_user_id` from JWT or per-user API key (see [Authentication](#authentication)).
+
+#### Legacy master-key fallback (deployment control)
+
+When dual-auth is **not wired** (no `LOGTO_URL` / asyncpg pool) the service falls back to the legacy master-key check (`X-API-Key`), which sets **no user context**. In that mode the per-user/per-agent scope isolation of the file/RAG surfaces is **inactive** — requests run against the pre-feature unscoped storage layout. This is a deployment-controlled escape hatch for dev/test, not a production configuration: production must wire the `AuthService` in the lifespan (which happens before uvicorn serves) so every authenticated request carries its user identity and every file/RAG/memory operation is composed under the caller's `{user_id}/{agent_slug}/` scope. Fail-closed hardening (refusing unscoped file ops when dual-auth is unwired, behind an explicit flag) is tracked as a future iteration.
 
 **BUG-001 fix:** the `ON CONFLICT (name) DO UPDATE` upsert is scoped by `user_id`. If user A creates a server named `weather` and user B tries to create another `weather`, the conflict check only matches A's row through RLS, so B's insert is **not** a conflict — it creates a new row. If B already has a `weather` row, the upsert updates B's own row. There is **no silent cross-user overwrite**. A duplicate-name conflict within the same user returns `409 Conflict`.
 

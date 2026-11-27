@@ -25,11 +25,15 @@ from dependencies import (
     get_list_files_use_case,
     get_list_folders_use_case,
     get_read_file_use_case,
+    get_request_agent_scope,
     get_upload_file_use_case,
+    track_space_usage,
 )
 from domain.constants import DEFAULT_WORKING_DIR
+from domain.entities.agent_scope import AgentScope
 from domain.errors.file import FileTooLargeError, FileValidationError
 from domain.errors.messages import ErrorMessage
+from domain.logging.messages import LogMessage
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +133,35 @@ def _validate_delete_prefix(prefix: str) -> str:
     return normalized
 
 
+def _scoped_prefix(prefix: str) -> str:
+    """Compose the storage prefix under the caller's scope (legacy fallback).
+
+    The caller-scope composition (scope-rag-memories REQ-003) applies ONLY
+    when the request carries an authenticated identity: with no user context
+    the legacy (unscoped) behaviour is preserved so the existing dev path
+    keeps working. The client-supplied relative part MUST already be
+    validated (``_validate_prefix`` traversal rules run BEFORE composition).
+
+    **SECURITY NOTE (security review FINDING-2, deployment control):** the
+    unscoped legacy path is reachable ONLY while dual-auth is NOT wired (an
+    authenticated request always has a non-empty ``current_user_id`` — the
+    legacy master-key fallback sets none). Production MUST wire the
+    ``AuthService``; failing closed on unwired dual-auth at the router level
+    is the recommended future hardening (see ``security.verify_credentials``).
+
+    Args:
+        prefix: The validated client-relative prefix.
+
+    Returns:
+        The prefix relative to the caller's scope, or the unchanged input in
+        the legacy path.
+    """
+    scope: AgentScope = get_request_agent_scope()
+    if not scope.user_id:
+        return prefix
+    return scope.scoped_prefix(prefix)
+
+
 @file_router.get(
     "/files/list",
     status_code=status.HTTP_200_OK,
@@ -143,7 +176,14 @@ async def list_files(
     prefix: str = "",
     recursive: bool = True,
 ) -> list[FileInfoResponse]:
-    prefix = _validate_prefix(prefix)
+    """List files under the caller's scoped prefix (REQ-003/REQ-005).
+
+    The client ``prefix`` is validated as a relative path first, then
+    composed under ``<user_id>/<agent_slug>/`` — a scope prefix never matches
+    another user's or another agent's objects.
+    """
+    prefix = _scoped_prefix(_validate_prefix(prefix))
+    track_space_usage()
     files = await use_case.execute(prefix=prefix, recursive=recursive)
     return [FileInfoResponse(**asdict(f)) for f in files]
 
@@ -161,8 +201,18 @@ async def list_folders(
     use_case: Annotated[ListFoldersUseCase, Depends(get_list_folders_use_case)],
     prefix: str = "",
 ) -> list[str]:
-    prefix = _validate_prefix(prefix)
-    return await use_case.execute(prefix=prefix)
+    """List folders under the caller's scoped prefix (REQ-003/REQ-005).
+
+    The returned folder names are relative to the caller's scope (the full
+    bucket keys never leak outside the scope).
+    """
+    prefix = _scoped_prefix(_validate_prefix(prefix))
+    track_space_usage()
+    folders = await use_case.execute(prefix=prefix)
+    scope: AgentScope = get_request_agent_scope()
+    if scope.user_id:
+        return scope.relativize_folders(folders)
+    return folders
 
 
 @file_router.post(
@@ -178,7 +228,13 @@ async def read_file(
     request: ReadFileRequest,
     use_case: Annotated[ReadFileUseCase, Depends(get_read_file_use_case)],
 ) -> FileContentResponse:
-    result = await use_case.execute(file_path=request.file_path)
+    """Read one file under the caller's scoped object path (REQ-003/REQ-005)."""
+    file_path = request.file_path
+    scope: AgentScope = get_request_agent_scope()
+    if scope.user_id:
+        file_path = scope.scoped_object_path(file_path)
+    track_space_usage()
+    result = await use_case.execute(file_path=file_path)
     return FileContentResponse(
         content=result.content,
         metadata=result.metadata,
@@ -200,17 +256,18 @@ async def upload_file(
     file: Annotated[UploadFile, File(description="The file to upload")],
     prefix: Annotated[str, Form(description="Optional prefix/folder")] = "",
 ):
-    normalized = posixpath.normpath(prefix.replace("\\", "/"))
-    if normalized == ".":
-        normalized = ""
-    if normalized.startswith("..") or posixpath.isabs(normalized):
-        raise FileValidationError(ErrorMessage.PREFIX_MUST_BE_RELATIVE_SHORT)
-    if prefix.endswith("/") and not normalized.endswith("/"):
-        normalized += "/"
+    """Upload one file under the caller's scoped prefix (REQ-003)."""
+    # Code-review 🟡-8: one shared relative-path validator for every upload
+    # entry point (the previously inlined copy had drifted from the helper's
+    # message); traversal/absolute prefixes surface as 422 either way.
+    normalized = _validate_prefix(prefix)
 
     safe_name = _sanitize_filename(file.filename)
     content_type = file.content_type or "application/octet-stream"
     _validate_file_type(safe_name, content_type)
+
+    scope: AgentScope = get_request_agent_scope()
+    scoped_prefix = scope.scoped_prefix(normalized) if scope.user_id else normalized
 
     file_data = await file.read()
     if len(file_data) > MAX_UPLOAD_SIZE:
@@ -218,10 +275,11 @@ async def upload_file(
             ErrorMessage.FILE_TOO_LARGE.format(max_mb=MAX_UPLOAD_SIZE // (1024 * 1024))
         )
 
+    track_space_usage()
     result = await use_case.execute(
         file_data=file_data,
         file_name=safe_name,
-        prefix=normalized,
+        prefix=scoped_prefix,
         content_type=content_type,
     )
     return {
@@ -244,7 +302,16 @@ async def create_folder(
     request: CreateFolderRequest,
     use_case: Annotated[CreateFolderUseCase, Depends(get_create_folder_use_case)],
 ):
-    result = await use_case.execute(prefix=request.prefix)
+    """Create a folder marker under the caller's scoped prefix (REQ-003).
+
+    The relative prefix is validated like every other file op (traversal /
+    absolute rejection on the client-supplied part BEFORE scope composition —
+    security FINDING-1), so a composed marker key can never carry residual
+    ``..`` segments that would be undeletable through the delete routes.
+    """
+    prefix = _scoped_prefix(_validate_prefix(request.prefix))
+    track_space_usage()
+    result = await use_case.execute(prefix=prefix)
     return {"message": "Folder created", "prefix": result}
 
 
@@ -260,18 +327,55 @@ async def create_folder(
 async def delete_file(
     use_case: Annotated[DeleteFileUseCase, Depends(get_delete_file_use_case)],
     object_name: str = "",
-    working_dir: str = "",
+    working_dir: str | None = None,
 ):
+    """Delete one file and cascade its vectors under the caller's scope (REQ-003).
+
+    The ``working_dir`` parameter distinguishes ABSENT from explicitly EMPTY
+    (code-review iteration-5, the composable-ui contract), INSIDE a scope:
+    absent keeps the ``default-composable`` fallback composed under the
+    caller's scope (old REST clients — the deployment order requirement),
+    while an explicitly-empty value composes the caller's SCOPE ROOT
+    namespace — the identical normalization the classical query and index
+    paths apply to an empty ``working_dir``. The unauthenticated legacy path
+    is preserved verbatim (absent and empty both fall back to
+    ``default-composable``).
+    """
     object_name = _validate_object_path(object_name)
-    if working_dir and working_dir.strip():
-        working_dir = _validate_prefix(working_dir)
+    scope: AgentScope = get_request_agent_scope()
+    if scope.user_id:
+        if working_dir is None:
+            # ABSENT: the legacy ``default-composable`` fallback, composed
+            # under the caller's scope (old REST clients — deployment order).
+            logger.warning(
+                LogMessage.DELETE_FILE_WORKING_DIR_FALLBACK, DEFAULT_WORKING_DIR
+            )
+            effective = scope.scoped_working_dir(DEFAULT_WORKING_DIR)
+        else:
+            # Explicitly present (possibly EMPTY): validate + compose. An
+            # explicitly-empty value composes the caller's SCOPE ROOT
+            # namespace — the identical normalization the classical query and
+            # index paths apply to an empty ``working_dir`` (cross-repo
+            # composable-ui contract).
+            effective = scope.scoped_working_dir(_validate_prefix(working_dir))
     else:
-        logger.warning(
-            "working_dir not provided for delete_file, falling back to %s",
-            DEFAULT_WORKING_DIR,
-        )
-        working_dir = DEFAULT_WORKING_DIR
-    result = await use_case.execute(object_path=object_name, working_dir=working_dir)
+        # Legacy (unauthenticated dev path): every original behavior
+        # preserved verbatim — absent AND explicitly-empty both fall back to
+        # ``default-composable``; a supplied value is validated as-is.
+        if working_dir is None or not working_dir.strip():
+            logger.warning(
+                LogMessage.DELETE_FILE_WORKING_DIR_FALLBACK, DEFAULT_WORKING_DIR
+            )
+            effective = DEFAULT_WORKING_DIR
+        else:
+            effective = _validate_prefix(working_dir)
+    track_space_usage(working_dir=effective if scope.user_id else None)
+    scoped_object_name = (
+        scope.scoped_object_path(object_name) if scope.user_id else object_name
+    )
+    result = await use_case.execute(
+        object_path=scoped_object_name, working_dir=effective
+    )
     return {"message": "File deleted", "object_name": result}
 
 
@@ -288,6 +392,8 @@ async def delete_folder(
     use_case: Annotated[DeleteFolderUseCase, Depends(get_delete_folder_use_case)],
     prefix: str = "",
 ):
-    prefix = _validate_delete_prefix(prefix)
+    """Recursively delete one folder under the caller's scope (REQ-003)."""
+    prefix = _scoped_prefix(_validate_delete_prefix(prefix))
+    track_space_usage()
     result = await use_case.execute(prefix=prefix)
     return {"message": "Folder deleted", "prefix": result}

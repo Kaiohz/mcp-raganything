@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from domain.constants import AGENT_HEADER
 from domain.entities.auth.auth_context import AuthContext
 from domain.errors.messages import ErrorMessage
 from domain.logging.messages import LogMessage
@@ -52,7 +53,12 @@ _UNAUTHORIZED_BODY = json.dumps(
 #: (https) / ``host:80`` (http) are the same endpoint behind the proxy.
 _DEFAULT_PORT_SUFFIXES = (":443", ":80")
 
-Authenticator = Callable[[str | None, str | None], Awaitable[AuthContext | None]]
+#: ``(authorization, api_key, agent_header)`` — the agent slug header is
+#: forwarded through the SAME seam so whichever layer authenticates the
+#: request records the caller scope identically (scope-rag-memories REQ-001).
+Authenticator = Callable[
+    [str | None, str | None, str | None], Awaitable[AuthContext | None]
+]
 
 
 def _without_default_port(host: str) -> str:
@@ -176,8 +182,11 @@ class McpAuthGuard:
         app: The wrapped inner ASGI app (the FastMCP http_app behind a
             transport-security guard).
         authenticate: The dual-auth callable resolving ``(authorization,
-            api_key)`` headers into an :class:`AuthContext` (or ``None``) —
-            the wired :meth:`McpApiKeyMiddleware.authenticate_headers` seam.
+            api_key, agent_header)`` headers into an :class:`AuthContext`
+            (or ``None``) — the wired
+            :meth:`McpApiKeyMiddleware.authenticate_headers` seam (the agent
+            slug header is forwarded so the caller scope is recorded by
+            whichever layer authenticates, scope-rag-memories REQ-001).
         mount_path: This mount's public path (e.g. ``/files/mcp``). The
             guard rewrites the exact path and its trailing-slash form to
             ``/`` so the inner app serves the request DIRECTLY (REQ-015).
@@ -218,7 +227,9 @@ class McpAuthGuard:
         headers = _asgi_headers(scope)
         try:
             ctx = await self._authenticate(
-                headers.get("authorization"), headers.get("x-api-key")
+                headers.get("authorization"),
+                headers.get("x-api-key"),
+                headers.get(AGENT_HEADER),
             )
         except Exception:  # noqa: BLE001 — never leak auth internals over the wire
             logger.exception(LogMessage.MCP_REQUEST_DENIED)

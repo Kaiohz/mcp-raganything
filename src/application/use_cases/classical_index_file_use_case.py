@@ -1,6 +1,7 @@
 import contextlib
 import logging
 import os
+from collections.abc import Callable
 
 import aiofiles
 from kreuzberg import extract_file
@@ -14,6 +15,11 @@ from domain.services.classical_helpers import (
     build_documents_from_extraction,
     validate_path,
 )
+from domain.services.scope import resolve_agent_scope
+from infrastructure.database.rls_context import (
+    current_agent_scope,
+    current_user_id,
+)
 from infrastructure.document_reader.kreuzberg_adapter import make_extraction_config
 
 logger = logging.getLogger(__name__)
@@ -24,7 +30,10 @@ class ClassicalIndexFileUseCase:
 
     Downloads the file from object storage, extracts its content via
     Kreuzberg, chunks it, and adds the resulting documents to the vector
-    store for the given working directory.
+    store for the given working directory. On an authenticated request the
+    caller's scope is composed in front of BOTH the object key and the
+    working_dir before table resolution (scope-rag-memories REQ-006), and
+    the space record's ``working_dirs`` is tracked best-effort (REQ-008).
     """
 
     def __init__(
@@ -33,11 +42,13 @@ class ClassicalIndexFileUseCase:
         storage: StoragePort,
         bucket: str,
         output_dir: str,
+        space_recorder: Callable[[str], None] | None = None,
     ) -> None:
         self.vector_store = vector_store
         self.storage = storage
         self.bucket = bucket
         self.output_dir = output_dir
+        self._space_recorder = space_recorder
 
     async def execute(
         self,
@@ -49,8 +60,10 @@ class ClassicalIndexFileUseCase:
         """Download, extract, chunk, and index a single file.
 
         Args:
-            file_name: Object key in the storage bucket.
-            working_dir: Logical namespace (table suffix) in the vector store.
+            file_name: Object key in the storage bucket, relative to the
+                caller's scope when authenticated.
+            working_dir: Logical namespace (table suffix) in the vector
+                store, project level (relative to the caller's scope).
             chunk_size: Maximum characters per chunk.
             chunk_overlap: Overlap characters between adjacent chunks.
 
@@ -59,6 +72,13 @@ class ClassicalIndexFileUseCase:
         """
         file_path = None
         try:
+            user_id = current_user_id.get()
+            if user_id is not None:
+                scope = resolve_agent_scope(user_id, current_agent_scope.get())
+                working_dir = scope.scoped_working_dir(working_dir)
+                file_name = scope.scoped_object_path(file_name)
+                if self._space_recorder is not None:
+                    self._space_recorder(working_dir)
             logger.info(LogMessage.CLASSICAL_FILE_INDEX_STARTED, file_name, working_dir)
             data = await self.storage.get_object(self.bucket, file_name)
 

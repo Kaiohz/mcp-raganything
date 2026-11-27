@@ -1,6 +1,7 @@
 from typing import Literal
 
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
 
 from application.responses.classical_query_response import (
     ClassicalRagResponse,
@@ -9,6 +10,7 @@ from application.responses.classical_query_response import (
 from dependencies import (
     get_classical_query_use_case,
 )
+from domain.errors.base import DomainError
 
 mcp_classical = FastMCP("ClassicalRAG")
 
@@ -26,8 +28,13 @@ async def classical_query(
 ) -> McpClassicalRagResponse:
     """Query the classical RAG knowledge base.
 
+    The effective namespace is the caller's scope composed in front of the
+    client-supplied ``working_dir`` (``{user_id}/{agent_slug}/{working_dir}``)
+    — a project is always relative to the caller's own space.
+
     Args:
-        working_dir: RAG workspace directory for this project.
+        working_dir: RAG workspace directory for this project, relative to
+            the caller's scope.
         query: The search query.
         top_k: Maximum number of chunks to retrieve.
         num_variations: Number of query variations (multi-query).
@@ -35,18 +42,24 @@ async def classical_query(
         vector_distance_threshold: Maximum cosine distance for vector filtering.
         enable_llm_judge: Enable LLM-as-judge scoring.
         mode: Query mode - 'vector' for vector-only, 'hybrid' for BM25+vector combined.
+
+    Raises:
+        ToolError: Sanitized scope-validation or LLM-configuration failures.
     """
-    use_case = await get_classical_query_use_case()
-    response = await use_case.execute(
-        working_dir=working_dir,
-        query=query,
-        top_k=top_k,
-        num_variations=num_variations,
-        relevance_threshold=relevance_threshold,
-        vector_distance_threshold=vector_distance_threshold,
-        enable_llm_judge=enable_llm_judge,
-        mode=mode,
-    )
+    try:
+        use_case = await get_classical_query_use_case()
+        response = await use_case.execute(
+            working_dir=working_dir,
+            query=query,
+            top_k=top_k,
+            num_variations=num_variations,
+            relevance_threshold=relevance_threshold,
+            vector_distance_threshold=vector_distance_threshold,
+            enable_llm_judge=enable_llm_judge,
+            mode=mode,
+        )
+    except DomainError as error:
+        raise ToolError(error.detail) from None
     classical_response = McpClassicalRagResponse()
     for chunk in response.chunks:
         classical_response.rag_response.append(

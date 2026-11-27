@@ -177,7 +177,11 @@ class McpRegistryStore(McpServerRegistryStore):
                 user_id              = EXCLUDED.user_id,
                 auth_mode            = EXCLUDED.auth_mode;
             """
-        async with self._pool.acquire() as conn:
+        async with self._pool.acquire() as conn, conn.transaction():
+            # RLS GUC lifetime (code-review C4): the transaction-local
+            # app.user_id setting only survives INSIDE an explicit
+            # transaction — set it there, so the FORCE RLS policy on
+            # mcp_servers is actually evaluated against the caller's id.
             await set_rls_context(conn, current_user_id.get())
             result = await conn.execute(
                 sql,
@@ -242,7 +246,7 @@ class McpRegistryStore(McpServerRegistryStore):
         {where};
         """
 
-        async with self._pool.acquire() as conn:
+        async with self._pool.acquire() as conn, conn.transaction():
             await set_rls_context(conn, user_id)
             row = await conn.fetchrow(sql, *params)
 
@@ -284,7 +288,7 @@ class McpRegistryStore(McpServerRegistryStore):
         ORDER BY name;
         """
 
-        async with self._pool.acquire() as conn:
+        async with self._pool.acquire() as conn, conn.transaction():
             await set_rls_context(conn, user_id)
             rows = await conn.fetch(sql, *params)
 
@@ -316,7 +320,7 @@ class McpRegistryStore(McpServerRegistryStore):
                 belongs to another user when RLS is engaged).
         """
         user_id = current_user_id.get()
-        async with self._pool.acquire() as conn:
+        async with self._pool.acquire() as conn, conn.transaction():
             await set_rls_context(conn, user_id)
             if user_id is not None:
                 existing = await conn.fetchval(
@@ -356,7 +360,7 @@ class McpRegistryStore(McpServerRegistryStore):
             False otherwise.
         """
         user_id = current_user_id.get()
-        async with self._pool.acquire() as conn:
+        async with self._pool.acquire() as conn, conn.transaction():
             await set_rls_context(conn, user_id)
             if user_id is not None:
                 result = await conn.fetchval(

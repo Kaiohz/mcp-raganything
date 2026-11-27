@@ -10,17 +10,22 @@ from sqlalchemy import text
 
 from domain.errors.messages import ErrorMessage
 from domain.errors.vector_store import VectorStoreConfigError
+from domain.logging.messages import LogMessage
 from domain.ports.vector_store_port import SearchResult, VectorStorePort
+from domain.ports.vector_table_manager import VectorTableManagerPort
 
 logger = logging.getLogger(__name__)
 
 
-class LangchainPgvectorAdapter(VectorStorePort):
+class LangchainPgvectorAdapter(VectorStorePort, VectorTableManagerPort):
     """PGVector-backed vector store adapter using langchain-postgres.
 
     Manages per-working-dir vector tables with SHA-256-hashed names. Lazily
     initializes the PGEngine and PGVectorStore on first access for each
-    working directory.
+    working directory. Also implements the table-level lifecycle port
+    (:class:`VectorTableManagerPort`) so a space's tracked
+    ``classical_rag_*`` tables can be dropped by working_dir (scope cascade,
+    REQ-010) — the naming rule stays encapsulated in this adapter.
     """
 
     def __init__(
@@ -214,6 +219,42 @@ class LangchainPgvectorAdapter(VectorStorePort):
         count = await engine._run_as_async(_delete())
         logger.info("Vectors deleted by prefix: table=%s count=%d", table_name, count)
         return count
+
+    async def drop_table(self, working_dir: str) -> None:
+        """Drop the vector table backing ``working_dir`` (idempotent).
+
+        Uses the SAME SHA-256 naming rule as every other operation so a
+        tracked working_dir always resolves to the exact table created for
+        it. The in-memory store cache entry is dropped with the table.
+
+        Args:
+            working_dir: The tracked composed working_dir.
+
+        Raises:
+            VectorStoreConfigError: If no PGEngine could be resolved.
+        """
+        engine = self._engine
+        if engine is None:
+            if self._connection_string:
+                engine = PGEngine.from_connection_string(self._connection_string)
+                self._engine = engine
+            else:
+                raise VectorStoreConfigError(
+                    ErrorMessage.VECTOR_STORE_NOT_INITIALIZED.format(
+                        working_dir=working_dir
+                    )
+                )
+        table_name = self._get_table_name(working_dir)
+        stmt = text(f'DROP TABLE IF EXISTS "{table_name}"')
+        logger.info(LogMessage.SPACE_TABLE_DROPPED, working_dir)
+
+        async def _drop() -> None:
+            async with engine._pool.connect() as conn:
+                await conn.execute(stmt)
+                await conn.commit()
+
+        await engine._run_as_async(_drop())
+        self._stores.pop(working_dir, None)
 
     async def close(self) -> None:
         if self._engine is not None:

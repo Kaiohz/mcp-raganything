@@ -1,6 +1,7 @@
 import contextlib
 import logging
 import os
+from collections.abc import Callable
 from pathlib import Path
 
 import aiofiles
@@ -20,6 +21,11 @@ from domain.services.classical_helpers import (
     build_documents_from_extraction,
     validate_path,
 )
+from domain.services.scope import resolve_agent_scope
+from infrastructure.database.rls_context import (
+    current_agent_scope,
+    current_user_id,
+)
 from infrastructure.document_reader.kreuzberg_adapter import make_extraction_config
 
 logger = logging.getLogger(__name__)
@@ -30,7 +36,11 @@ class ClassicalIndexFolderUseCase:
 
     Iterates over objects under a prefix, extracts and chunks each file,
     and adds the documents to the vector store. Reports per-file status
-    (SUCCESS / FAILED / PARTIAL) with aggregated stats.
+    (SUCCESS / FAILED / PARTIAL) with aggregated stats. On an authenticated
+    request the caller's scope is composed in front of the working_dir
+    BEFORE the table resolution and the storage listing
+    (scope-rag-memories REQ-006), and the space record's ``working_dirs`` is
+    tracked best-effort (REQ-008).
     """
 
     def __init__(
@@ -39,11 +49,13 @@ class ClassicalIndexFolderUseCase:
         storage: StoragePort,
         bucket: str,
         output_dir: str,
+        space_recorder: Callable[[str], None] | None = None,
     ) -> None:
         self.vector_store = vector_store
         self.storage = storage
         self.bucket = bucket
         self.output_dir = output_dir
+        self._space_recorder = space_recorder
 
     async def _process_file(
         self,
@@ -144,6 +156,13 @@ class ClassicalIndexFolderUseCase:
         Returns:
             FolderIndexingResult with per-file details and aggregated stats.
         """
+        user_id = current_user_id.get()
+        if user_id is not None:
+            scope = resolve_agent_scope(user_id, current_agent_scope.get())
+            working_dir = scope.scoped_working_dir(working_dir)
+            if self._space_recorder is not None:
+                self._space_recorder(working_dir)
+
         logger.info(LogMessage.CLASSICAL_FOLDER_INDEX_STARTED, working_dir, recursive)
         await self.vector_store.ensure_table(working_dir)
 
