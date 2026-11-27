@@ -548,13 +548,28 @@ class MinioConfig(BaseSettings):
 
 
 class WebSearchConfig(BaseSettings):
-    """Bounded DuckDuckGo (DDGS) execution limits.
+    """Bounded search execution limits and provider backend selection.
 
     All values are per-Python-process; they do not coordinate across Uvicorn
-    workers or replicas. No character/output-size setting exists here or
-    anywhere in the web-search configuration by design.
+    workers or replicas. ``WEB_SEARCH_BACKENDS`` is an ordered ddgs backend
+    list (comma-separated env var): the first backend returning entries wins,
+    so production can ride out one provider's anti-bot challenges. The
+    ``WEB_SEARCH_PAGE_MAX_CHARS`` cap bounds the exploration output size
+    (0 disables the cap and restores the complete-Markdown contract).
     """
 
+    WEB_SEARCH_BACKENDS: Annotated[list[str], NoDecode] = Field(
+        default=["duckduckgo"],
+        description="Ordered ddgs backends tried per search, comma-separated "
+        "(e.g. 'google,duckduckgo'). The first backend returning entries "
+        "wins; present-but-empty falls back to the first default entry.",
+    )
+    WEB_SEARCH_PAGE_MAX_CHARS: int = Field(
+        default=0,
+        ge=0,
+        description="Per-explored-page Markdown cap in characters. 0 "
+        "disables the cap (complete Crawl4AI Markdown contract preserved).",
+    )
     WEB_SEARCH_EXECUTOR_WORKERS: int = Field(
         default=4,
         ge=1,
@@ -571,8 +586,25 @@ class WebSearchConfig(BaseSettings):
         default=10.0,
         gt=0,
         description="Outer asyncio timeout (seconds) around the complete "
-        "search operation (capacity wait included).",
+        "search operation (capacity wait and the full backend fallback "
+        "chain included).",
     )
+
+    @pydantic_field_validator("WEB_SEARCH_BACKENDS", mode="before")
+    @classmethod
+    def _coerce_backend_list(cls, value: object) -> object:
+        """Coerce the ``WEB_SEARCH_BACKENDS`` comma-separated env value.
+
+        A present-but-empty value falls back to the first default entry: no
+        backend would mean a permanently empty search, so startup with the
+        documented default is safer than a silent outage.
+        """
+        parsed = _coerce_csv_list_value(
+            value, field_name="WEB_SEARCH_BACKENDS", refuse_empty=False
+        )
+        if isinstance(parsed, list) and not parsed:
+            return ["duckduckgo"]
+        return parsed
 
 
 class CrawlConfig(BaseSettings):

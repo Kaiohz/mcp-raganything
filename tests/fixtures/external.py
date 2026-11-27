@@ -173,6 +173,17 @@ class FakeDDGS:
         try:
             if owner.search_gate is not None:
                 owner.search_gate.wait()
+            # Per-backend override (fallback tests): a list replaces the
+            # shared results and a BaseException replaces the shared error
+            # for THAT backend only — other backends behave as configured.
+            try:
+                backend_override = owner.backends_results[kwargs.get("backend")]
+            except KeyError:
+                backend_override = None
+            if isinstance(backend_override, BaseException):
+                raise backend_override
+            if backend_override is not None:
+                return copy.deepcopy(backend_override)
             if owner.search_error is not None:
                 raise owner.search_error
             return copy.deepcopy(owner.search_results)
@@ -246,6 +257,7 @@ class WebExternal:
         self.search_error: BaseException | None = None
         self.search_gate: threading.Event | None = None
         self.dns_answers: dict[str, list[str]] = {}
+        self.backends_results: dict[str, list[dict] | BaseException] = {}
         self.reset()
 
     def reset(self) -> None:
@@ -264,6 +276,7 @@ class WebExternal:
         self.crawl_failures = {}
         self.crawl_delays = {}
         self.dns_answers = {}
+        self.backends_results = {}
 
     @property
     def crawler_count(self) -> int:

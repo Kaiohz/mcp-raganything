@@ -33,8 +33,11 @@ class WebCrawlOutcome(BaseModel):
         url: The URL that was selected for exploration (validated as safe).
         status: ``not_explored`` / ``success`` / ``failed``.
         final_url: Last validated URL when known, otherwise None.
-        markdown: Complete Crawl4AI Markdown for successful pages, "" when the
-            page had no content. Never truncated; always None unless success.
+        markdown: Crawl4AI Markdown for successful pages, "" when the page
+            had no content. Never truncated unless ``truncated`` is True
+            (``WEB_SEARCH_PAGE_MAX_CHARS`` cap). Always None unless success.
+        truncated: True when the Markdown was cut at the configured
+            per-page character cap (False when no cap applies).
         error: Safe, concise failure reason (no provider internals).
     """
 
@@ -42,6 +45,7 @@ class WebCrawlOutcome(BaseModel):
     status: WebCrawlStatus
     final_url: str | None = None
     markdown: str | None = None
+    truncated: bool = False
     error: str | None = None
 
 

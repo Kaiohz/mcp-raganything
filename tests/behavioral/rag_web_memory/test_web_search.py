@@ -7,6 +7,10 @@ from unittest.mock import AsyncMock
 import pytest
 from mcp.shared.exceptions import McpError
 
+from infrastructure.web_search.crawl4ai_adapter import Crawl4AIWebCrawlerAdapter
+from infrastructure.web_search.ddgs_adapter import DDGSSearchAdapter
+from infrastructure.web_search.url_safety.adapter import UrlSafetyAdapter
+
 pytestmark = pytest.mark.asyncio(loop_scope="session")
 
 WEB_MOUNT = "/web/mcp"
@@ -79,7 +83,13 @@ async def test_web_mount_exposes_only_the_approved_tool_without_starting_chromiu
     crawl_properties = output_properties["results"]["items"]["properties"]["crawl"][
         "properties"
     ]
-    assert set(crawl_properties) == {"status", "final_url", "markdown", "error"}
+    assert set(crawl_properties) == {
+        "status",
+        "final_url",
+        "markdown",
+        "truncated",
+        "error",
+    }
     assert crawl_properties["status"]["enum"] == [
         "not_explored",
         "success",
@@ -178,6 +188,7 @@ async def test_search_uses_duckduckgo_maps_results_and_streams_one_batch(
         "status": "not_explored",
         "final_url": None,
         "markdown": None,
+        "truncated": False,
         "error": None,
     }
 
@@ -230,6 +241,166 @@ async def test_empty_search_returns_empty_response_without_crawler(
     assert response_body(result) == {"query": "no results", "results": []}
     assert web_external.crawl_batches == []
     assert web_external.crawler_count == initial_crawlers
+
+
+async def test_backend_fallback_uses_first_non_empty_backend(
+    mcp_call, web_external, monkeypatch
+):
+    """The ordered backend chain rides out a single provider's challenge: a
+    cleanly-empty first backend is skipped and the next one supplies results."""
+    monkeypatch.setattr(
+        "dependencies.web_search_adapter",
+        DDGSSearchAdapter(
+            timeout_seconds=5,
+            max_concurrency=2,
+            executor_workers=2,
+            backends=["google", "duckduckgo"],
+        ),
+    )
+    web_external.backends_results = {"google": []}
+    web_external.search_results = provider_results(2)
+
+    result = await mcp_call(
+        WEB_MOUNT, "web_search", {"query": "fallback", "explore_top_n": 0}
+    )
+
+    body = response_body(result)
+    assert result.is_error is False
+    assert [call["kwargs"]["backend"] for call in web_external.search_calls] == [
+        "google",
+        "duckduckgo",
+    ]
+    assert [item["url"] for item in body["results"]] == [
+        "https://example.com/1",
+        "https://example.com/2",
+    ]
+
+
+async def test_backend_fallback_continues_after_a_provider_error(
+    mcp_call, web_external, monkeypatch
+):
+    """A hard backend failure is logged and skipped, never surfaced while a
+    later backend still supplies entries."""
+    monkeypatch.setattr(
+        "dependencies.web_search_adapter",
+        DDGSSearchAdapter(
+            timeout_seconds=5,
+            max_concurrency=2,
+            executor_workers=2,
+            backends=["google", "duckduckgo"],
+        ),
+    )
+    web_external.backends_results = {"google": RuntimeError("connect boom")}
+    web_external.search_results = provider_results(1)
+
+    result = await mcp_call(
+        WEB_MOUNT, "web_search", {"query": "resilience", "explore_top_n": 0}
+    )
+
+    body = response_body(result)
+    assert result.is_error is False
+    assert [call["kwargs"]["backend"] for call in web_external.search_calls] == [
+        "google",
+        "duckduckgo",
+    ]
+    assert [item["title"] for item in body["results"]] == ["Result 1"]
+
+
+async def test_all_backends_clean_empty_maps_to_empty_results(
+    mcp_call, web_external, monkeypatch
+):
+    """When the whole chain answers cleanly-but-empty the genuine-empty
+    contract (AC-22) still maps to an empty response, not an error."""
+    monkeypatch.setattr(
+        "dependencies.web_search_adapter",
+        DDGSSearchAdapter(
+            timeout_seconds=5,
+            max_concurrency=2,
+            executor_workers=2,
+            backends=["google", "duckduckgo"],
+        ),
+    )
+    web_external.backends_results = {"google": [], "duckduckgo": []}
+
+    result = await mcp_call(
+        WEB_MOUNT, "web_search", {"query": "genuinely empty", "explore_top_n": 0}
+    )
+
+    assert result.is_error is False
+    assert response_body(result)["results"] == []
+    assert [call["kwargs"]["backend"] for call in web_external.search_calls] == [
+        "google",
+        "duckduckgo",
+    ]
+
+
+async def test_all_backends_failing_surface_sanitized_provider_error(
+    mcp_call, web_external, error_text, monkeypatch
+):
+    """No clean backend run at all: the LAST backend failure propagates and is
+    sanitized like the single-backend provider failure it replaces."""
+    monkeypatch.setattr(
+        "dependencies.web_search_adapter",
+        DDGSSearchAdapter(
+            timeout_seconds=5,
+            max_concurrency=2,
+            executor_workers=2,
+            backends=["google", "duckduckgo"],
+        ),
+    )
+    web_external.backends_results = {
+        "google": RuntimeError("private backend detail"),
+        "duckduckgo": TimeoutError("socket 10.0.0.8"),
+    }
+
+    result = await mcp_call(
+        WEB_MOUNT, "web_search", {"query": "outage", "explore_top_n": 0}
+    )
+
+    message = error_text(result)
+    assert result.is_error is True
+    assert len(message) < 500
+    assert "private backend detail" not in message
+    assert "10.0.0.8" not in message
+    assert [call["kwargs"]["backend"] for call in web_external.search_calls] == [
+        "google",
+        "duckduckgo",
+    ]
+
+
+async def test_crawler_page_cap_truncates_markdown_and_flags_it(
+    mcp_call, web_external, monkeypatch
+):
+    """A configured ``WEB_SEARCH_PAGE_MAX_CHARS`` cap cuts every successful
+    page at the bound and flags the outcome ``truncated`` (context
+    protection); 0 keeps the complete-Markdown contract (see the exact-markdown
+    test above)."""
+    monkeypatch.setattr(
+        "dependencies.web_crawler_adapter",
+        Crawl4AIWebCrawlerAdapter(
+            max_concurrent_batches=1,
+            max_sessions_per_batch=1,
+            memory_threshold_percent=80,
+            page_timeout_ms=20_000,
+            overall_timeout_seconds=5,
+            rate_limit_min_delay_seconds=0.05,
+            rate_limit_max_delay_seconds=0.1,
+            url_safety=UrlSafetyAdapter(),
+            max_page_chars=50,
+        ),
+    )
+    web_external.search_results = provider_results(1)
+    markdown = "x" * 200
+    web_external.markdown_by_url["https://example.com/1"] = markdown
+
+    result = await mcp_call(
+        WEB_MOUNT, "web_search", {"query": "capped", "explore_top_n": 1}
+    )
+
+    crawl = response_body(result)["results"][0]["crawl"]
+    assert crawl["status"] == "success"
+    assert crawl["markdown"] == "x" * 50
+    assert crawl["truncated"] is True
 
 
 @pytest.mark.parametrize(
@@ -323,7 +494,7 @@ async def test_successful_empty_markdown_is_not_converted_to_failure(
     assert crawl["error"] is None
 
 
-async def test_long_unicode_markdown_is_exact_and_has_no_truncation_fields(
+async def test_long_unicode_markdown_is_exact_and_untruncated_without_a_cap(
     mcp_call, web_external
 ):
     web_external.search_results = provider_results(1)
@@ -336,10 +507,16 @@ async def test_long_unicode_markdown_is_exact_and_has_no_truncation_fields(
     item = body["results"][0]
     assert item["crawl"]["markdown"] == markdown
     assert item["crawl"]["markdown"].endswith("END-MARKER")
+    assert item["crawl"]["truncated"] is False
     assert set(item) == {"title", "url", "snippet", "crawl"}
-    assert set(item["crawl"]) == {"status", "final_url", "markdown", "error"}
+    assert set(item["crawl"]) == {
+        "status",
+        "final_url",
+        "markdown",
+        "truncated",
+        "error",
+    }
     assert "chars" not in str(body)
-    assert "truncated" not in str(body)
 
 
 @pytest.mark.parametrize(

@@ -270,11 +270,15 @@ class LogMessage(StrEnum):
     )
     WEB_SEARCH_VALIDATION_REJECTED = "Web search validation rejected the arguments"
     WEB_SEARCH_PROVIDER_FAILED = "Web search provider call failed"
-    WEB_SEARCH_PROVIDER_NO_RESULTS = (
-        "Provider returned no results (max_results=%d): this may be either a "
-        "genuinely empty result set or an anti-bot challenge / network block "
-        "(ddgs collapses both into 'No results found.'), retry or verify "
-        "outbound access to the DuckDuckGo html endpoint."
+    WEB_SEARCH_BACKEND_NO_RESULTS = (
+        "ddgs backend %s returned no results (max_results=%d): this may be "
+        "either a genuinely empty result set or an anti-bot challenge / "
+        "network block (ddgs collapses both into 'No results found.'); "
+        "trying the next backend"
+    )
+    WEB_SEARCH_BACKEND_FAILED = (
+        "ddgs backend %s failed; trying the next backend "
+        "(details are never logged)"
     )
     WEB_SEARCH_UNEXPECTED = "Unexpected web search failure"
     WEB_SEARCH_TIMED_OUT = "Web search timed out after %.2fs"
