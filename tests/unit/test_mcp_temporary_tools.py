@@ -118,6 +118,9 @@ class TestTemporaryUploadFile:
 
         result = await _upload()
 
+        # The tool RETURNS the client-relative path; the STORAGE key is
+        # composed under the caller's scope (write side == read side of the
+        # agent-facing tools, scope-rag-memories REQ-003).
         expected_object = f"{AUTHORIZED_PREFIX}rapport.pdf"
         assert result["object_name"] == expected_object
         assert result["size"] == len(PDF_BYTES)
@@ -126,8 +129,9 @@ class TestTemporaryUploadFile:
             0
         ] or storage_mock.put_object.call_args.kwargs.get("bucket")
         assert bucket == "raganything", storage_mock.put_object.call_args
+        scoped_key = f"user-a/personal/{expected_object}"
         assert storage_mock.put_object.call_args.args[1:4] == (
-            expected_object,
+            scoped_key,
             PDF_BYTES,
             "application/pdf",
         )
@@ -226,7 +230,9 @@ class TestTemporaryDeleteFile:
 
         storage_mock.remove_object.assert_called_once()
         args, kwargs = storage_mock.remove_object.call_args
-        assert args[1] == object_path or kwargs.get("object_path") == object_path
+        # The REMOVE composes the caller's scope (the write side is scoped).
+        expected_scoped = f"user-a/personal/{object_path}"
+        assert args[1] == expected_scoped or kwargs.get("object_path") == expected_scoped
         assert "deleted" in str(result).lower() or bool(result)
 
     async def test_refuses_paths_outside_the_authorized_prefix(

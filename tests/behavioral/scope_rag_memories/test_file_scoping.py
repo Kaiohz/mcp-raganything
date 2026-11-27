@@ -403,10 +403,12 @@ async def test_files_mount_still_exposes_the_public_file_tools(mcp_list):
 # ---------------------------------------------------------------------------
 
 
-async def test_temporary_upload_keeps_the_chat_tmp_user_prefix_unscoped(
+async def test_temporary_upload_composes_the_caller_scope_before_chat_tmp(
     mcp_call, storage_external
 ):
-    """`chat_tmp/<user_id>/...` keeps its dedicated policy — no agent slug."""
+    """chat_tmp rides the CALLER'S scope (write == read of the agent-facing
+    file tools, scope-rag-memories REQ-003): the scoped composition applies
+    in front of the RELATIVE chat_tmp prefix."""
     result = await mcp_call(
         FILES_MOUNT,
         "temporary_upload_file",
@@ -423,7 +425,8 @@ async def test_temporary_upload_keeps_the_chat_tmp_user_prefix_unscoped(
     stored = storage_external.calls_for("put_object")
     assert (
         stored
-        and stored[-1]["object_path"] == "chat_tmp/user-alice/session-1/attachment.txt"
+        and stored[-1]["object_path"]
+        == "user-alice/agent-x/chat_tmp/user-alice/session-1/attachment.txt"
     )
 
 
@@ -446,10 +449,11 @@ async def test_temporary_upload_still_rejects_another_users_chat_tmp_prefix(
     assert storage_external.calls_for("put_object") == []
 
 
-async def test_temporary_delete_still_scoped_to_chat_tmp_without_agent_composition(
+async def test_temporary_delete_composes_the_caller_scope_like_the_write_side(
     mcp_call, storage_external
 ):
-    storage_external.seed({"chat_tmp/user-alice/session-1/attachment.txt": b"hello"})
+    scoped_name = "user-alice/agent-x/chat_tmp/user-alice/session-1/attachment.txt"
+    storage_external.seed({scoped_name: b"hello"})
 
     result = await mcp_call(
         FILES_MOUNT,
@@ -460,11 +464,7 @@ async def test_temporary_delete_still_scoped_to_chat_tmp_without_agent_compositi
 
     assert result.is_error is False, error_text(result)
     removals = storage_external.calls_for("remove_object")
-    assert (
-        removals
-        and removals[-1]["object_path"]
-        == "chat_tmp/user-alice/session-1/attachment.txt"
-    )
+    assert removals and removals[-1]["object_path"] == scoped_name
 
 
 async def test_temporary_upload_of_disallowed_type_still_rejected(

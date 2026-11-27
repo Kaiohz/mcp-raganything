@@ -135,17 +135,26 @@ async def temporary_upload_file(
         logger.warning(LogMessage.TEMP_UPLOAD_REJECTED, user_id, exc)
         raise ToolError(str(exc)) from None
 
+    # SCOPE COMPOSITION (scope-rag-memories REQ-003): the temp object is
+    # written under the CALLER'S scope root (<user>/<agent>/...) so the
+    # regular agent-facing file tools (list/read, which are ALWAYS scoped)
+    # can resolve it. Without the composition the upload lands OUTSIDE the
+    # caller's scope and the agent reads 404 NoSuchKey. The RELATIVE
+    # (client) path is still what the tool RETURNS.
+    relative_prefix = normalized_prefix
+    scoped_prefix = _scoped_prefix(normalized_prefix)
+
     # REQ-032: reuse the REAL UploadFileUseCase and the existing RustFS storage.
     use_case = get_upload_file_use_case()
     file_info = await use_case.execute(
         file_data=decoded,
         file_name=safe_name,
-        prefix=normalized_prefix,
+        prefix=scoped_prefix,
         content_type=content_type,
     )
     logger.info(LogMessage.TEMP_UPLOAD_COMPLETED, file_info.object_name, len(decoded))
     return {
-        "object_name": file_info.object_name,
+        "object_name": relative_prefix + safe_name,
         "size": len(decoded),
         "content_type": content_type,
     }
@@ -178,11 +187,15 @@ async def temporary_delete_file(object_path: str) -> dict:
 
     # I2/C2 companion (REQ-035/REQ-047): plain StoragePort.remove_object — NOT
     # DeleteFileUseCase, NO pgvector cascade, NO working_dir involvement.
-    # Absent (StorageNotFoundError) is an idempotent no-op (EDG-015); a REAL
+    # The REMOVE composes the caller's scope (the upload side is scoped —
+    # without it the cleanup reads an unscoped 404 NoSuchKey). Absent
+    # (StorageNotFoundError) is an idempotent no-op (EDG-015); a REAL
     # storage failure MUST surface as a ToolError so the composable-agents
     # cleanup logs ERROR and retries exactly once (REQ-046).
     try:
-        await minio_adapter.remove_object(minio_config.MINIO_BUCKET, normalized)
+        await minio_adapter.remove_object(
+            minio_config.MINIO_BUCKET, _scoped_object_path(normalized)
+        )
     except StorageNotFoundError:
         logger.info(LogMessage.TEMP_DELETE_ABSENT, normalized, "storage-not-found")
         return {"deleted": normalized, "present": False}
