@@ -7,9 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 from mcp.shared.exceptions import McpError
 
-from infrastructure.web_search.crawl4ai_adapter import Crawl4AIWebCrawlerAdapter
 from infrastructure.web_search.ddgs_adapter import DDGSSearchAdapter
-from infrastructure.web_search.url_safety.adapter import UrlSafetyAdapter
 
 pytestmark = pytest.mark.asyncio(loop_scope="session")
 
@@ -374,21 +372,14 @@ async def test_crawler_page_cap_truncates_markdown_and_flags_it(
     """A configured ``WEB_SEARCH_PAGE_MAX_CHARS`` cap cuts every successful
     page at the bound and flags the outcome ``truncated`` (context
     protection); 0 keeps the complete-Markdown contract (see the exact-markdown
-    test above)."""
-    monkeypatch.setattr(
-        "dependencies.web_crawler_adapter",
-        Crawl4AIWebCrawlerAdapter(
-            max_concurrent_batches=1,
-            max_sessions_per_batch=1,
-            memory_threshold_percent=80,
-            page_timeout_ms=20_000,
-            overall_timeout_seconds=5,
-            rate_limit_min_delay_seconds=0.05,
-            rate_limit_max_delay_seconds=0.1,
-            url_safety=UrlSafetyAdapter(),
-            max_page_chars=50,
-        ),
-    )
+    test above). The REAL prod crawl singleton is used — only its cap
+    attribute is overridden, so the session-unique lazy-crawler contract
+    (TestShutdown above) is preserved."""
+    import dependencies
+
+    adapter = dependencies.get_web_crawler_adapter()
+    monkeypatch.setattr(adapter, "_max_page_chars", 50)
+
     web_external.search_results = provider_results(1)
     markdown = "x" * 200
     web_external.markdown_by_url["https://example.com/1"] = markdown
