@@ -97,26 +97,3 @@ jobs:
           tags: |
             kaiohz/pickpro:raganything-${{ steps.sha.outputs.result }}
             kaiohz/pickpro:raganything-latest
-
-      - name: Checkout flux repository
-        run: |
-          git clone https://x-access-token:${{ secrets.FLUX_REPO_TOKEN }}@github.com/SoluDevTech/flux.git flux-repo
-
-      - name: Update deployment image tag
-        run: |
-          DEPLOYMENT_FILE="flux-repo/prd/composables/raganything/deployment.yaml"
-          if [ -f "$DEPLOYMENT_FILE" ]; then
-            sed -i 's|image: kaiohz/pickpro:raganything-.*|image: kaiohz/pickpro:raganything-${{ steps.sha.outputs.result }}|g' "$DEPLOYMENT_FILE"
-          else
-            echo "Error: Deployment file not found at $DEPLOYMENT_FILE"
-            exit 1
-          fi
-
-      - name: Commit and push changes
-        run: |
-          cd flux-repo
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add prd/composables/raganything/deployment.yaml
-          git commit -m "Update raganything image to ${{ steps.sha.outputs.result }}" || echo "No changes to commit"
-          git push https://x-access-token:${{ secrets.FLUX_REPO_TOKEN }}@github.com/SoluDevTech/flux.git main
