@@ -25,6 +25,24 @@ import pytest
 from infrastructure.database.rls_context import current_user_id
 
 
+@pytest.fixture(autouse=True)
+def _require_agent_scope(monkeypatch):
+    """Data use cases now REQUIRE an agent scope (user × agent directive)."""
+    for module in (
+        "application.use_cases.classical_index_file_use_case",
+        "application.use_cases.classical_query_use_case",
+        "application.use_cases.classical_index_folder_use_case",
+    ):
+        import importlib
+        try:
+            mod = importlib.import_module(module)
+        except Exception:
+            continue
+        monkeypatch.setattr(mod, "require_agent_scope",
+                            lambda user, raw: __import__("domain.services.scope", fromlist=["resolve_agent_scope"]).resolve_agent_scope(user, raw or "agent-x"))
+    yield
+
+
 class TestIndexingUserIsolation:
     """Indexing use cases must tag chunks with ``user_id`` metadata."""
 

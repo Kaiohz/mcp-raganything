@@ -14,7 +14,7 @@ from domain.logging.messages import LogMessage
 from domain.ports.bm25_engine import BM25EnginePort
 from domain.ports.llm_port import LLMPort
 from domain.ports.vector_store_port import SearchResult, VectorStorePort
-from domain.services.scope import resolve_agent_scope
+from domain.services.scope import require_agent_scope
 from infrastructure.database.rls_context import (
     current_agent_scope,
     current_user_id,
@@ -79,7 +79,7 @@ class ClassicalQueryUseCase:
         user_id = current_user_id.get()
         if user_id is None:
             return None
-        scope = resolve_agent_scope(user_id, current_agent_scope.get())
+        scope = require_agent_scope(user_id, current_agent_scope.get())
         composed = scope.scoped_working_dir(working_dir)
         if self._space_recorder is not None:
             self._space_recorder(composed)

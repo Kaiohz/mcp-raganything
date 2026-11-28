@@ -115,6 +115,11 @@ class ErrorMessage(StrEnum):
         "Invalid agent scope: the '{header}' header value {value!r} does not "
         "match the required pattern ^[a-z0-9][a-z0-9-]{{0,99}}$"
     )
+    AGENT_SCOPE_REQUIRED = (
+        "Agent scope required: every data operation must carry a valid "
+        "'{header}' value (user × agent scoping; the personal namespace is a "
+        "system-internal fallback and is not available to callers)."
+    )
     SPACE_NOT_FOUND = "RAG space not found for agent '{agent_slug}'."
     SPACE_AGENT_SLUG_RESERVED = (
         "The agent slug '{agent_slug}' is reserved and cannot be stored as a "

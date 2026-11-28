@@ -87,19 +87,18 @@ async def test_mcp_query_composes_working_dir_with_scope_and_user_filter(
         assert metadata_filter == {"user_id": "user-alice"}
 
 
-async def test_mcp_query_without_header_queries_the_personal_root_namespace(
-    mcp_call, rag_boundaries
-):
+async def test_mcp_query_without_header_is_rejected(mcp_call, rag_boundaries):
+    """User × agent directive: classical operations REQUIRE an agent scope."""
     result = await mcp_call(
         "/classical/mcp",
         "classical_query",
-        {"working_dir": "", "query": "personal docs", "enable_llm_judge": False},
+        {"working_dir": "", "query": "anything", "enable_llm_judge": False},
         headers=ALICE,
     )
 
-    assert result.is_error is False
-    searches = similarity_searches(rag_boundaries)
-    assert searches and {payload[0] for payload in searches} == {COMPOSED_PERSONAL_ROOT}
+    assert result.is_error is True
+    assert "agent scope required" in error_text(result).lower()
+    assert similarity_searches(rag_boundaries) == []
 
 
 # ---------------------------------------------------------------------------
@@ -155,7 +154,11 @@ async def test_agent_y_querying_p1_gets_zero_chunks_from_agent_x_corpus(
     assert [chunk["content"] for chunk in own_chunks] == ["agent-x internal roadmap"]
 
 
-async def test_personal_scope_cannot_reach_an_agent_corpus(mcp_call, rag_boundaries):
+async def test_the_personal_namespace_is_unreachable_from_agent_scopes(
+    mcp_call, rag_boundaries
+):
+    """The personal corpus (legacy data) never leaks into agent scopes — the
+    scope is REQUIRED, so an unscoped request cannot reach it either."""
     vector = rag_boundaries
     vector.seed_namespace(
         COMPOSED_AGENT_X_P1,
@@ -171,15 +174,26 @@ async def test_personal_scope_cannot_reach_an_agent_corpus(mcp_call, rag_boundar
         [("personal p1 chunk", "docs/p.txt", {"user_id": "user-alice"})],
     )
 
+    # An agent-x query sees ONLY agent-x data (never the personal corpus).
     result = await mcp_call(
+        "/classical/mcp",
+        "classical_query",
+        {"working_dir": "p1", "query": "a", "enable_llm_judge": False},
+        headers={**ALICE, AGENT_HEADER: "agent-x"},
+    )
+
+    chunks = rag_chunks(result)
+    assert [chunk["content"] for chunk in chunks] == ["agent-x only"]
+
+    # And an UNscoped request is REJECTED outright (no personal fallback).
+    unscoped = await mcp_call(
         "/classical/mcp",
         "classical_query",
         {"working_dir": "p1", "query": "a", "enable_llm_judge": False},
         headers=ALICE,
     )
-
-    chunks = rag_chunks(result)
-    assert [chunk["content"] for chunk in chunks] == ["personal p1 chunk"]
+    assert unscoped.is_error is True
+    assert "agent scope required" in error_text(unscoped).lower()
 
 
 async def test_rest_query_isolated_across_agents(api, rag_boundaries):
@@ -237,11 +251,12 @@ async def test_rest_file_index_composes_working_dir_and_keeps_user_tag(
         assert metadata.get("user_id") == "user-alice"
 
 
-async def test_rest_file_index_without_header_indexes_the_personal_composition(
+async def test_rest_file_index_without_header_is_rejected(
     api, storage_external, rag_boundaries
 ):
+    """User × agent directive: indexing REQUIRES an agent scope."""
     storage_external.seed(
-        {"user-alice/personal/docs/guide.txt": b"personal guide content."}
+        {"user-alice/agent-x/docs/guide.txt": b"guide content."}
     )
 
     response = await api.post(
@@ -250,11 +265,9 @@ async def test_rest_file_index_without_header_indexes_the_personal_composition(
         headers=ALICE,
     )
 
-    assert response.status_code == 202
-    await await_background_index(rag_boundaries)
-
-    additions = rag_boundaries.calls_for("add_documents")
-    assert additions and additions[-1][0] == COMPOSED_PERSONAL_ROOT
+    assert response.status_code == 422
+    assert "agent scope required" in response.json()["detail"].lower()
+    assert rag_boundaries.calls_for("add_documents") == []
 
 
 async def test_rest_folder_index_schedules_the_scoped_prefix(
@@ -316,11 +329,14 @@ async def test_same_supplied_working_dir_under_different_agents_targets_differen
 
     await mcp_call("/classical/mcp", "classical_query", arguments, headers=WITH_AGENT_X)
     await mcp_call("/classical/mcp", "classical_query", arguments, headers=WITH_AGENT_Y)
-    await mcp_call("/classical/mcp", "classical_query", arguments, headers=ALICE)
+    # An unscoped request is REJECTED — no personal composition happens.
+    unscoped = await mcp_call(
+        "/classical/mcp", "classical_query", arguments, headers=ALICE
+    )
 
     working_dirs = {payload[0] for payload in similarity_searches(rag_boundaries)}
     assert working_dirs == {
         COMPOSED_AGENT_X_P1,
         COMPOSED_AGENT_Y_P1,
-        "user-alice/personal/p1/",
     }
+    assert unscoped.is_error is True

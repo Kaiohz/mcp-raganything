@@ -36,6 +36,7 @@ from dependencies import (
     get_list_folders_use_case,
     get_read_file_use_case,
     get_request_agent_scope,
+    get_required_agent_scope,
     get_upload_file_use_case,
     minio_adapter,
     minio_config,
@@ -222,30 +223,42 @@ def _validate_prefix(prefix: str) -> str:
 
 
 def _scoped_prefix(prefix: str) -> str:
-    """Compose the storage prefix under the caller's scope (legacy fallback).
+    """Compose the storage prefix under the caller's scope — SYSTEM-LENIENT.
 
-    The caller-scope composition (scope-rag-memories REQ-003) applies ONLY to
-    an authenticated context: with no user id the legacy unscoped behaviour
-    is preserved. An invalid ``X-Composable-Agent`` value is converted to a
-    sanitized ``ToolError`` BEFORE any storage operation (REQ-002).
+    Used ONLY by the TEMPORARY chat tools (system-owned, bound to
+    ``chat_tmp/<user_id>/...`` — not agent data). Agent-facing data tools
+    MUST use the REQUIRED variants below (user × agent scoping directive).
 
-    **SECURITY NOTE (security review FINDING-2, deployment control):** the
-    unscoped legacy path is reachable ONLY while dual-auth is NOT wired (the
-    FastMCP middleware fails closed without a wired ``AuthService``); see
-    ``security.verify_credentials`` for the deployment note and the
-    recommended fail-closed hardening.
+    The caller-scope composition applies ONLY to an authenticated context:
+    with no user id the legacy unscoped behaviour is preserved (reachable
+    only while dual-auth is NOT wired — the FastMCP middleware fails closed
+    without a wired ``AuthService``).
+    """
+    scope: AgentScope = get_request_agent_scope()
+    if not scope.user_id:
+        return prefix
+    return scope.scoped_prefix(prefix)
 
-    Args:
-        prefix: The validated client-relative prefix.
 
-    Returns:
-        The scoped prefix, or the unchanged input in the legacy path.
+def _scoped_object_path(object_path: str) -> str:
+    """Compose a full object key under the caller's scope — SYSTEM-LENIENT
+    (temporary chat tools only; see :func:`_scoped_prefix`)."""
+    scope: AgentScope = get_request_agent_scope()
+    if not scope.user_id:
+        return object_path
+    return scope.scoped_object_path(object_path)
 
-    Raises:
-        ToolError: On an invalid agent-scope header value.
+
+def _agent_scoped_prefix(prefix: str) -> str:
+    """Compose the storage prefix under the caller's REQUIRED agent scope.
+
+    Agent-facing data tools (list/read) must ALWAYS carry
+    ``X-Composable-Agent`` — the personal namespace is a system-internal
+    fallback and is not reachable from callers. An absent/invalid value
+    raises a sanitized ``ToolError`` BEFORE any storage operation.
     """
     try:
-        scope: AgentScope = get_request_agent_scope()
+        scope: AgentScope = get_required_agent_scope()
     except DomainError as error:
         raise ToolError(error.detail) from None
     if not scope.user_id:
@@ -253,10 +266,10 @@ def _scoped_prefix(prefix: str) -> str:
     return scope.scoped_prefix(prefix)
 
 
-def _scoped_object_path(object_path: str) -> str:
-    """Compose a full object key under the caller's scope (see above)."""
+def _agent_scoped_object_path(object_path: str) -> str:
+    """Compose a full object key under the caller's REQUIRED agent scope."""
     try:
-        scope: AgentScope = get_request_agent_scope()
+        scope: AgentScope = get_required_agent_scope()
     except DomainError as error:
         raise ToolError(error.detail) from None
     if not scope.user_id:
@@ -282,7 +295,7 @@ async def list_files(
         List of file objects with the FULL object_name, size, and
         last_modified
     """
-    prefix = _scoped_prefix(_validate_prefix(prefix))
+    prefix = _agent_scoped_prefix(_validate_prefix(prefix))
     track_space_usage()
     use_case = get_list_files_use_case()
     files = await use_case.execute(prefix=prefix, recursive=recursive)
@@ -303,12 +316,12 @@ async def list_folders(prefix: str = "") -> list[str]:
         List of folder prefix strings within the caller's scope (e.g.
         ['docs/', 'photos/'])
     """
-    prefix = _scoped_prefix(_validate_prefix(prefix))
+    prefix = _agent_scoped_prefix(_validate_prefix(prefix))
     track_space_usage()
     use_case = get_list_folders_use_case()
     folders = await use_case.execute(prefix=prefix)
     try:
-        scope: AgentScope = get_request_agent_scope()
+        scope: AgentScope = get_required_agent_scope()
     except DomainError as error:
         raise ToolError(error.detail) from None
     if scope.user_id:
@@ -330,7 +343,7 @@ async def read_file(file_path: str) -> FileContentResponse:
     Returns:
         Extracted text content with metadata and any detected tables
     """
-    scoped_path = _scoped_object_path(file_path)
+    scoped_path = _agent_scoped_object_path(file_path)
     track_space_usage()
     use_case = get_read_file_use_case()
     try:

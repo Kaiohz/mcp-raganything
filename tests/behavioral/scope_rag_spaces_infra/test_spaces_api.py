@@ -126,19 +126,20 @@ async def test_create_space_rejects_the_reserved_personal_slug(infra_api, cluste
     assert deleted.status_code == 404, deleted.text
 
 
-async def test_personal_scope_use_never_materializes_a_space_record(
+async def test_unscoped_use_is_rejected_and_never_materializes_a_record(
     infra_api, cluster_app
 ):
-    """Security review FINDING-3 (ensure half): the lazy provisioning path
-    must also never materialize a ``personal`` record — a personal-scope
-    scoped use (no agent header) stores objects without a space row."""
+    """User × agent directive (supersedes FINDING-3's ensure half): an
+    unscoped personal-scope use is REJECTED (422) — no object stored and no
+    ``personal`` space row materialized by any path."""
     upload = await infra_api.post(
         "/api/v1/files/upload",
         headers=bearer("jwt-alice"),
         data={"prefix": "personal-notes"},
         files={"file": ("p.txt", b"personal file", "text/plain")},
     )
-    assert upload.status_code == 201, upload.text
+    assert upload.status_code == 422, upload.text
+    assert "agent scope required" in upload.json()["detail"].lower()
 
     listing = await infra_api.get(SPACES, headers=bearer("jwt-alice"))
     assert "personal" not in [
