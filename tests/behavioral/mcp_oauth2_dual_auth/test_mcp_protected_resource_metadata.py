@@ -47,7 +47,6 @@ MCP_MOUNTS_FOR_METADATA = (
     "/files/mcp",
     "/classical/mcp",
     "/web/mcp",
-    "/memories/mcp",
     "/generated/qa-gen-meta/mcp",
 )
 

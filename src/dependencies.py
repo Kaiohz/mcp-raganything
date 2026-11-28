@@ -33,19 +33,15 @@ from application.use_cases.create_rag_space import CreateRagSpaceUseCase
 from application.use_cases.delete_file_use_case import DeleteFileUseCase
 from application.use_cases.delete_folder_use_case import DeleteFolderUseCase
 from application.use_cases.delete_mcp_server import DeleteMcpServerUseCase
-from application.use_cases.delete_memory_use_case import DeleteMemoryUseCase
 from application.use_cases.delete_rag_space import DeleteRagSpaceUseCase
 from application.use_cases.ensure_rag_space import EnsureRagSpaceUseCase
 from application.use_cases.get_mcp_server import GetMcpServerUseCase
-from application.use_cases.get_memory_use_case import GetMemoryUseCase
 from application.use_cases.list_files_use_case import ListFilesUseCase
 from application.use_cases.list_folders_use_case import ListFoldersUseCase
 from application.use_cases.list_mcp_servers import ListMcpServersUseCase
-from application.use_cases.list_memories_use_case import ListMemoriesUseCase
 from application.use_cases.list_rag_spaces import ListRagSpacesUseCase
 from application.use_cases.liveness_check_use_case import LivenessCheckUseCase
 from application.use_cases.read_file_use_case import ReadFileUseCase
-from application.use_cases.save_memory_use_case import SaveMemoryUseCase
 from application.use_cases.update_mcp_server import UpdateMcpServerUseCase
 from application.use_cases.upload_file_use_case import UploadFileUseCase
 from application.use_cases.validate_mcp_server import ValidateMcpServerUseCase
@@ -57,14 +53,12 @@ from config import (
     CrawlConfig,
     DatabaseConfig,
     LLMConfig,
-    MemoryStoreConfig,
     MinioConfig,
     WebSearchConfig,
 )
 from domain.constants import PERSONAL_AGENT_SLUG
 from domain.entities.agent_scope import AgentScope
 from domain.entities.auth.auth_context import AuthContext
-from domain.entities.memory import MemoryCredential
 from domain.errors.base import DomainError
 from domain.errors.config import DependencyNotInitializedError
 from domain.errors.llm import LlmNotConfiguredError
@@ -94,9 +88,6 @@ from infrastructure.database.rls_context import (
 )
 from infrastructure.document_reader.xberg_adapter import XbergAdapter
 from infrastructure.mcp.tool_loader import FastMcpToolLoader
-from infrastructure.memory.composable_agents_store_adapter.adapter import (
-    ComposableAgentsMemoryStoreAdapter,
-)
 from infrastructure.openapi_mcp.adapter import FastMcpOpenApiFactory
 from infrastructure.rag.classical_bm25_adapter import ClassicalBM25Adapter
 from infrastructure.security.crypto import FernetSecretCipher
@@ -127,7 +118,7 @@ postgres_health_adapter = AsyncpgHealthAdapter(db_config)
 
 classical_rag_config = ClassicalRAGConfig()
 
-# --- Web search + memory tools (bounded process-local adapters) ---------------
+# --- Web search tools (bounded process-local adapters) ------------------------
 #
 # These adapters are process-wide singletons, but they are built LAZILY on
 # first use instead of at import time: their bounds (timeouts, concurrency,
@@ -136,13 +127,11 @@ classical_rag_config = ClassicalRAGConfig()
 # resolved in the environment the application actually starts in. The DDGS
 # adapter owns its dedicated executor + semaphore (shut down at application
 # shutdown), the crawl adapter lazily starts the shared crawler on first crawl
-# (never at import/startup), and the memory adapter speaks async HTTP to the
-# composable-agents Store File API.
+# (never at import/startup).
 url_safety_adapter = UrlSafetyAdapter()
 
 web_search_adapter: DDGSSearchAdapter | None = None
 web_crawler_adapter: Crawl4AIWebCrawlerAdapter | None = None
-memory_store_adapter: ComposableAgentsMemoryStoreAdapter | None = None
 
 
 def _build_web_search_adapter() -> DDGSSearchAdapter:
@@ -175,15 +164,6 @@ def _build_web_crawler_adapter() -> Crawl4AIWebCrawlerAdapter:
     )
 
 
-def _build_memory_store_adapter() -> ComposableAgentsMemoryStoreAdapter:
-    """Create the memory-store adapter from validated settings (lazy singleton)."""
-    config = MemoryStoreConfig()  # type: ignore
-    return ComposableAgentsMemoryStoreAdapter(
-        base_url=config.COMPOSABLE_AGENTS_BASE_URL,
-        timeout_seconds=config.MEMORY_STORE_TIMEOUT_SECONDS,
-    )
-
-
 def get_web_search_adapter() -> DDGSSearchAdapter:
     """Return the web-search adapter singleton (built on first use)."""
     global web_search_adapter
@@ -200,34 +180,12 @@ def get_web_crawler_adapter() -> Crawl4AIWebCrawlerAdapter:
     return web_crawler_adapter
 
 
-def get_memory_store_adapter() -> ComposableAgentsMemoryStoreAdapter:
-    """Return the memory-store adapter singleton (built on first use)."""
-    global memory_store_adapter
-    if memory_store_adapter is None:
-        memory_store_adapter = _build_memory_store_adapter()
-    return memory_store_adapter
-
-
 def get_web_search_use_case() -> WebSearchUseCase:
     """Return the web-search use case (ports wired to their adapters)."""
     return WebSearchUseCase(
         search=get_web_search_adapter(),
         crawler=get_web_crawler_adapter(),
         url_safety=url_safety_adapter,
-    )
-
-
-def get_memory_identity() -> tuple[str, MemoryCredential]:
-    """Read the authenticated caller identity from the RLS contextvars.
-
-    Returns:
-        The (possibly empty) user id and the caller credential as received by
-        the middleware ("" values mean no identity — the use case fails
-        closed on those without any upstream request).
-    """
-    return current_user_id.get() or "", MemoryCredential(
-        method=current_auth_method.get() or "",
-        credential=current_credential.get() or "",
     )
 
 
@@ -259,26 +217,6 @@ def get_request_auth_context() -> AuthContext | None:
             raw_credential=credential,
         )
     return None
-
-
-def get_save_memory_use_case() -> SaveMemoryUseCase:
-    """Return the save-memory use case (MemoryStorePort wired)."""
-    return SaveMemoryUseCase(store=get_memory_store_adapter())
-
-
-def get_list_memories_use_case() -> ListMemoriesUseCase:
-    """Return the list-memories use case (MemoryStorePort wired)."""
-    return ListMemoriesUseCase(store=get_memory_store_adapter())
-
-
-def get_get_memory_use_case() -> GetMemoryUseCase:
-    """Return the get-memory use case (MemoryStorePort wired)."""
-    return GetMemoryUseCase(store=get_memory_store_adapter())
-
-
-def get_delete_memory_use_case() -> DeleteMemoryUseCase:
-    """Return the delete-memory use case (MemoryStorePort wired)."""
-    return DeleteMemoryUseCase(store=get_memory_store_adapter())
 
 
 # --- Caller scope (user × agent) + RAG spaces (scope-rag-memories) ------------

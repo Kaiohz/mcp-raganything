@@ -7,7 +7,7 @@ the HTTP status + headers are the behavior under test.
 Delegation contract pinned here (REQ-010 replicating REQ-001/REQ-002/REQ-017):
 
 * the four mounts (``/files/mcp``, ``/classical/mcp``, ``/web/mcp``,
-  ``/memories/mcp``) adopt the SAME HTTP-level guard pattern as
+  ``/web/mcp``) adopt the SAME HTTP-level guard pattern as
   composable-agents' ``McpAuthGuard``: every request missing valid credentials
   is answered HTTP 401 BEFORE any MCP method runs — including an
   unauthenticated ``initialize`` (never a successful initialize followed by a
@@ -35,7 +35,7 @@ pytestmark = pytest.mark.asyncio(loop_scope="session")
 
 #: The production proxy Host (mirrors the ingress Host header).
 PROD_HOST = "raganything.soludev.tech"
-MCP_MOUNTS = ("/files/mcp", "/classical/mcp", "/web/mcp", "/memories/mcp")
+MCP_MOUNTS = ("/files/mcp", "/classical/mcp", "/web/mcp")
 WELL_KNOWN_PATH = "/.well-known/oauth-protected-resource"
 #: The generic, non-enumerating 401 body.
 GENERIC_401_BODY = {"detail": "Invalid or missing credentials"}

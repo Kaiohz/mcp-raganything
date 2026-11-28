@@ -292,15 +292,6 @@ class LogMessage(StrEnum):
     )
     CRAWL_BATCH_TIMEOUT = "Crawl batch timed out after %.2fs: unfinished=%d"
     CRAWL_CLOSE_FAILED = "Crawl stream close failed"
-    MEMORY_SAVE_COMPLETED = "Memory saved: action=%s chars=%d duration_ms=%.1f"
-    MEMORY_STORE_REQUEST_FAILED = "Memory store %s request failed: category=%s"
-    MEMORY_STORE_CLOSED = "Memory store HTTP client closed"
-    MEMORY_STORE_CLOSE_FAILED = "Memory store HTTP client close failed"
-    MEMORY_IDENTITY_MISSING = "Memory save rejected: no user identity or credential"
-    MEMORY_SAVE_UNEXPECTED = "Unexpected memory save failure"
-    MEMORY_LIST_UNEXPECTED = "Unexpected memory list failure"
-    MEMORY_READ_UNEXPECTED = "Unexpected memory read failure"
-    MEMORY_DELETE_UNEXPECTED = "Unexpected memory delete failure"
 
     # --- Caller scope / RAG spaces (scope-rag-memories spec) ---
     SCOPE_RESOLVED = "Caller scope resolved: user_id=%s agent_slug=%s"

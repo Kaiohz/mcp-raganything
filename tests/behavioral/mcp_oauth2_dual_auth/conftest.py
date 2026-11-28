@@ -25,7 +25,7 @@ import pytest_asyncio
 PROD_HOST = "raganything.soludev.tech"
 
 #: The four streamable-HTTP MCP mounts (exact paths, no trailing slash).
-MCP_MOUNTS = ("/files/mcp", "/classical/mcp", "/web/mcp", "/memories/mcp")
+MCP_MOUNTS = ("/files/mcp", "/classical/mcp", "/web/mcp")
 
 #: MCP authorization-spec discovery chain constants (REQ-010 replicating
 #: REQ-001/REQ-002; the Logto OIDC issuer is pinned by the feature spec).

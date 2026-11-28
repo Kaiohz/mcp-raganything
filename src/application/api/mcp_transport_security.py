@@ -215,7 +215,7 @@ def apply_mcp_max_request_body_size() -> None:
     fastmcp 3.3.1 instantiates the manager inside the app lifespan through
     the ``StreamableHTTPSessionManager`` symbol of
     :mod:`fastmcp.server.http`; replacing that symbol makes all four mounts
-    (files / classical / web / memories) accept MCP POSTs up to
+    (files / classical / web) accept MCP POSTs up to
     :func:`mcp_max_request_body_size` instead of the SDK's 4 MiB default.
     """
     import fastmcp.server.http as _fastmcp_http

@@ -150,9 +150,6 @@ class TestMcpAuthorizationServerStartupWarnings:
                 main, "mcp_classical_app", SimpleNamespace(lifespan=_noop_lifespan)
             ),
             patch.object(main, "mcp_web_app", SimpleNamespace(lifespan=_noop_lifespan)),
-            patch.object(
-                main, "mcp_memories_app", SimpleNamespace(lifespan=_noop_lifespan)
-            ),
         ):
             async with main.combined_lifespan(main.app):
                 pass

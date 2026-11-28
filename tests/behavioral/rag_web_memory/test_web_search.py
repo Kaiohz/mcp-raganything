@@ -754,8 +754,8 @@ async def test_robots_denial_returns_no_partial_markdown_or_raw_html(
     assert "html" not in item
 
 
-async def test_web_search_has_no_rag_indexing_or_memory_side_effects(
-    mcp_call, web_external, memory_external, monkeypatch
+async def test_web_search_has_no_rag_indexing_side_effects(
+    mcp_call, web_external, monkeypatch
 ):
     web_external.search_results = provider_results(1)
     embedding = AsyncMock(side_effect=AssertionError("web search embedded a page"))
@@ -773,4 +773,3 @@ async def test_web_search_has_no_rag_indexing_or_memory_side_effects(
 
     assert result.is_error is False
     embedding.assert_not_awaited()
-    assert memory_external.requests == []

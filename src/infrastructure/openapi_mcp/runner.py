@@ -119,7 +119,7 @@ class GeneratedMcpRunner(GeneratedMcpRunnerPort):
         http_app = mcp.http_app(path="/", stateless_http=True)
         # Apply the shared HTTP-level guard stack (auth + transport security)
         # when one is wired — the generated mounts get the SAME treatment as
-        # the static /files, /classical, /web and /memories servers
+        # the static /files, /classical and /web servers
         # (feat-mcp-oauth2-dual-auth, REQ-017). The FastMCP middleware stay
         # mounted as defense-in-depth behind the HTTP guard. STATELESS
         # transport too (code-review C-1): the tool task inherits the
