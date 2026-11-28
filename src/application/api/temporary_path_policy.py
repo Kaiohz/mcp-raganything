@@ -1,15 +1,27 @@
 """Shared temporary-file object-path policy for the MCP temporary tools
-(chat-pdf-attachments spec §5.3, REQ-031/035/047).
+(chat-pdf-attachments spec §5.3, REQ-031/035/047 — amended by the user ×
+agent directive, chat_tmp Option 2).
 
-The temporary namespace is strictly user-isolated:
+The temporary namespace is strictly scoped user × agent:
 
 .. code-block:: text
 
-    chat_tmp/<current_user_id>/<thread_id>/<attachment_id>/<filename>
+    <user_id>/<agent_slug>/chat_tmp/<thread_id>/<attachment_id>/<filename>
 
-Only paths matching ``chat_tmp/<current_user_id>/...`` with at least one extra
-segment are accepted for upload prefixes / delete targets. Any traversal
-attempt, absolute path or other root (``documents/``, ``uploads/``) is refused.
+The CLIENT-RELATIVE value the temporary tools accept carries NO user id
+segment — the identity lives in the REQUIRED agent scope the backend
+composes server-side (``X-Composable-Agent`` + the authenticated
+principal), so the caller can never relocate another user's or another
+agent's objects:
+
+.. code-block:: text
+
+    chat_tmp/<thread_id>/<attachment_id>/<filename>
+
+Only relative paths matching ``chat_tmp/<thread_id>/<attachment_id>/...``
+are accepted for upload prefixes / delete targets. Any traversal attempt,
+absolute path, other root (``documents/``, ``uploads/``) or a foreign
+``<user_id>`` segment (legacy shape) is refused.
 
 Every predicate lives in its own tiny function (one rule, one decision) so the
 validators cannot drift and each unit stays trivially testable — the detailed
@@ -21,14 +33,17 @@ Contract details:
   slashes, ``//``/``/./`` collapse, trailing slashes drop) and refuses empty
   values, absolute paths and residual ``..`` segments (``..`` survives
   ``normpath`` for shapes like ``a/../..``).
-* ``_require_user_tmp_root`` — enforces ``chat_tmp/<user_id>/…`` with at least
-  one object segment beneath it: the bare root, root-with-slash, foreign user
-  ids and any other root (``documents/``, ``uploads/``) are refused.
-* ``validate_temporary_prefix`` — upload prefix: after the two checks above,
-  the "folder" trailing slash expected by :class:`UploadFileUseCase` is
-  restored when the caller supplied one (``normpath`` strips it).
-* ``validate_temporary_object_path`` — delete target: same two checks, no
-  folder-form restoration (an object path always ends with a file name).
+* ``_require_tmp_root`` — enforces ``chat_tmp/<thread_id>/<attachment_id>/…``
+  with at least one object segment beneath it (delete targets): the bare
+  root, root-with-slash, the legacy ``chat_tmp/<user_id>/…`` shape and any
+  other root (``documents/``, ``uploads/``) are refused.
+* ``validate_temporary_prefix`` — upload prefix: ``chat_tmp/<thread>/
+  <attachment_id>/`` (two scoping segments + the trailing slash expected by
+  :class:`UploadFileUseCase` is restored when the caller supplied one).
+* ``validate_temporary_object_path`` — delete target: a full object key
+  ``chat_tmp/<thread>/<attachment_id>/<file>`` (a file name segment is
+  REQUIRED — no folder-form restoration, an object path always ends with a
+  file name).
 * ``sanitize_temporary_file_name`` — plain relative sub-paths
   (``some/dir/photo.png``) are REDUCED to the basename; traversal attempts
   (``..`` anywhere, a leading slash, an exploited backslash), control
@@ -40,9 +55,10 @@ import posixpath
 
 TEMP_ROOT = "chat_tmp"
 
-_ROOT_SCOPE_MESSAGE = "must stay inside {root}/<user_id>/..."
+_ROOT_SCOPE_MESSAGE = "must stay inside {root}/<thread_id>/<attachment_id>/..."
 _ISOLATION_MESSAGE = (
-    "must start with {root}/{user_id}/ to stay inside your own temporary namespace"
+    "must start with {root}/<thread_id>/<attachment_id>/ "
+    "(the caller identity is carried by the agent scope, never by the path)"
 )
 
 
@@ -58,28 +74,31 @@ def _normalize_relative(value: str, label: str) -> str:
     return normalized
 
 
-def _require_user_tmp_root(normalized: str, user_id: str, label: str) -> None:
-    """Refuse paths that do not carry an object below ``chat_tmp/<user_id>/``."""
+def _require_tmp_root(normalized: str, min_parts: int, label: str) -> None:
+    """Refuse paths outside ``chat_tmp/<thread_id>/<attachment_id>/…``.
+
+    The legacy ``chat_tmp/<user_id>/…`` shape is refused as well: the
+    user identity is carried by the REQUIRED agent scope (chat_tmp
+    Option 2), never by a client-controlled path segment.
+    """
     parts = normalized.split("/")
-    if len(parts) < 3 or not parts[1] or parts[0] != TEMP_ROOT or parts[1] != user_id:
-        raise ValueError(
-            f"{label} {_ISOLATION_MESSAGE.format(root=TEMP_ROOT, user_id=user_id)}"
-        )
+    if len(parts) < min_parts or not parts[1] or not parts[2] or parts[0] != TEMP_ROOT:
+        raise ValueError(f"{label} {_ISOLATION_MESSAGE.format(root=TEMP_ROOT)}")
 
 
-def validate_temporary_prefix(prefix: str, user_id: str) -> str:
-    """Validate a temporary upload prefix for the CURRENT user (REQ-031)."""
+def validate_temporary_prefix(prefix: str) -> str:
+    """Validate a temporary upload prefix (REQ-031, scoped user × agent)."""
     normalized = _normalize_relative(prefix, "prefix")
-    _require_user_tmp_root(normalized, user_id, "prefix")
+    _require_tmp_root(normalized, 3, "prefix")
     if prefix.endswith("/") and not normalized.endswith("/"):
         normalized += "/"  # normpath strips the trailing slash — restore it
     return normalized
 
 
-def validate_temporary_object_path(object_path: str, user_id: str) -> str:
-    """Validate a temporary delete target for the CURRENT user (REQ-035/047)."""
+def validate_temporary_object_path(object_path: str) -> str:
+    """Validate a temporary delete target (REQ-035/047, scoped user × agent)."""
     normalized = _normalize_relative(object_path, "object_path")
-    _require_user_tmp_root(normalized, user_id, "object_path")
+    _require_tmp_root(normalized, 4, "object_path")
     return normalized
 
 

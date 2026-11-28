@@ -41,6 +41,9 @@ MOUNT = "/files/mcp"
 
 _UPLOAD_PREFIX_ALICE = "chat_tmp/user-alice/session/"
 _UPLOAD_PREFIX_BOB = "chat_tmp/user-bob/session/"
+#: User × agent directive (chat_tmp Option 2): the temporary tools REQUIRE
+#: the agent scope — the RLS-principal probes must carry it.
+_UPLOAD_HEADERS = {"X-Composable-Agent": "agent-x"}
 
 
 def _txt_payload(text: str) -> dict:
@@ -152,6 +155,7 @@ class TestRlsPrincipalIsTheAcceptedRequestPrincipal:
                 "temporary_upload_file",
                 {**_txt_payload(tag), "prefix": prefix},
                 credential=credential,
+                headers=_UPLOAD_HEADERS,
             )
             results.append(result)
 
@@ -202,6 +206,7 @@ class TestRlsPrincipalIsTheAcceptedRequestPrincipal:
             headers={
                 "X-API-Key": API_KEY_KEY_BOB,
                 "Mcp-Session-Id": STALE_SESSION_ID,
+                **_UPLOAD_HEADERS,
             },
         )
 

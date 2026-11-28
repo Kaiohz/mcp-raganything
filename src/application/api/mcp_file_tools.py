@@ -35,7 +35,6 @@ from dependencies import (
     get_list_files_use_case,
     get_list_folders_use_case,
     get_read_file_use_case,
-    get_request_agent_scope,
     get_required_agent_scope,
     get_upload_file_use_case,
     minio_adapter,
@@ -108,16 +107,21 @@ async def temporary_upload_file(
         file_name: Attachment basename (plain single segment).
         content_base64: Strictly decodable base64 payload.
         content_type: Attachment MIME type.
-        prefix: Destination prefix; MUST match chat_tmp/<current_user_id>/...
+        prefix: Destination prefix; MUST match
+            ``chat_tmp/<thread_id>/<attachment_id>/`` — the caller identity
+            is carried by the agent scope (user × agent directive), never by
+            the path.
 
     Returns:
         The JSON contract: ``{"object_name", "size", "content_type"}`` (REQ-033).
 
     Raises:
-        ToolError: On unauthenticated context, invalid base64, disallowed
-            type, oversize payload, traversal or out-of-namespace prefix.
+        ToolError: On unauthenticated context, missing agent scope, invalid
+            base64, disallowed type, oversize payload, traversal or
+            out-of-namespace prefix.
     """
     user_id = _require_user_id()
+    scope = _temporary_scope()
     try:
         safe_name = sanitize_temporary_file_name(file_name)
     except ValueError as exc:
@@ -131,19 +135,20 @@ async def temporary_upload_file(
             f"temporary upload too large: {len(decoded)} bytes (maximum {max_mb} MB)"
         )
     try:
-        normalized_prefix = validate_temporary_prefix(prefix, user_id)
+        normalized_prefix = validate_temporary_prefix(prefix)
     except ValueError as exc:
         logger.warning(LogMessage.TEMP_UPLOAD_REJECTED, user_id, exc)
         raise ToolError(str(exc)) from None
 
-    # SCOPE COMPOSITION (scope-rag-memories REQ-003): the temp object is
-    # written under the CALLER'S scope root (<user>/<agent>/...) so the
-    # regular agent-facing file tools (list/read, which are ALWAYS scoped)
-    # can resolve it. Without the composition the upload lands OUTSIDE the
-    # caller's scope and the agent reads 404 NoSuchKey. The RELATIVE
-    # (client) path is still what the tool RETURNS.
+    # SCOPE COMPOSITION (scope-rag-memories REQ-003 + user × agent directive,
+    # chat_tmp Option 2): the temp object is written under the REQUIRED scope
+    # root (<user_id>/<agent_slug>/chat_tmp/...) so the regular agent-facing
+    # file tools (list/read, which are ALWAYS scoped) can resolve it. Without
+    # the composition the upload lands OUTSIDE the caller's scope and the
+    # agent reads 404 NoSuchKey. The RELATIVE (client) path is still what the
+    # tool RETURNS.
     relative_prefix = normalized_prefix
-    scoped_prefix = _scoped_prefix(normalized_prefix)
+    scoped_prefix = scope.scoped_prefix(normalized_prefix)
 
     # REQ-032: reuse the REAL UploadFileUseCase and the existing RustFS storage.
     use_case = get_upload_file_use_case()
@@ -170,32 +175,36 @@ async def temporary_delete_file(object_path: str) -> dict:
     (EDG-015).
 
     Args:
-        object_path: Path under ``chat_tmp/<current_user_id>/...``.
+        object_path: Path under ``chat_tmp/<thread_id>/<attachment_id>/<file>``
+            (the caller identity is carried by the agent scope, never by the
+            path).
 
     Returns:
         ``{"deleted": object_path}`` on success or idempotent absence.
 
     Raises:
-        ToolError: On unauthenticated context, traversal or any path outside
-            the caller's own ``chat_tmp/<user_id>/`` namespace (REQ-047).
+        ToolError: On unauthenticated context, missing agent scope, traversal
+            or any path outside the caller's scoped ``chat_tmp/`` namespace
+            (REQ-047, user × agent directive).
     """
     user_id = _require_user_id()
+    scope = _temporary_scope()
     try:
-        normalized = validate_temporary_object_path(object_path, user_id)
+        normalized = validate_temporary_object_path(object_path)
     except ValueError as exc:
         logger.warning(LogMessage.TEMP_DELETE_REJECTED, user_id, exc)
         raise ToolError(str(exc)) from None
 
     # I2/C2 companion (REQ-035/REQ-047): plain StoragePort.remove_object — NOT
     # DeleteFileUseCase, NO pgvector cascade, NO working_dir involvement.
-    # The REMOVE composes the caller's scope (the upload side is scoped —
-    # without it the cleanup reads an unscoped 404 NoSuchKey). Absent
+    # The REMOVE composes the caller's REQUIRED scope (the upload side is
+    # scoped — without it the cleanup reads an unscoped 404 NoSuchKey). Absent
     # (StorageNotFoundError) is an idempotent no-op (EDG-015); a REAL
     # storage failure MUST surface as a ToolError so the composable-agents
     # cleanup logs ERROR and retries exactly once (REQ-046).
     try:
         await minio_adapter.remove_object(
-            minio_config.MINIO_BUCKET, _scoped_object_path(normalized)
+            minio_config.MINIO_BUCKET, scope.scoped_object_path(normalized)
         )
     except StorageNotFoundError:
         logger.info(LogMessage.TEMP_DELETE_ABSENT, normalized, "storage-not-found")
@@ -222,31 +231,19 @@ def _validate_prefix(prefix: str) -> str:
     return normalized
 
 
-def _scoped_prefix(prefix: str) -> str:
-    """Compose the storage prefix under the caller's scope — SYSTEM-LENIENT.
+def _temporary_scope() -> AgentScope:
+    """Return the caller's REQUIRED agent scope for the temporary tools.
 
-    Used ONLY by the TEMPORARY chat tools (system-owned, bound to
-    ``chat_tmp/<user_id>/...`` — not agent data). Agent-facing data tools
-    MUST use the REQUIRED variants below (user × agent scoping directive).
-
-    The caller-scope composition applies ONLY to an authenticated context:
-    with no user id the legacy unscoped behaviour is preserved (reachable
-    only while dual-auth is NOT wired — the FastMCP middleware fails closed
-    without a wired ``AuthService``).
+    User × agent directive (chat_tmp Option 2): even the system-owned
+    temporary chat tools are bound to the caller's
+    ``<user_id>/<agent_slug>/`` namespace — the backend ALWAYS forwards the
+    thread's agent as ``X-Composable-Agent``. An absent agent scope raises a
+    sanitized ``ToolError`` BEFORE any storage operation.
     """
-    scope: AgentScope = get_request_agent_scope()
-    if not scope.user_id:
-        return prefix
-    return scope.scoped_prefix(prefix)
-
-
-def _scoped_object_path(object_path: str) -> str:
-    """Compose a full object key under the caller's scope — SYSTEM-LENIENT
-    (temporary chat tools only; see :func:`_scoped_prefix`)."""
-    scope: AgentScope = get_request_agent_scope()
-    if not scope.user_id:
-        return object_path
-    return scope.scoped_object_path(object_path)
+    try:
+        return get_required_agent_scope()
+    except DomainError as error:
+        raise ToolError(error.detail) from None
 
 
 def _agent_scoped_prefix(prefix: str) -> str:
