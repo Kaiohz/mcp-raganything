@@ -12,6 +12,7 @@ All tests go through the real MCP tools (mounted ``/files/mcp``) and REST
 routes; only the outbound MinIO boundary is a recording double.
 """
 
+import base64
 import pytest
 
 pytestmark = pytest.mark.asyncio(loop_scope="session")
@@ -483,3 +484,62 @@ async def test_temporary_upload_of_disallowed_type_still_rejected(
 
     assert result.is_error is True
     assert storage_external.calls_for("put_object") == []
+
+
+# ---------------------------------------------------------------------------
+# streamable-HTTP request-body cap (413 on oversized MCP POSTs) — REQ-092
+# ---------------------------------------------------------------------------
+
+
+async def test_mcp_transport_accepts_mcp_post_bodies_above_the_sdk_4mib_default(
+    mcp_call, storage_external
+):
+    """The transport cap lifts from the 4 MiB SDK default to the FILES budget:
+    an 8 MiB payload (base64-inflated past the SDK line) reaches the tool and
+    is stored instead of answering 413 Content Too Large."""
+    payload = b"X" * (8 * 1024 * 1024)
+
+    result = await mcp_call(
+        FILES_MOUNT,
+        "temporary_upload_file",
+        {
+            "file_name": "big.pdf",
+            "content_base64": base64.b64encode(payload).decode(),
+            "content_type": "application/pdf",
+            "prefix": "chat_tmp/user-alice/session-1",
+        },
+        headers=WITH_AGENT_X,
+    )
+
+    assert result.is_error is False, error_text(result)
+    stored = storage_external.calls_for("put_object")
+    assert stored and stored[-1]["size"] == 8 * 1024 * 1024
+    assert stored[-1]["object_path"].endswith("chat_tmp/user-alice/session-1/big.pdf")
+
+
+def test_apply_mcp_max_request_body_size_patches_the_fastmcp_lifespan_symbol():
+    """The fastmcp lifespan builds its session manager through the patched
+    module symbol: after ``apply_mcp_max_request_body_size`` every mount
+    instantiates the LargeBody subclass (and defaulting reads the FILES
+    budget at call time)."""
+    import fastmcp.server.http as fastmcp_http
+    from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+
+    from application.api.mcp_transport_security import (
+        LargeBodyStreamableHTTPSessionManager,
+        mcp_max_request_body_size,
+        apply_mcp_max_request_body_size,
+    )
+
+    assert mcp_max_request_body_size() > 4 * 1024 * 1024
+    previous = fastmcp_http.StreamableHTTPSessionManager
+    try:
+        apply_mcp_max_request_body_size()
+        assert fastmcp_http.StreamableHTTPSessionManager is (
+            LargeBodyStreamableHTTPSessionManager
+        )
+        assert issubclass(
+            LargeBodyStreamableHTTPSessionManager, StreamableHTTPSessionManager
+        )
+    finally:
+        fastmcp_http.StreamableHTTPSessionManager = previous

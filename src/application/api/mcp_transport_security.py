@@ -36,6 +36,7 @@ import logging
 import re
 from typing import TYPE_CHECKING
 
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.server.transport_security import (
     TransportSecurityMiddleware,
     TransportSecuritySettings,
@@ -165,3 +166,58 @@ def transport_allowed_hosts(allowed_hosts: list[str]) -> list[str]:
                 if port_form not in normalized:
                     normalized.append(port_form)
     return normalized
+
+
+# ---------------------------------------------------------------------------
+# Streamable-HTTP request-body cap (413 on oversized MCP POSTs)
+# ---------------------------------------------------------------------------
+
+#: The mcp-SDK default body cap the SDK falls back to (4 MiB).
+_SDK_DEFAULT_MAX_REQUEST_BODY_SIZE = 4 * 1024 * 1024
+
+
+def mcp_max_request_body_size() -> int:
+    """Body cap for MCP POSTs, derived from the FILES upload budget (REQ-092).
+
+    A temporary upload carries its bytes base64-encoded inside the JSON-RPC
+    envelope (x4/3) plus the envelope overhead, so the transport cap never
+    sits BELOW fastmcp's 4 MiB SDK default. Read at CALL time — the manager
+    is built inside the app lifespan, after settings are loaded.
+    """
+    from dependencies import minio_config
+
+    return max(
+        _SDK_DEFAULT_MAX_REQUEST_BODY_SIZE,
+        int(minio_config.FILES_MAX_UPLOAD_SIZE * 4 / 3) + 2 * 1024 * 1024,
+    )
+
+
+class LargeBodyStreamableHTTPSessionManager(StreamableHTTPSessionManager):
+    """Session manager with a REQUEST-BODY cap that fits the FILES budget.
+
+    fastmcp 3.3.1 builds its ``StreamableHTTPSessionManager`` inside the app
+    lifespan WITHOUT forwarding ``max_request_body_size`` — the mcp-SDK's
+    4 MiB default answered ``413 Content Too Large`` BEFORE any tool ran,
+    so every ``temporary_upload_file`` call with a payload above ~3 MB
+    decoded (base64-inflated past 4 MiB) was rejected with a raw
+    ``HTTPStatusError`` that surfaced on the caller as an opaque
+    "unhandled errors in a TaskGroup (1 sub-exception)".
+    """
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        kwargs.setdefault("max_request_body_size", mcp_max_request_body_size())
+        super().__init__(*args, **kwargs)
+
+
+def apply_mcp_max_request_body_size() -> None:
+    """Patch fastmcp's session-manager class so every mount lifts the cap.
+
+    fastmcp 3.3.1 instantiates the manager inside the app lifespan through
+    the ``StreamableHTTPSessionManager`` symbol of
+    :mod:`fastmcp.server.http`; replacing that symbol makes all four mounts
+    (files / classical / web / memories) accept MCP POSTs up to
+    :func:`mcp_max_request_body_size` instead of the SDK's 4 MiB default.
+    """
+    import fastmcp.server.http as _fastmcp_http
+
+    _fastmcp_http.StreamableHTTPSessionManager = LargeBodyStreamableHTTPSessionManager
