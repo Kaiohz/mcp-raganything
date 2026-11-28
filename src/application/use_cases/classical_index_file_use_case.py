@@ -4,15 +4,15 @@ import os
 from collections.abc import Callable
 
 import aiofiles
-from kreuzberg import extract_file
 
 from application.use_cases._user_id_tag import tag_documents_with_user_id
 from domain.entities.indexing_result import FileIndexingResult, IndexingStatus
 from domain.logging.messages import LogMessage
+from domain.ports.document_reader_port import DocumentReaderPort
 from domain.ports.storage_port import StoragePort
 from domain.ports.vector_store_port import VectorStorePort
 from domain.services.classical_helpers import (
-    build_documents_from_extraction,
+    build_documents_from_chunks,
     validate_path,
 )
 from domain.services.scope import resolve_agent_scope
@@ -20,7 +20,6 @@ from infrastructure.database.rls_context import (
     current_agent_scope,
     current_user_id,
 )
-from infrastructure.document_reader.kreuzberg_adapter import make_extraction_config
 
 logger = logging.getLogger(__name__)
 
@@ -28,8 +27,9 @@ logger = logging.getLogger(__name__)
 class ClassicalIndexFileUseCase:
     """Index a single file into the classical RAG vector store.
 
-    Downloads the file from object storage, extracts its content via
-    Kreuzberg, chunks it, and adds the resulting documents to the vector
+    Downloads the file from object storage, extracts and chunks it via the
+    document reader (xberg adapter), and adds the resulting documents to the
+    vector
     store for the given working directory. On an authenticated request the
     caller's scope is composed in front of BOTH the object key and the
     working_dir before table resolution (scope-rag-memories REQ-006), and
@@ -40,12 +40,14 @@ class ClassicalIndexFileUseCase:
         self,
         vector_store: VectorStorePort,
         storage: StoragePort,
+        document_reader: DocumentReaderPort,
         bucket: str,
         output_dir: str,
         space_recorder: Callable[[str], None] | None = None,
     ) -> None:
         self.vector_store = vector_store
         self.storage = storage
+        self.document_reader = document_reader
         self.bucket = bucket
         self.output_dir = output_dir
         self._space_recorder = space_recorder
@@ -89,12 +91,11 @@ class ClassicalIndexFileUseCase:
 
             await self.vector_store.ensure_table(working_dir)
 
-            config = make_extraction_config(
-                chunk_size=chunk_size, chunk_overlap=chunk_overlap
+            chunk_texts = await self.document_reader.extract_chunks(
+                file_path, chunk_size=chunk_size, chunk_overlap=chunk_overlap
             )
-            result = await extract_file(file_path, config=config)
 
-            documents = build_documents_from_extraction(result, file_name)
+            documents = build_documents_from_chunks(chunk_texts, file_name)
 
             documents = tag_documents_with_user_id(documents)
 

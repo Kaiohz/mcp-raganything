@@ -232,7 +232,9 @@ class TestTemporaryDeleteFile:
         args, kwargs = storage_mock.remove_object.call_args
         # The REMOVE composes the caller's scope (the write side is scoped).
         expected_scoped = f"user-a/personal/{object_path}"
-        assert args[1] == expected_scoped or kwargs.get("object_path") == expected_scoped
+        assert (
+            args[1] == expected_scoped or kwargs.get("object_path") == expected_scoped
+        )
         assert "deleted" in str(result).lower() or bool(result)
 
     async def test_refuses_paths_outside_the_authorized_prefix(

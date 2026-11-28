@@ -1,4 +1,4 @@
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -13,13 +13,21 @@ from domain.entities.indexing_result import (
 
 class TestClassicalIndexFolderUseCase:
     @pytest.fixture
+    def mock_document_reader(self) -> AsyncMock:
+        reader = AsyncMock()
+        reader.extract_chunks.return_value = ["chunk text"]
+        return reader
+
+    @pytest.fixture
     def use_case(
         self,
         mock_vector_store: AsyncMock,
         mock_storage: AsyncMock,
+        mock_document_reader: AsyncMock,
     ) -> ClassicalIndexFolderUseCase:
         return ClassicalIndexFolderUseCase(
             vector_store=mock_vector_store,
+            document_reader=mock_document_reader,
             storage=mock_storage,
             bucket="test-bucket",
             output_dir="/tmp/output",
@@ -62,10 +70,8 @@ class TestClassicalIndexFolderUseCase:
         # Assert
         mock_vector_store.ensure_table.assert_called_once_with("project/docs")
 
-    @patch("application.use_cases.classical_index_folder_use_case.extract_file")
     async def test_execute_downloads_and_indexes_each_file(
         self,
-        mock_extract: AsyncMock,
         use_case: ClassicalIndexFolderUseCase,
         mock_storage: AsyncMock,
         mock_vector_store: AsyncMock,
@@ -75,10 +81,6 @@ class TestClassicalIndexFolderUseCase:
             "project/docs/report.pdf",
             "project/docs/notes.txt",
         ]
-        mock_result = MagicMock()
-        mock_result.chunks = []
-        mock_result.content = "text"
-        mock_extract.return_value = mock_result
 
         # Act
         await use_case.execute(
@@ -93,10 +95,8 @@ class TestClassicalIndexFolderUseCase:
         )
         mock_storage.get_object.assert_any_call("test-bucket", "project/docs/notes.txt")
 
-    @patch("application.use_cases.classical_index_folder_use_case.extract_file")
     async def test_execute_filters_by_file_extensions(
         self,
-        mock_extract: AsyncMock,
         use_case: ClassicalIndexFolderUseCase,
         mock_storage: AsyncMock,
     ) -> None:
@@ -106,10 +106,6 @@ class TestClassicalIndexFolderUseCase:
             "project/docs/notes.txt",
             "project/docs/data.xlsx",
         ]
-        mock_result = MagicMock()
-        mock_result.chunks = []
-        mock_result.content = "text"
-        mock_extract.return_value = mock_result
 
         # Act
         await use_case.execute(
@@ -124,10 +120,8 @@ class TestClassicalIndexFolderUseCase:
         )
         mock_storage.get_object.assert_any_call("test-bucket", "project/docs/notes.txt")
 
-    @patch("application.use_cases.classical_index_folder_use_case.extract_file")
     async def test_execute_returns_folder_indexing_result(
         self,
-        mock_extract: AsyncMock,
         use_case: ClassicalIndexFolderUseCase,
         mock_storage: AsyncMock,
     ) -> None:
@@ -135,10 +129,6 @@ class TestClassicalIndexFolderUseCase:
         mock_storage.list_objects.return_value = [
             "project/docs/report.pdf",
         ]
-        mock_result = MagicMock()
-        mock_result.chunks = []
-        mock_result.content = "text"
-        mock_extract.return_value = mock_result
 
         # Act
         result = await use_case.execute(
@@ -170,12 +160,11 @@ class TestClassicalIndexFolderUseCase:
         assert result.status == IndexingStatus.SUCCESS
         assert result.stats.total_files == 0
 
-    @patch("application.use_cases.classical_index_folder_use_case.extract_file")
     async def test_execute_tracks_successful_and_failed_files(
         self,
-        mock_extract: AsyncMock,
         use_case: ClassicalIndexFolderUseCase,
         mock_storage: AsyncMock,
+        mock_document_reader: AsyncMock,
     ) -> None:
         # Arrange
         mock_storage.list_objects.return_value = [
@@ -184,17 +173,14 @@ class TestClassicalIndexFolderUseCase:
         ]
         call_count = 0
 
-        def _extract_with_failure(*args, **kwargs):
+        async def _extract_with_failure(*args, **kwargs):
             nonlocal call_count
             call_count += 1
             if call_count == 2:
                 raise RuntimeError("Extraction failed")
-            mock_result = MagicMock()
-            mock_result.chunks = []
-            mock_result.content = "Good content"
-            return mock_result
+            return ["Good content"]
 
-        mock_extract.side_effect = _extract_with_failure
+        mock_document_reader.extract_chunks.side_effect = _extract_with_failure
 
         # Act
         result = await use_case.execute(
@@ -210,10 +196,12 @@ class TestClassicalIndexFolderUseCase:
         self,
         mock_vector_store: AsyncMock,
         mock_storage: AsyncMock,
+        mock_document_reader: AsyncMock,
     ) -> None:
         # Arrange
         use_case = ClassicalIndexFolderUseCase(
             vector_store=mock_vector_store,
+            document_reader=mock_document_reader,
             storage=mock_storage,
             bucket="custom-folder-bucket",
             output_dir="/custom/output",
@@ -248,21 +236,16 @@ class TestClassicalIndexFolderUseCase:
             "test-bucket", prefix="project/docs/", recursive=False
         )
 
-    @patch("application.use_cases.classical_index_folder_use_case.extract_file")
     async def test_execute_passes_chunk_params(
         self,
-        mock_extract: AsyncMock,
         use_case: ClassicalIndexFolderUseCase,
         mock_storage: AsyncMock,
+        mock_document_reader: AsyncMock,
     ) -> None:
         # Arrange
         mock_storage.list_objects.return_value = [
             "project/docs/report.pdf",
         ]
-        mock_result = MagicMock()
-        mock_result.chunks = []
-        mock_result.content = "text"
-        mock_extract.return_value = mock_result
 
         # Act
         await use_case.execute(
@@ -272,4 +255,7 @@ class TestClassicalIndexFolderUseCase:
         )
 
         # Assert
-        mock_extract.assert_called_once()
+        mock_document_reader.extract_chunks.assert_called_once()
+        call_kwargs = mock_document_reader.extract_chunks.call_args
+        assert call_kwargs.kwargs["chunk_size"] == 500
+        assert call_kwargs.kwargs["chunk_overlap"] == 100

@@ -92,7 +92,7 @@ from infrastructure.database.rls_context import (
     current_credential,
     current_user_id,
 )
-from infrastructure.document_reader.kreuzberg_adapter import KreuzbergAdapter
+from infrastructure.document_reader.xberg_adapter import XbergAdapter
 from infrastructure.mcp.tool_loader import FastMcpToolLoader
 from infrastructure.memory.composable_agents_store_adapter.adapter import (
     ComposableAgentsMemoryStoreAdapter,
@@ -122,7 +122,7 @@ minio_adapter = MinioAdapter(
     secure=minio_config.MINIO_SECURE,
 )
 
-kreuzberg_adapter = KreuzbergAdapter()
+xberg_adapter = XbergAdapter()
 postgres_health_adapter = AsyncpgHealthAdapter(db_config)
 
 classical_rag_config = ClassicalRAGConfig()
@@ -768,6 +768,7 @@ async def get_classical_index_file_use_case() -> ClassicalIndexFileUseCase:
     vector_store = await get_vector_store_for_user()
     return ClassicalIndexFileUseCase(
         vector_store=vector_store,
+        document_reader=xberg_adapter,
         storage=minio_adapter,
         bucket=minio_config.MINIO_BUCKET,
         output_dir=app_config.OUTPUT_DIR,
@@ -779,6 +780,7 @@ async def get_classical_index_folder_use_case() -> ClassicalIndexFolderUseCase:
     vector_store = await get_vector_store_for_user()
     return ClassicalIndexFolderUseCase(
         vector_store=vector_store,
+        document_reader=xberg_adapter,
         storage=minio_adapter,
         bucket=minio_config.MINIO_BUCKET,
         output_dir=app_config.OUTPUT_DIR,
@@ -810,7 +812,7 @@ def get_list_folders_use_case() -> ListFoldersUseCase:
 def get_read_file_use_case() -> ReadFileUseCase:
     return ReadFileUseCase(
         storage=minio_adapter,
-        document_reader=kreuzberg_adapter,
+        document_reader=xberg_adapter,
         bucket=minio_config.MINIO_BUCKET,
         output_dir=app_config.OUTPUT_DIR,
     )

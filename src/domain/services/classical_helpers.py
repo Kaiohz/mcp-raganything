@@ -15,13 +15,10 @@ def validate_path(output_dir: str, file_name: str) -> str:
     return file_path
 
 
-def build_documents_from_extraction(
-    result, file_name: str
+def build_documents_from_chunks(
+    chunk_texts: list[str], file_name: str
 ) -> list[tuple[str, str, dict[str, int]]]:
     documents = []
-    if result.chunks:
-        for i, chunk in enumerate(result.chunks):
-            documents.append((chunk.content, file_name, {"chunk_index": i}))
-    elif result.content and result.content.strip():
-        documents.append((result.content, file_name, {}))
+    for i, chunk_text in enumerate(chunk_texts):
+        documents.append((chunk_text, file_name, {"chunk_index": i}))
     return documents

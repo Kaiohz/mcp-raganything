@@ -65,8 +65,8 @@ class LogMessage(StrEnum):
     )
 
     # --- Document reader (Kreuzberg) ---
-    KREUZBERG_EXTRACTION_FAILED_FOR = "Kreuzberg extraction failed for %s: %s"
-    KREUZBERG_EXTRACTION_DURATION = "Kreuzberg extraction done: file=%s elapsed_ms=%.2f"
+    KREUZBERG_EXTRACTION_FAILED_FOR = "xberg extraction failed for %s: %s"
+    KREUZBERG_EXTRACTION_DURATION = "xberg extraction done: file=%s elapsed_ms=%.2f"
     KREUZBERG_SERIALIZATION_DURATION = (
         "Kreuzberg serialization done: file=%s elapsed_ms=%.2f"
     )
