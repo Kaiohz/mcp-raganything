@@ -309,3 +309,46 @@ class TestXbergAdapterConfig:
     def test_default_ocr_mode_comes_from_settings(self) -> None:
         config = make_xberg_config()
         assert config.ocr is not None
+
+
+class TestPageDictCoercion:
+    """Both xberg page shapes normalize to the page-dict contract."""
+
+    def test_dict_page_reads_keys_and_defaults(self) -> None:
+        from infrastructure.document_reader.xberg_adapter import XbergAdapter
+
+        assert XbergAdapter._page_dict(
+            {"page_number": 3, "content": "body", "tables": []}
+        ) == {"page_number": 3, "content": "body", "tables": []}
+        assert XbergAdapter._page_dict({}) == {
+            "page_number": 1,
+            "content": "",
+            "tables": [],
+        }
+
+    def test_object_page_reads_attributes_and_defaults(self) -> None:
+        from infrastructure.document_reader.xberg_adapter import XbergAdapter
+
+        class FakePage:
+            page_number = 2
+            content = "body"
+
+        assert XbergAdapter._page_dict(FakePage()) == {
+            "page_number": 2,
+            "content": "body",
+            "tables": [],
+        }
+        assert XbergAdapter._page_dict(object()) == {
+            "page_number": 1,
+            "content": "",
+            "tables": [],
+        }
+
+    def test_dict_page_serializes_table_dicts(self) -> None:
+        from infrastructure.document_reader.xberg_adapter import XbergAdapter
+
+        page = {"content": "x", "tables": [{"markdown": "| A |"}, {}]}
+        assert XbergAdapter._page_dict(page)["tables"] == [
+            {"markdown": "| A |"},
+            {"markdown": ""},
+        ]
