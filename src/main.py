@@ -28,7 +28,10 @@ from application.api.mcp_guard import (
 )
 from application.api.mcp_memory_tools import mcp_memories
 from application.api.mcp_registry_routes import mcp_registry_router
-from application.api.mcp_transport_security import McpTransportSecurityGuard
+from application.api.mcp_transport_security import (
+    McpTransportSecurityGuard,
+    apply_mcp_max_request_body_size,
+)
 from application.api.mcp_web_tools import mcp_web
 from application.api.space_routes import space_router
 from application.error_handlers import (
@@ -225,6 +228,7 @@ mcp_memories.add_middleware(mcp_middleware)
 # method-level middleware is not re-deriving it). Do NOT rely on the global
 # FASTMCP_STATELESS_HTTP env var: the fastmcp default is stateful, and the
 # prod configmap only sets it incidentally.
+apply_mcp_max_request_body_size()
 mcp_files_app = mcp_files.http_app(path="/", stateless_http=True)
 mcp_classical_app = mcp_classical.http_app(path="/", stateless_http=True)
 mcp_web_app = mcp_web.http_app(path="/", stateless_http=True)
