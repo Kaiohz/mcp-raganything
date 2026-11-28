@@ -80,20 +80,19 @@ async def test_dual_auth_wired_requests_are_always_scoped_f2_verification(
     documented on ``security.verify_credentials``) is unreachable for an
     authenticated request, because the dual-auth path always sets the
     ``current_user_id`` contextvar the scoping branches read."""
+    # User × agent directive now: an authenticated request with NO agent
+    # header is REJECTED (422) — the personal fallback is not a caller
+    # surface anymore. The scoping branch itself is pinned by the
+    # agent-header tests (rest + mcp) above.
     response = await api.get(REST_LIST, headers=bearer("jwt-alice"))
 
-    assert response.status_code == 200
-    listing = storage_external.calls_for("list_files_metadata")
-    assert listing and listing[-1]["prefix"] == "user-alice/personal/", (
-        "an authenticated request must be scoped (never the unscoped legacy path)"
-    )
+    assert response.status_code == 422
+    assert "agent scope required" in response.json()["detail"].lower()
+    assert storage_external.calls == []
 
 
-async def test_rest_list_without_agent_header_returns_only_personal_scope(
-    api, storage_external
-):
-    """No ``X-Composable-Agent`` header → prefix ``{user_id}/personal/``."""
-    # Arrange — objects across two users and two scopes of user A.
+async def test_rest_list_without_agent_header_is_rejected(api, storage_external):
+    """User × agent directive: no ``X-Composable-Agent`` → 422, no storage."""
     storage_external.seed(
         {
             "user-alice/personal/notes.txt": b"alice personal",
@@ -103,19 +102,17 @@ async def test_rest_list_without_agent_header_returns_only_personal_scope(
         }
     )
 
-    # Act
     response = await api.get(REST_LIST, headers=bearer("jwt-alice"))
 
-    # Assert — only the caller's personal scope is visible.
-    assert response.status_code == 200
-    object_names = [row["object_name"] for row in response.json()]
-    assert object_names == ["user-alice/personal/notes.txt"]
+    assert response.status_code == 422
+    assert "agent scope required" in response.json()["detail"].lower()
+    assert storage_external.calls == []
 
 
-async def test_mcp_list_files_without_agent_header_returns_only_personal_scope(
+async def test_mcp_list_files_without_agent_header_is_rejected(
     mcp_call, storage_external
 ):
-    """MCP variant of the personal fallback (REQ-001)."""
+    """MCP variant (user × agent directive): no agent header → ToolError."""
     storage_external.seed(
         {
             "user-alice/personal/notes.txt": b"alice personal",
@@ -126,8 +123,9 @@ async def test_mcp_list_files_without_agent_header_returns_only_personal_scope(
 
     result = await mcp_call(FILES_MOUNT, "list_files", {"prefix": ""})
 
-    rows = tool_rows(result)
-    assert [row["object_name"] for row in rows] == ["user-alice/personal/notes.txt"]
+    assert result.is_error is True
+    assert "agent scope required" in error_text(result).lower()
+    assert storage_external.calls == []
 
 
 # ---------------------------------------------------------------------------

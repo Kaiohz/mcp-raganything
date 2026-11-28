@@ -4,6 +4,8 @@ import httpx
 import pytest
 from httpx import ASGITransport
 
+import application.api.file_routes as file_routes
+import dependencies
 from application.use_cases.list_files_use_case import ListFilesUseCase
 from application.use_cases.list_folders_use_case import ListFoldersUseCase
 from application.use_cases.read_file_use_case import ReadFileUseCase
@@ -20,6 +22,19 @@ from main import app
 
 
 @pytest.fixture(autouse=True)
+def _required_agent_scope(monkeypatch):
+    """Every data route REQUIRES an agent scope (user × agent directive).
+
+    The suite pins the route contracts under the bound scope user-alice ×
+    agent-x (DI provider doubled: dependencies + route-module binding).
+    """
+    provider = lambda: dependencies.resolve_agent_scope("user-alice", "agent-x")
+    monkeypatch.setattr(dependencies, "get_required_agent_scope", provider)
+    monkeypatch.setattr(file_routes, "get_required_agent_scope", provider)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _clear_dependency_overrides():
     yield
     app.dependency_overrides.clear()
@@ -31,7 +46,7 @@ class TestListFilesRoute:
         mock = AsyncMock(spec=ListFilesUseCase)
         mock.execute.return_value = [
             FileInfo(
-                object_name="docs/report.pdf", size=1024, last_modified="2026-01-01"
+                object_name="user-alice/agent-x/docs/report.pdf", size=1024, last_modified="2026-01-01"
             ),
             FileInfo(
                 object_name="docs/notes.txt", size=512, last_modified="2026-01-02"
@@ -73,7 +88,7 @@ class TestListFilesRoute:
         # Assert
         body = response.json()
         assert len(body) == 2
-        assert body[0]["object_name"] == "docs/report.pdf"
+        assert body[0]["object_name"] == "user-alice/agent-x/docs/report.pdf"
         assert body[0]["size"] == 1024
 
     async def test_list_files_with_prefix_param(
@@ -98,7 +113,7 @@ class TestListFilesRoute:
         assert response.status_code == 200
         mock_list_files_use_case.execute.assert_called_once_with(
             # Arrange
-            prefix="docs/",
+            prefix="user-alice/agent-x/docs/",
             recursive=False,
         )
 
@@ -364,7 +379,7 @@ class TestListFoldersRoute:
         # Assert
         assert response.status_code == 200
         assert response.json() == ["reports/", "exports/"]
-        mock_list_folders_use_case.execute.assert_called_once_with(prefix="docs/")
+        mock_list_folders_use_case.execute.assert_called_once_with(prefix="user-alice/agent-x/docs/")
 
     async def test_list_folders_returns_404_for_missing_bucket(
         self, mock_list_folders_use_case: AsyncMock

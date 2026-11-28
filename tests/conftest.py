@@ -15,6 +15,46 @@ from fastmcp.client.transports import StreamableHttpTransport
 from mcp.shared.exceptions import McpError
 from mcp.types import ErrorData, TextContent
 
+
+# Deterministic RLS context per test: ContextVars NEVER leak between tests —
+# a previous test's agent-scope/user context would flip REQUIRED-scope
+# results (user × agent directive) depending on execution order.
+@pytest.fixture(autouse=True)
+def _reset_rls_contextvars(request):
+    from infrastructure.database.rls_context import (
+        current_agent_scope,
+        current_auth_method,
+        current_credential,
+        current_user_id,
+    )
+
+    for contextvar in (
+        current_user_id,
+        current_agent_scope,
+        current_auth_method,
+        current_credential,
+    ):
+        try:
+            contextvar.set(None)
+        except Exception:
+            pass
+    # UNIT tests only: deterministic default scope for the route-level
+    # REQUIRED-scope dependency (main._scope_dep binds the FUNCTION object —
+    # module-attr patches cannot reach it). Behavioral suites are skipped:
+    # they pin the REAL enforcement contract (including 422s).
+    if "behavioral" not in str(request.fspath):
+        import dependencies as deps
+
+        provider = lambda: deps.resolve_agent_scope("user-alice", "agent-x")
+        from main import app as main_app
+
+        main_app.dependency_overrides[deps.get_required_agent_scope] = provider
+        yield
+        main_app.dependency_overrides.pop(deps.get_required_agent_scope, None)
+    else:
+        yield
+
+
 from domain.entities.indexing_result import (
     FileIndexingResult,
     FolderIndexingResult,

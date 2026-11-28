@@ -25,7 +25,7 @@ from dependencies import (
     get_list_files_use_case,
     get_list_folders_use_case,
     get_read_file_use_case,
-    get_request_agent_scope,
+    get_required_agent_scope,
     get_upload_file_use_case,
     track_space_usage,
 )
@@ -134,29 +134,15 @@ def _validate_delete_prefix(prefix: str) -> str:
 
 
 def _scoped_prefix(prefix: str) -> str:
-    """Compose the storage prefix under the caller's scope (legacy fallback).
+    """Compose the storage prefix under the caller's REQUIRED agent scope.
 
-    The caller-scope composition (scope-rag-memories REQ-003) applies ONLY
-    when the request carries an authenticated identity: with no user context
-    the legacy (unscoped) behaviour is preserved so the existing dev path
-    keeps working. The client-supplied relative part MUST already be
-    validated (``_validate_prefix`` traversal rules run BEFORE composition).
-
-    **SECURITY NOTE (security review FINDING-2, deployment control):** the
-    unscoped legacy path is reachable ONLY while dual-auth is NOT wired (an
-    authenticated request always has a non-empty ``current_user_id`` — the
-    legacy master-key fallback sets none). Production MUST wire the
-    ``AuthService``; failing closed on unwired dual-auth at the router level
-    is the recommended future hardening (see ``security.verify_credentials``).
-
-    Args:
-        prefix: The validated client-relative prefix.
-
-    Returns:
-        The prefix relative to the caller's scope, or the unchanged input in
-        the legacy path.
+    Data-scoped REST surfaces (files listing/reading) never fall through to
+    the personal namespace: every request must carry a valid
+    ``X-Composable-Agent`` (user × agent scoping directive — the personal
+    namespace is a system-internal fallback). Absent/invalid values map to
+    422 (``AgentScopeInvalidError``) BEFORE any storage operation.
     """
-    scope: AgentScope = get_request_agent_scope()
+    scope: AgentScope = get_required_agent_scope()
     if not scope.user_id:
         return prefix
     return scope.scoped_prefix(prefix)
@@ -209,7 +195,7 @@ async def list_folders(
     prefix = _scoped_prefix(_validate_prefix(prefix))
     track_space_usage()
     folders = await use_case.execute(prefix=prefix)
-    scope: AgentScope = get_request_agent_scope()
+    scope: AgentScope = get_required_agent_scope()
     if scope.user_id:
         return scope.relativize_folders(folders)
     return folders
@@ -230,7 +216,7 @@ async def read_file(
 ) -> FileContentResponse:
     """Read one file under the caller's scoped object path (REQ-003/REQ-005)."""
     file_path = request.file_path
-    scope: AgentScope = get_request_agent_scope()
+    scope: AgentScope = get_required_agent_scope()
     if scope.user_id:
         file_path = scope.scoped_object_path(file_path)
     track_space_usage()
@@ -266,7 +252,7 @@ async def upload_file(
     content_type = file.content_type or "application/octet-stream"
     _validate_file_type(safe_name, content_type)
 
-    scope: AgentScope = get_request_agent_scope()
+    scope: AgentScope = get_required_agent_scope()
     scoped_prefix = scope.scoped_prefix(normalized) if scope.user_id else normalized
 
     file_data = await file.read()
@@ -342,7 +328,7 @@ async def delete_file(
     ``default-composable``).
     """
     object_name = _validate_object_path(object_name)
-    scope: AgentScope = get_request_agent_scope()
+    scope: AgentScope = get_required_agent_scope()
     if scope.user_id:
         if working_dir is None:
             # ABSENT: the legacy ``default-composable`` fallback, composed

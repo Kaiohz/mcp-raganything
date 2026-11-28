@@ -6,10 +6,21 @@ import httpx
 import pytest
 from httpx import ASGITransport
 
+import application.api.file_routes as file_routes
+import dependencies
 from application.use_cases.upload_file_use_case import UploadFileUseCase
 from dependencies import get_upload_file_use_case
 from domain.ports.storage_port import FileInfo
 from main import app
+
+
+@pytest.fixture(autouse=True)
+def _required_agent_scope(monkeypatch):
+    """Uploads are agent-scoped (user × agent directive): bind the DI scope."""
+    provider = lambda: dependencies.resolve_agent_scope("user-alice", "agent-x")
+    monkeypatch.setattr(dependencies, "get_required_agent_scope", provider)
+    monkeypatch.setattr(file_routes, "get_required_agent_scope", provider)
+    yield
 
 
 @pytest.fixture(autouse=True)
@@ -113,7 +124,7 @@ class TestUploadFileRoute:
             # Arrange
             file_data=b"image data",
             file_name="photo.jpg",
-            prefix="",
+            prefix="user-alice/agent-x/",
             content_type="image/jpeg",
         )
 

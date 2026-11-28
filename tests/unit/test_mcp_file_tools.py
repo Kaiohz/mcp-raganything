@@ -17,6 +17,18 @@ from domain.ports.document_reader_port import DocumentContent, DocumentMetadata
 from domain.ports.storage_port import FileInfo
 
 
+@pytest.fixture(autouse=True)
+def _required_agent_scope(monkeypatch):
+    """The agent-facing data tools REQUIRE a scope (user × agent directive):
+    bind user "tool-user" × agent "agent-x" for every direct tool call."""
+    import dependencies
+    scope = dependencies.resolve_agent_scope("tool-user", "agent-x")
+    monkeypatch.setattr(
+        "application.api.mcp_file_tools.get_required_agent_scope", lambda: scope
+    )
+    yield
+
+
 class TestMCPFilesInstance:
     """Verify the FastMCP instance configuration."""
 
@@ -113,7 +125,7 @@ class TestListFiles:
             await list_files()
 
         # Assert
-        mock_use_case.execute.assert_called_once_with(prefix="", recursive=True)
+        mock_use_case.execute.assert_called_once_with(prefix="tool-user/agent-x/", recursive=True)
 
     async def test_calls_use_case_with_custom_prefix(
         self, mock_files: list[FileInfo]
@@ -132,7 +144,7 @@ class TestListFiles:
 
         # Assert
         mock_use_case.execute.assert_called_once_with(
-            prefix="reports/", recursive=False
+            prefix="tool-user/agent-x/reports/", recursive=False
         )
 
     async def test_returns_empty_list_when_no_files(self) -> None:
@@ -195,7 +207,7 @@ class TestListFolders:
             result = await list_folders(prefix="docs/")
 
         # Assert
-        mock_use_case.execute.assert_called_once_with(prefix="docs/")
+        mock_use_case.execute.assert_called_once_with(prefix="tool-user/agent-x/docs/")
         assert result == ["reports/"]
 
     async def test_rejects_path_traversal_prefix(self) -> None:

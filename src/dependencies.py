@@ -63,6 +63,7 @@ from domain.errors.base import DomainError
 from domain.errors.config import DependencyNotInitializedError
 from domain.errors.llm import LlmNotConfiguredError
 from domain.errors.messages import ErrorMessage
+from domain.errors.scope import AgentScopeInvalidError
 from domain.logging.messages import LogMessage
 from domain.ports.auth.api_key_repository import ApiKeyRepositoryPort
 from domain.ports.auth.jwt_service import JwtServicePort
@@ -249,6 +250,29 @@ def get_request_agent_scope() -> AgentScope:
             storage operation).
     """
     return resolve_agent_scope(current_user_id.get(), current_agent_scope.get())
+
+
+def get_required_agent_scope() -> AgentScope:
+    """Resolve the caller scope REQUIRING an agent header (user × agent).
+
+    Data-scoped surfaces (agent-facing files / classical tools and routes)
+    must never fall through to the personal namespace: every operation is
+    bound to an explicit ``X-Composable-Agent`` scope (user directive — the
+    personal namespace stays a system-internal fallback only).
+
+    Returns:
+        The immutable :class:`AgentScope` for the request.
+
+    Raises:
+        AgentScopeInvalidError: When the header is absent/empty (or its value
+            invalid) — mapped to 422 / ``ToolError`` before any storage op.
+    """
+    raw = current_agent_scope.get()
+    if raw is None or not raw.strip():
+        raise AgentScopeInvalidError(
+            ErrorMessage.AGENT_SCOPE_REQUIRED.format(header="X-Composable-Agent")
+        )
+    return resolve_agent_scope(current_user_id.get(), raw)
 
 
 # --- Background space-touch state (declared BEFORE its users, code-review

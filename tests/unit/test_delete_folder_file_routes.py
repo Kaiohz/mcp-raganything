@@ -4,6 +4,8 @@ import httpx
 import pytest
 from httpx import ASGITransport
 
+import application.api.file_routes as file_routes
+import dependencies
 from application.use_cases.create_folder_use_case import CreateFolderUseCase
 from application.use_cases.delete_file_use_case import DeleteFileUseCase
 from application.use_cases.delete_folder_use_case import DeleteFolderUseCase
@@ -13,6 +15,20 @@ from dependencies import (
     get_delete_folder_use_case,
 )
 from main import app
+
+
+@pytest.fixture(autouse=True)
+def _required_agent_scope(monkeypatch):
+    """Every data route now REQUIRES an agent scope (user × agent directive).
+
+    The suite pins the route contracts under the bound scope user-alice ×
+    agent-x — the DI provider is doubled (dependencies + the route module's
+    import-time binding).
+    """
+    provider = lambda: dependencies.resolve_agent_scope("user-alice", "agent-x")
+    monkeypatch.setattr(dependencies, "get_required_agent_scope", provider)
+    monkeypatch.setattr(file_routes, "get_required_agent_scope", provider)
+    yield
 
 
 @pytest.fixture(autouse=True)
@@ -40,6 +56,7 @@ class TestCreateFolderRoute:
         ) as client:
             response = await client.post(
                 "/api/v1/files/folders",
+                headers={"X-Composable-Agent": "test-agent"},
                 json={"prefix": "docs"},
             )
 
@@ -57,9 +74,13 @@ class TestCreateFolderRoute:
         async with httpx.AsyncClient(
             transport=ASGITransport(app=app), base_url="http://test"
         ) as client:
-            await client.post("/api/v1/files/folders", json={"prefix": "docs"})
+            await client.post(
+                "/api/v1/files/folders",
+                headers={"X-Composable-Agent": "test-agent"},
+                json={"prefix": "docs"},
+            )
 
-        mock_create_folder_use_case.execute.assert_called_once_with(prefix="docs")
+        mock_create_folder_use_case.execute.assert_called_once_with(prefix="user-alice/agent-x/docs/")
 
     async def test_rejects_empty_prefix(self) -> None:
         async with httpx.AsyncClient(
@@ -67,6 +88,7 @@ class TestCreateFolderRoute:
         ) as client:
             response = await client.post(
                 "/api/v1/files/folders",
+                headers={"X-Composable-Agent": "test-agent"},
                 json={"prefix": ""},
             )
 
@@ -78,6 +100,7 @@ class TestCreateFolderRoute:
         ) as client:
             response = await client.post(
                 "/api/v1/files/folders",
+                headers={"X-Composable-Agent": "test-agent"},
                 json={"prefix": "/docs"},
             )
 
@@ -103,6 +126,7 @@ class TestDeleteFileRoute:
         ) as client:
             response = await client.delete(
                 "/api/v1/files",
+                headers={"X-Composable-Agent": "test-agent"},
                 params={
                     "object_name": "docs/report.pdf",
                     "working_dir": "docs/",
@@ -125,6 +149,7 @@ class TestDeleteFileRoute:
         ) as client:
             await client.delete(
                 "/api/v1/files",
+                headers={"X-Composable-Agent": "test-agent"},
                 params={
                     "object_name": "docs/report.pdf",
                     "working_dir": "docs/",
@@ -132,8 +157,8 @@ class TestDeleteFileRoute:
             )
 
         mock_delete_file_use_case.execute.assert_called_once_with(
-            object_path="docs/report.pdf",
-            working_dir="docs/",
+            object_path="user-alice/agent-x/docs/report.pdf",
+            working_dir="user-alice/agent-x/docs/",
         )
 
     async def test_rejects_missing_object_name(self) -> None:
@@ -159,13 +184,14 @@ class TestDeleteFileRoute:
         ) as client:
             response = await client.delete(
                 "/api/v1/files",
+                headers={"X-Composable-Agent": "test-agent"},
                 params={"object_name": "report.pdf"},
             )
 
         assert response.status_code == 200
         mock_delete_file_use_case.execute.assert_called_once_with(
-            object_path="report.pdf",
-            working_dir="default-composable",
+            object_path="user-alice/agent-x/report.pdf",
+            working_dir="user-alice/agent-x/default-composable/",
         )
 
 
@@ -188,6 +214,7 @@ class TestDeleteFolderRoute:
         ) as client:
             response = await client.delete(
                 "/api/v1/files/folders",
+                headers={"X-Composable-Agent": "test-agent"},
                 params={"prefix": "docs"},
             )
 
@@ -207,10 +234,11 @@ class TestDeleteFolderRoute:
         ) as client:
             await client.delete(
                 "/api/v1/files/folders",
+                headers={"X-Composable-Agent": "test-agent"},
                 params={"prefix": "docs"},
             )
 
-        mock_delete_folder_use_case.execute.assert_called_once_with(prefix="docs")
+        mock_delete_folder_use_case.execute.assert_called_once_with(prefix="user-alice/agent-x/docs/")
 
     async def test_rejects_missing_prefix(self) -> None:
         async with httpx.AsyncClient(

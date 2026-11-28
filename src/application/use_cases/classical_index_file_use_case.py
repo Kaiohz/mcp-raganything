@@ -15,7 +15,7 @@ from domain.services.classical_helpers import (
     build_documents_from_chunks,
     validate_path,
 )
-from domain.services.scope import resolve_agent_scope
+from domain.services.scope import require_agent_scope
 from infrastructure.database.rls_context import (
     current_agent_scope,
     current_user_id,
@@ -76,7 +76,7 @@ class ClassicalIndexFileUseCase:
         try:
             user_id = current_user_id.get()
             if user_id is not None:
-                scope = resolve_agent_scope(user_id, current_agent_scope.get())
+                scope = require_agent_scope(user_id, current_agent_scope.get())
                 working_dir = scope.scoped_working_dir(working_dir)
                 file_name = scope.scoped_object_path(file_name)
                 if self._space_recorder is not None:

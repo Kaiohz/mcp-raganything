@@ -58,6 +58,7 @@ from dependencies import (
     classical_bm25_adapter,
     classical_vector_store,
     db_config,
+    get_required_agent_scope,
 )
 from domain.errors.base import DomainError
 from domain.errors.classical import ClassicalConfigError
@@ -506,9 +507,13 @@ app.include_router(health_router, prefix=REST_PATH)
 # ``verify_api_key`` check on the ``X-API-Key`` header, so the REST routers
 # keep working in dev/test and during the startup window.
 _auth_dep = [Depends(rest_security.verify_credentials)]
-app.include_router(file_router, prefix=REST_PATH, dependencies=_auth_dep)
-app.include_router(classical_indexing_router, prefix=REST_PATH, dependencies=_auth_dep)
-app.include_router(classical_query_router, prefix=REST_PATH, dependencies=_auth_dep)
+# User × agent directive: the data REST routers REQUIRE the agent scope —
+# validated at the ROUTE level (422) so the use cases' caught-error paths
+# (202 FAILED payloads) never swallow an enforcement violation.
+_scope_dep = [Depends(rest_security.verify_credentials), Depends(get_required_agent_scope)]
+app.include_router(file_router, prefix=REST_PATH, dependencies=_scope_dep)
+app.include_router(classical_indexing_router, prefix=REST_PATH, dependencies=_scope_dep)
+app.include_router(classical_query_router, prefix=REST_PATH, dependencies=_scope_dep)
 # mcp_registry_router already carries the full /api/v1/mcp/servers prefix, so
 # it is included without an additional prefix (only the auth dependency).
 app.include_router(mcp_registry_router, dependencies=_auth_dep)

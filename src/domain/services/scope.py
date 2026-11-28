@@ -86,3 +86,28 @@ def resolve_agent_scope(
     # INFO here would flood every request's logs.
     _logger.debug(LogMessage.SCOPE_RESOLVED, user_id, agent_slug)
     return AgentScope(user_id=user_id or "", agent_slug=agent_slug)
+
+
+def require_agent_scope(user_id: str | None, raw_agent_header: str | None) -> AgentScope:
+    """Resolve the caller scope REQUIREING an agent header (user × agent).
+
+    Data-scoped surfaces (classical indexing/query) must never fall through
+    to the personal namespace: every operation is bound to an explicit
+    ``X-Composable-Agent`` value (user directive — the personal namespace
+    stays a system-internal fallback only).
+
+    Args:
+        user_id: The authenticated principal id from the RLS contextvar.
+        raw_agent_header: The raw ``X-Composable-Agent`` header value.
+
+    Returns:
+        The immutable :class:`AgentScope` for the request.
+
+    Raises:
+        AgentScopeInvalidError: When the header is absent/empty (or invalid).
+    """
+    if raw_agent_header is None or not raw_agent_header.strip():
+        raise AgentScopeInvalidError(
+            ErrorMessage.AGENT_SCOPE_REQUIRED.format(header="X-Composable-Agent")
+        )
+    return resolve_agent_scope(user_id, raw_agent_header)

@@ -72,9 +72,8 @@ async def test_rest_upload_stores_object_under_the_caller_scope_prefix(
     assert stored and stored[-1]["object_path"] == "user-alice/agent-x/docs/hello.txt"
 
 
-async def test_rest_upload_without_header_lands_in_personal_scope(
-    api, storage_external
-):
+async def test_rest_upload_without_header_is_rejected(api, storage_external):
+    """User × agent directive: no data op without an agent scope."""
     response = await api.post(
         f"{REST}/upload",
         headers=ALICE,
@@ -82,9 +81,9 @@ async def test_rest_upload_without_header_lands_in_personal_scope(
         files={"file": ("notes.txt", b"personal note", "text/plain")},
     )
 
-    assert response.status_code == 201
-    body = response.json()
-    assert body["object_name"] == "user-alice/personal/notes.txt"
+    assert response.status_code == 422
+    assert "agent scope required" in response.json()["detail"].lower()
+    assert storage_external.calls == []
 
 
 async def test_rest_upload_rejects_traversal_even_inside_the_scope(
@@ -115,7 +114,6 @@ async def test_rest_upload_rejects_traversal_even_inside_the_scope(
             ["user-alice/agent-x/docs/report.txt", "user-alice/agent-x/plan.md"],
         ),
         ("jwt-alice", "agent-y", ["user-alice/agent-y/other.md"]),
-        ("jwt-alice", None, ["user-alice/personal/notes.txt"]),
         ("jwt-bob", "agent-x", ["user-bob/agent-x/task.md"]),
     ],
 )
@@ -123,14 +121,26 @@ async def test_mcp_list_files_isolation_matrix_user_x_agent(
     mcp_call, storage_external, credential, agent, expected
 ):
     storage_external.seed(CROSS_SCOPE_OBJECTS)
-    headers = {"Authorization": f"Bearer {credential}"}
-    if agent:
-        headers[AGENT_HEADER] = agent
-
+    headers = {"Authorization": f"Bearer {credential}", AGENT_HEADER: agent}
     result = await mcp_call(FILES_MOUNT, "list_files", {"prefix": ""}, headers=headers)
-
     rows = tool_rows(result)
     assert [row["object_name"] for row in rows] == sorted(expected)
+
+
+async def test_mcp_list_files_without_agent_header_is_rejected(
+    mcp_call, storage_external
+):
+    """User × agent directive: the personal fallback is gone."""
+    storage_external.seed(CROSS_SCOPE_OBJECTS)
+    result = await mcp_call(
+        FILES_MOUNT,
+        "list_files",
+        {"prefix": ""},
+        headers={"Authorization": "Bearer jwt-alice"},
+    )
+    assert result.is_error is True
+    assert "agent scope required" in error_text(result).lower()
+    assert storage_external.calls == []
 
 
 async def test_mcp_list_folders_is_scoped(mcp_call, storage_external):
@@ -160,7 +170,6 @@ async def test_mcp_list_folders_is_scoped(mcp_call, storage_external):
     [
         (WITH_AGENT_X, ["user-alice/agent-x/plan.md"]),
         (WITH_AGENT_Y, []),
-        (ALICE, ["user-alice/personal/notes.txt"]),
         # Bob with agent-x sees ONLY his own fresh scope: his own object is
         # visible, none of Alice's data ever is (same contract as the MCP
         # isolation matrix above and the "fresh empty scope" scope-resolution
@@ -175,7 +184,6 @@ async def test_rest_list_files_isolated_by_caller_scope(
 ):
     storage_external.seed(
         {
-            "user-alice/personal/notes.txt": b"alice personal",
             "user-alice/agent-x/plan.md": b"alice agent-x",
             "user-bob/agent-x/task.md": b"bob agent-x",
         }
@@ -185,6 +193,17 @@ async def test_rest_list_files_isolated_by_caller_scope(
 
     assert response.status_code == 200
     assert [row["object_name"] for row in response.json()] == expected
+
+
+async def test_rest_list_files_without_agent_header_is_rejected(
+    api, storage_external
+):
+    """User × agent directive: no data op without an agent scope."""
+    response = await api.get(f"{REST}/list", headers=ALICE, params={"prefix": ""})
+
+    assert response.status_code == 422
+    assert "agent scope required" in response.json()["detail"].lower()
+    assert storage_external.calls == []
 
 
 async def test_rest_list_folders_returns_only_caller_scope_folders(
