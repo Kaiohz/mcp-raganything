@@ -29,3 +29,12 @@ class DocumentReaderPort(ABC):
         self, file_path: str, mime_type: str = ""
     ) -> DocumentContent:
         pass
+
+    @abstractmethod
+    async def extract_chunks(
+        self,
+        file_path: str,
+        chunk_size: int = 1000,
+        chunk_overlap: int = 200,
+    ) -> list[str]:
+        """Extract a document and return its text chunks (classical RAG)."""

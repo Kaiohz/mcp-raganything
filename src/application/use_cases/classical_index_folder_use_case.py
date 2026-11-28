@@ -5,7 +5,6 @@ from collections.abc import Callable
 from pathlib import Path
 
 import aiofiles
-from kreuzberg import ExtractionConfig, extract_file
 
 from application.use_cases._user_id_tag import tag_documents_with_user_id
 from domain.entities.indexing_result import (
@@ -15,10 +14,11 @@ from domain.entities.indexing_result import (
     IndexingStatus,
 )
 from domain.logging.messages import LogMessage
+from domain.ports.document_reader_port import DocumentReaderPort
 from domain.ports.storage_port import StoragePort
 from domain.ports.vector_store_port import VectorStorePort
 from domain.services.classical_helpers import (
-    build_documents_from_extraction,
+    build_documents_from_chunks,
     validate_path,
 )
 from domain.services.scope import resolve_agent_scope
@@ -26,7 +26,6 @@ from infrastructure.database.rls_context import (
     current_agent_scope,
     current_user_id,
 )
-from infrastructure.document_reader.kreuzberg_adapter import make_extraction_config
 
 logger = logging.getLogger(__name__)
 
@@ -47,11 +46,13 @@ class ClassicalIndexFolderUseCase:
         self,
         vector_store: VectorStorePort,
         storage: StoragePort,
+        document_reader: DocumentReaderPort,
         bucket: str,
         output_dir: str,
         space_recorder: Callable[[str], None] | None = None,
     ) -> None:
         self.vector_store = vector_store
+        self.document_reader = document_reader
         self.storage = storage
         self.bucket = bucket
         self.output_dir = output_dir
@@ -64,7 +65,8 @@ class ClassicalIndexFolderUseCase:
         *,
         index: int,
         total: int,
-        config: ExtractionConfig,
+        chunk_size: int,
+        chunk_overlap: int,
     ) -> FileProcessingDetail:
         """Extract, chunk and index one storage object; never raises.
 
@@ -74,7 +76,9 @@ class ClassicalIndexFolderUseCase:
             index: Zero-based position of this file (logs use ``index + 1``,
                 matching the historical ``processed + failed`` counters).
             total: Total number of files in this batch.
-            config: Kreuzberg extraction configuration.
+            chunk_size: Maximum characters per chunk (forwarded to the
+                document reader).
+            chunk_overlap: Overlap characters between adjacent chunks.
 
         Returns:
             :class:`FileProcessingDetail` for this file (SUCCESS or FAILED).
@@ -94,9 +98,11 @@ class ClassicalIndexFolderUseCase:
             async with aiofiles.open(local_path, "wb") as f:
                 await f.write(data)
 
-            result = await extract_file(local_path, config=config)
+            chunk_texts = await self.document_reader.extract_chunks(
+                local_path, chunk_size=chunk_size, chunk_overlap=chunk_overlap
+            )
 
-            documents = build_documents_from_extraction(result, file_name)
+            documents = build_documents_from_chunks(chunk_texts, file_name)
 
             documents = tag_documents_with_user_id(documents)
 
@@ -184,17 +190,14 @@ class ClassicalIndexFolderUseCase:
         processed = 0
         failed = 0
         file_results = []
-        config = make_extraction_config(
-            chunk_size=chunk_size, chunk_overlap=chunk_overlap
-        )
-
         for index, file_name in enumerate(files):
             detail = await self._process_file(
                 working_dir,
                 file_name,
                 index=index,
                 total=len(files),
-                config=config,
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
             )
             if detail.status is IndexingStatus.SUCCESS:
                 processed += 1

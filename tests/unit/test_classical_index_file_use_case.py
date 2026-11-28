@@ -1,4 +1,4 @@
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -10,31 +10,31 @@ from domain.entities.indexing_result import FileIndexingResult, IndexingStatus
 
 class TestClassicalIndexFileUseCase:
     @pytest.fixture
+    def mock_document_reader(self) -> AsyncMock:
+        reader = AsyncMock()
+        reader.extract_chunks.return_value = ["chunk text"]
+        return reader
+
+    @pytest.fixture
     def use_case(
         self,
         mock_vector_store: AsyncMock,
         mock_storage: AsyncMock,
+        mock_document_reader: AsyncMock,
     ) -> ClassicalIndexFileUseCase:
         return ClassicalIndexFileUseCase(
             vector_store=mock_vector_store,
+            document_reader=mock_document_reader,
             storage=mock_storage,
             bucket="test-bucket",
             output_dir="/tmp/output",
         )
 
-    @patch("application.use_cases.classical_index_file_use_case.extract_file")
     async def test_execute_downloads_file_from_storage(
         self,
-        mock_extract: AsyncMock,
         use_case: ClassicalIndexFileUseCase,
         mock_storage: AsyncMock,
     ) -> None:
-        # Arrange
-        mock_result = MagicMock()
-        mock_result.chunks = []
-        mock_result.content = "Some text"
-        mock_extract.return_value = mock_result
-
         # Act
         await use_case.execute(
             file_name="reports/quarterly.pdf",
@@ -46,19 +46,11 @@ class TestClassicalIndexFileUseCase:
             "test-bucket", "reports/quarterly.pdf"
         )
 
-    @patch("application.use_cases.classical_index_file_use_case.extract_file")
     async def test_execute_ensures_vector_store_table(
         self,
-        mock_extract: AsyncMock,
         use_case: ClassicalIndexFileUseCase,
         mock_vector_store: AsyncMock,
     ) -> None:
-        # Arrange
-        mock_result = MagicMock()
-        mock_result.chunks = []
-        mock_result.content = "text"
-        mock_extract.return_value = mock_result
-
         # Act
         await use_case.execute(
             file_name="report.pdf",
@@ -68,46 +60,33 @@ class TestClassicalIndexFileUseCase:
         # Assert
         mock_vector_store.ensure_table.assert_called_once_with("/tmp/rag/project_1")
 
-    @patch("application.use_cases.classical_index_file_use_case.extract_file")
-    async def test_execute_extracts_content_via_kreuzberg(
+    async def test_execute_extracts_content_via_document_reader(
         self,
-        mock_extract: AsyncMock,
         use_case: ClassicalIndexFileUseCase,
+        mock_document_reader: AsyncMock,
     ) -> None:
-        # Arrange
-        mock_result = MagicMock()
-        mock_result.chunks = []
-        mock_result.content = "Extracted text"
-        mock_extract.return_value = mock_result
-
         # Act
         await use_case.execute(
             file_name="docs/report.pdf",
             working_dir="/tmp/rag/project_42",
         )
-
-        # Assert
-        mock_extract.assert_called_once()
-        call_args = mock_extract.call_args
-        assert call_args[0][0].endswith("docs/report.pdf") or "report.pdf" in str(
-            call_args
+        await use_case.execute(
+            file_name="report.pdf",
+            working_dir="/tmp/rag/project_1",
+            chunk_size=500,
+            chunk_overlap=100,
         )
 
-    @patch("application.use_cases.classical_index_file_use_case.extract_file")
+        # Assert — the reader is called once per file with the local temp path
+        first, second = mock_document_reader.extract_chunks.call_args_list
+        assert first.args[0].endswith("report.pdf")
+        assert second.kwargs == {"chunk_size": 500, "chunk_overlap": 100}
+
     async def test_execute_adds_documents_to_vector_store(
         self,
-        mock_extract: AsyncMock,
         use_case: ClassicalIndexFileUseCase,
         mock_vector_store: AsyncMock,
     ) -> None:
-        # Arrange
-        mock_result = MagicMock()
-        chunk = MagicMock()
-        chunk.content = "chunk text"
-        mock_result.chunks = [chunk]
-        mock_result.content = "full text"
-        mock_extract.return_value = mock_result
-
         # Act
         await use_case.execute(
             file_name="report.pdf",
@@ -120,44 +99,13 @@ class TestClassicalIndexFileUseCase:
         assert call_kwargs[1]["working_dir"] == "/tmp/rag/project_1"
         documents = call_kwargs[1]["documents"]
         assert isinstance(documents, list)
-        assert len(documents) > 0
+        assert documents == [("chunk text", "report.pdf", {"chunk_index": 0})]
 
-    @patch("application.use_cases.classical_index_file_use_case.extract_file")
-    async def test_execute_passes_chunk_size_and_overlap(
-        self,
-        mock_extract: AsyncMock,
-        use_case: ClassicalIndexFileUseCase,
-    ) -> None:
-        # Arrange
-        mock_result = MagicMock()
-        mock_result.chunks = []
-        mock_result.content = "text"
-        mock_extract.return_value = mock_result
-
-        # Act
-        await use_case.execute(
-            file_name="report.pdf",
-            working_dir="/tmp/rag/project_1",
-            chunk_size=500,
-            chunk_overlap=100,
-        )
-
-        # Assert
-        mock_extract.assert_called_once()
-
-    @patch("application.use_cases.classical_index_file_use_case.extract_file")
     async def test_execute_uses_default_chunk_params(
         self,
-        mock_extract: AsyncMock,
         use_case: ClassicalIndexFileUseCase,
-        mock_vector_store: AsyncMock,
+        mock_document_reader: AsyncMock,
     ) -> None:
-        # Arrange
-        mock_result = MagicMock()
-        mock_result.chunks = []
-        mock_result.content = "text"
-        mock_extract.return_value = mock_result
-
         # Act
         await use_case.execute(
             file_name="report.pdf",
@@ -165,20 +113,14 @@ class TestClassicalIndexFileUseCase:
         )
 
         # Assert
-        mock_vector_store.add_documents.assert_called_once()
+        mock_document_reader.extract_chunks.assert_called_once()
+        call_args = mock_document_reader.extract_chunks.call_args
+        assert call_args[1] == {"chunk_size": 1000, "chunk_overlap": 200}
 
-    @patch("application.use_cases.classical_index_file_use_case.extract_file")
     async def test_execute_returns_file_indexing_result_on_success(
         self,
-        mock_extract: AsyncMock,
         use_case: ClassicalIndexFileUseCase,
     ) -> None:
-        # Arrange
-        mock_result = MagicMock()
-        mock_result.chunks = []
-        mock_result.content = "text"
-        mock_extract.return_value = mock_result
-
         # Act
         result = await use_case.execute(
             file_name="report.pdf",
@@ -208,14 +150,15 @@ class TestClassicalIndexFileUseCase:
         assert result.status == IndexingStatus.FAILED
         assert result.error is not None
 
-    @patch("application.use_cases.classical_index_file_use_case.extract_file")
     async def test_execute_returns_failed_result_on_extraction_error(
         self,
-        mock_extract: AsyncMock,
         use_case: ClassicalIndexFileUseCase,
+        mock_document_reader: AsyncMock,
     ) -> None:
         # Arrange
-        mock_extract.side_effect = RuntimeError("Unsupported format")
+        mock_document_reader.extract_chunks.side_effect = RuntimeError(
+            "Unsupported format"
+        )
 
         # Act
         result = await use_case.execute(
@@ -243,21 +186,11 @@ class TestClassicalIndexFileUseCase:
         # Assert
         assert result.status == IndexingStatus.FAILED
 
-    @patch("application.use_cases.classical_index_file_use_case.extract_file")
     async def test_execute_adds_documents_with_file_path_metadata(
         self,
-        mock_extract: AsyncMock,
         use_case: ClassicalIndexFileUseCase,
         mock_vector_store: AsyncMock,
     ) -> None:
-        # Arrange
-        chunk = MagicMock()
-        chunk.content = "chunk text"
-        mock_result = MagicMock()
-        mock_result.chunks = [chunk]
-        mock_result.content = "full text"
-        mock_extract.return_value = mock_result
-
         # Act
         await use_case.execute(
             file_name="docs/report.pdf",
@@ -274,10 +207,12 @@ class TestClassicalIndexFileUseCase:
         self,
         mock_vector_store: AsyncMock,
         mock_storage: AsyncMock,
+        mock_document_reader: AsyncMock,
     ) -> None:
         # Arrange
         use_case = ClassicalIndexFileUseCase(
             vector_store=mock_vector_store,
+            document_reader=mock_document_reader,
             storage=mock_storage,
             bucket="custom-bucket",
             output_dir="/custom/output",
@@ -294,18 +229,14 @@ class TestClassicalIndexFileUseCase:
         # Assert
         mock_storage.get_object.assert_called_once_with("custom-bucket", "test.pdf")
 
-    @patch("application.use_cases.classical_index_file_use_case.extract_file")
     async def test_execute_processes_empty_document(
         self,
-        mock_extract: AsyncMock,
         use_case: ClassicalIndexFileUseCase,
+        mock_document_reader: AsyncMock,
         mock_vector_store: AsyncMock,
     ) -> None:
         # Arrange
-        mock_result = MagicMock()
-        mock_result.chunks = []
-        mock_result.content = ""
-        mock_extract.return_value = mock_result
+        mock_document_reader.extract_chunks.return_value = []
 
         # Act
         result = await use_case.execute(
@@ -315,3 +246,4 @@ class TestClassicalIndexFileUseCase:
 
         # Assert
         assert result.status == IndexingStatus.SUCCESS
+        mock_vector_store.add_documents.assert_not_called()

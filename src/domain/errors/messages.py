@@ -37,8 +37,8 @@ class ErrorMessage(StrEnum):
     # --- Document reader (Kreuzberg) ---
     UNSUPPORTED_FILE_FORMAT = "Unsupported file format: {error}"
     INVALID_FILE = "Invalid file: {error}"
-    KREUZBERG_EXTRACTION_FAILED = "Kreuzberg extraction failed: {error}"
-    KREUZBERG_EXTRACTION_TIMED_OUT = "Kreuzberg extraction timed out after {timeout}s"
+    KREUZBERG_EXTRACTION_FAILED = "Document extraction failed: {error}"
+    KREUZBERG_EXTRACTION_TIMED_OUT = "Document extraction timed out after {timeout}s"
 
     # --- Classical RAG helpers / BM25 ---
     FILE_NAME_ESCAPES_OUTPUT_DIR = "file_name escapes output directory: {file_name}"

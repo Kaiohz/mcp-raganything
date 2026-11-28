@@ -20,33 +20,34 @@ metadata passed to ``add_documents`` and the filter passed to
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from infrastructure.database.rls_context import current_user_id
 
 
 class TestIndexingUserIsolation:
     """Indexing use cases must tag chunks with ``user_id`` metadata."""
 
-    @patch("application.use_cases.classical_index_file_use_case.extract_file")
+    @pytest.fixture
+    def mock_document_reader(self) -> AsyncMock:
+        reader = AsyncMock()
+        reader.extract_chunks.return_value = ["chunk text"]
+        return reader
+
     async def test_index_file_tags_chunks_with_user_id_when_contextvar_set(
         self,
-        mock_extract: AsyncMock,
         mock_vector_store: AsyncMock,
         mock_storage: AsyncMock,
+        mock_document_reader: AsyncMock,
     ) -> None:
         # Arrange
         from application.use_cases.classical_index_file_use_case import (
             ClassicalIndexFileUseCase,
         )
 
-        chunk = MagicMock()
-        chunk.content = "chunk text"
-        mock_result = MagicMock()
-        mock_result.chunks = [chunk]
-        mock_result.content = "full text"
-        mock_extract.return_value = mock_result
-
         use_case = ClassicalIndexFileUseCase(
             vector_store=mock_vector_store,
+            document_reader=mock_document_reader,
             storage=mock_storage,
             bucket="test-bucket",
             output_dir="/tmp/output",
@@ -70,27 +71,20 @@ class TestIndexingUserIsolation:
         finally:
             current_user_id.reset(token)
 
-    @patch("application.use_cases.classical_index_file_use_case.extract_file")
     async def test_index_file_no_user_id_when_contextvar_none(
         self,
-        mock_extract: AsyncMock,
         mock_vector_store: AsyncMock,
         mock_storage: AsyncMock,
+        mock_document_reader: AsyncMock,
     ) -> None:
         # Arrange — contextvar default None (legacy path)
         from application.use_cases.classical_index_file_use_case import (
             ClassicalIndexFileUseCase,
         )
 
-        chunk = MagicMock()
-        chunk.content = "chunk text"
-        mock_result = MagicMock()
-        mock_result.chunks = [chunk]
-        mock_result.content = "full text"
-        mock_extract.return_value = mock_result
-
         use_case = ClassicalIndexFileUseCase(
             vector_store=mock_vector_store,
+            document_reader=mock_document_reader,
             storage=mock_storage,
             bucket="test-bucket",
             output_dir="/tmp/output",

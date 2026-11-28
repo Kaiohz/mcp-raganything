@@ -320,8 +320,8 @@ async def list_folders(prefix: str = "") -> list[str]:
 async def read_file(file_path: str) -> FileContentResponse:
     """Read and extract text content from one file in the caller's scope.
 
-    Supports 91 file formats including PDF, Office documents, images, HTML,
-    etc. Uses Kreuzberg for document intelligence extraction.
+    Supports 90+ file formats including PDF, Office documents, images, HTML,
+    etc. Uses xberg for document intelligence extraction.
 
     Args:
         file_path: Path to the file, relative to the caller's scope (e.g.

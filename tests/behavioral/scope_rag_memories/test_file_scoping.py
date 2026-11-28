@@ -13,6 +13,7 @@ routes; only the outbound MinIO boundary is a recording double.
 """
 
 import base64
+
 import pytest
 
 pytestmark = pytest.mark.asyncio(loop_scope="session")
@@ -527,8 +528,8 @@ def test_apply_mcp_max_request_body_size_patches_the_fastmcp_lifespan_symbol():
 
     from application.api.mcp_transport_security import (
         LargeBodyStreamableHTTPSessionManager,
-        mcp_max_request_body_size,
         apply_mcp_max_request_body_size,
+        mcp_max_request_body_size,
     )
 
     assert mcp_max_request_body_size() > 4 * 1024 * 1024
