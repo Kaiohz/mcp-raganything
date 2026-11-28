@@ -1,20 +1,27 @@
-"""TDD (Red) tests for the new temporary-file MCP tools — spec
-``chat-pdf-attachments`` §5.3 (REQ-029..035, REQ-047, EDG-015) and §9.6.
+"""TDD tests for the temporary-file MCP tools — spec ``chat-pdf-attachments``
+§5.3 (REQ-029..035, REQ-047, EDG-015) and §9.6, AMENDED by the user × agent
+directive (chat_tmp Option 2).
 
-Two tools are added to ``/files/mcp`` (module ``application.api.mcp_file_tools``):
+Two tools live in ``/files/mcp`` (module ``application.api.mcp_file_tools``):
 
 * ``temporary_upload_file(file_name, content_base64, content_type, prefix)``
   — REQ-030/031/032/033: strict base64, basename + traversal guards, the
   EXISTING MIME/extension rules, the 50 MiB limit (``FILES_MAX_UPLOAD_SIZE``
-  env overridable with the 52428800 default), user isolation
-  ``prefix == chat_tmp/<current_user_id>/...``, reusing the REAL
-  ``UploadFileUseCase`` + existing RustFS storage, and returning the
-  ``{"object_name", "size", "content_type"}`` JSON contract.
+  env overridable with the 52428800 default), the scoped namespace
+  ``<user_id>/<agent_slug>/chat_tmp/<thread_id>/<attachment_id>/...`` (the
+  RELATIVE prefix carries NO user id — the identity is the REQUIRED agent
+  scope), reusing the REAL ``UploadFileUseCase`` + existing RustFS storage,
+  and returning the ``{"object_name", "size", "content_type"}`` JSON contract.
 * ``temporary_delete_file(object_path)`` — REQ-034/035/REQ-047: only paths
-  under ``chat_tmp/<current_user_id>/`` are accepted, ONLY the RustFS object
-  is removed and the pgvector cascade is NEVER triggered (the vector store /
-  ``DeleteFileUseCase`` must remain untouched); the delete is idempotent
-  (EDG-015).
+  under the scoped ``chat_tmp/<thread_id>/<attachment_id>/`` shape are
+  accepted, ONLY the RustFS object is removed and the pgvector cascade is
+  NEVER triggered (the vector store / ``DeleteFileUseCase`` must remain
+  untouched); the delete is idempotent (EDG-015).
+
+User × agent directive (Option 2): BOTH temporary tools REQUIRE the agent
+scope — the backend always forwards the thread's agent as
+``X-Composable-Agent``; an absent scope is a ``ToolError`` before any
+storage operation.
 
 These tests follow the established Files-MCP tool-test convention
 (``tests/unit/test_mcp_file_tools.py``): the REAL FastMCP tool function is
@@ -38,12 +45,12 @@ from application.api.temporary_path_policy import (
 )
 from domain.errors.storage import StorageNotFoundError
 from domain.ports.storage_port import StoragePort
-from infrastructure.database.rls_context import current_user_id
+from infrastructure.database.rls_context import current_agent_scope, current_user_id
 
 PDF_BYTES = b"%PDF-1.7 temporary document payload"
 PDF_B64 = base64.b64encode(PDF_BYTES).decode()
 
-AUTHORIZED_PREFIX = "chat_tmp/user-a/thread-1/att-1/"
+AUTHORIZED_PREFIX = "chat_tmp/thread-1/att-1/"
 
 
 def _patch_storage(monkeypatch, storage_mock: AsyncMock) -> None:
@@ -70,9 +77,12 @@ def storage_mock() -> AsyncMock:
 
 @pytest.fixture
 def as_user_a(monkeypatch):
-    token = current_user_id.set("user-a")
+    """The bounded REQUIRED scope under test: user-a × agent-x."""
+    user_token = current_user_id.set("user-a")
+    agent_token = current_agent_scope.set("agent-x")
     yield
-    current_user_id.reset(token)
+    current_agent_scope.reset(agent_token)
+    current_user_id.reset(user_token)
 
 
 @pytest.fixture(autouse=True)
@@ -118,10 +128,11 @@ class TestTemporaryUploadFile:
 
         result = await _upload()
 
-        # The tool RETURNS the client-relative path; the STORAGE key is
-        # composed under the caller's scope (write side == read side of the
-        # agent-facing tools, scope-rag-memories REQ-003).
-        expected_object = f"{AUTHORIZED_PREFIX}rapport.pdf"
+        # The tool RETURNS the client-relative path (NO user id segment —
+        # chat_tmp Option 2); the STORAGE key is composed under the REQUIRED
+        # agent scope (write side == read side of the agent-facing tools,
+        # scope-rag-memories REQ-003).
+        expected_object = "chat_tmp/thread-1/att-1/rapport.pdf"
         assert result["object_name"] == expected_object
         assert result["size"] == len(PDF_BYTES)
         assert result["content_type"] == "application/pdf"
@@ -129,7 +140,7 @@ class TestTemporaryUploadFile:
             0
         ] or storage_mock.put_object.call_args.kwargs.get("bucket")
         assert bucket == "raganything", storage_mock.put_object.call_args
-        scoped_key = f"user-a/personal/{expected_object}"
+        scoped_key = f"user-a/agent-x/{expected_object}"
         assert storage_mock.put_object.call_args.args[1:4] == (
             scoped_key,
             PDF_BYTES,
@@ -186,22 +197,26 @@ class TestEnvMaxUploadSize:
         with pytest.raises(ToolError):
             await _upload(file_name="../../etc/passwd.pdf")
         with pytest.raises(ToolError):
-            await _upload(prefix="chat_tmp/user-a/../../etc")
+            await _upload(prefix="chat_tmp/thread-1/../../etc")
         storage_mock.put_object.assert_not_called()
 
-    async def test_rejects_prefix_outside_own_user_namespace(
+    async def test_rejects_prefix_outside_the_scoped_tmp_shape(
         self, storage_mock, as_user_a, monkeypatch
     ):
-        """REQ-031 isolation: prefix MUST start with chat_tmp/<current_user_id>/."""
+        """REQ-031 (Option 2): the prefix MUST match
+        chat_tmp/<thread_id>/<attachment_id>/ — other roots and the bare
+        root are refused. A foreign-user-looking segment is NOT special: it
+        is just a thread id name under the caller's own scope."""
         _patch_storage(monkeypatch, storage_mock)
-        for foreign_prefix in (
-            "chat_tmp/user-b/thread-1/att-1/",
+        for bad_prefix in (
             "documents/shared/",
-            "chat_tmp/",  # missing user segment
+            "chat_tmp/",  # missing thread/attachment segments
+            "chat_tmp/thread-1/",  # missing attachment segment
             "uploads/tmp/",
+            "attachments/dir/",
         ):
             with pytest.raises(ToolError):
-                await _upload(prefix=foreign_prefix)
+                await _upload(prefix=bad_prefix)
         storage_mock.put_object.assert_not_called()
 
     async def test_requires_authenticated_user(self, storage_mock, monkeypatch):
@@ -209,10 +224,29 @@ class TestEnvMaxUploadSize:
         # prefix and must refuse rather than upload unscoped.
         _patch_storage(monkeypatch, storage_mock)
         token = current_user_id.set(None)
+        agent_token = current_agent_scope.set("agent-x")
         try:
             with pytest.raises(ToolError):
                 await _upload()
         finally:
+            current_agent_scope.reset(agent_token)
+            current_user_id.reset(token)
+        storage_mock.put_object.assert_not_called()
+
+    async def test_requires_the_agent_scope(
+        self, storage_mock, monkeypatch
+    ):
+        """User × agent directive (chat_tmp Option 2): WITHOUT
+        ``X-Composable-Agent`` the temporary tool is refused BEFORE any
+        storage operation — the legacy lenient composition is gone."""
+        _patch_storage(monkeypatch, storage_mock)
+        token = current_user_id.set("user-a")
+        token_missing = current_agent_scope.set(None)
+        try:
+            with pytest.raises(ToolError, match="(?i)agent scope"):
+                await _upload()
+        finally:
+            current_agent_scope.reset(token_missing)
             current_user_id.reset(token)
         storage_mock.put_object.assert_not_called()
 
@@ -225,13 +259,13 @@ class TestTemporaryDeleteFile:
         _patch_storage(monkeypatch, storage_mock)
         from application.api.mcp_file_tools import temporary_delete_file
 
-        object_path = "chat_tmp/user-a/thread-1/att-1/rapport.pdf"
+        object_path = "chat_tmp/thread-1/att-1/rapport.pdf"
         result = await temporary_delete_file(object_path)
 
         storage_mock.remove_object.assert_called_once()
         args, kwargs = storage_mock.remove_object.call_args
         # The REMOVE composes the caller's scope (the write side is scoped).
-        expected_scoped = f"user-a/personal/{object_path}"
+        expected_scoped = f"user-a/agent-x/{object_path}"
         assert (
             args[1] == expected_scoped or kwargs.get("object_path") == expected_scoped
         )
@@ -245,7 +279,8 @@ class TestTemporaryDeleteFile:
 
         for evil_path in (
             "documents/shared/keep.pdf",
-            "chat_tmp/user-b/thread-2/att-2/foreign.pdf",
+            "chat_tmp/thread-1/att-1/",  # folder-shaped: no FILENAME segment
+            "chat_tmp/thread-1/rapport.pdf",  # missing the attachment segment
             "../../etc/passwd",
             "/absolute/path.pdf",
             "chat_tmp/",
@@ -261,7 +296,7 @@ class TestTemporaryDeleteFile:
         _patch_storage(monkeypatch, storage_mock)
         from application.api.mcp_file_tools import temporary_delete_file
 
-        object_path = "chat_tmp/user-a/thread-1/att-1/rapport.pdf"
+        object_path = "chat_tmp/thread-1/att-1/rapport.pdf"
         await temporary_delete_file(object_path)
         await temporary_delete_file(object_path)  # second call must not raise
         assert storage_mock.remove_object.call_count == 2
@@ -276,10 +311,8 @@ class TestTemporaryDeleteFile:
         storage_mock.remove_object.side_effect = StorageNotFoundError(
             "no such bucket/object"
         )
-        result = await temporary_delete_file(
-            "chat_tmp/user-a/thread-1/att-1/rapport.pdf"
-        )
-        assert result["deleted"] == "chat_tmp/user-a/thread-1/att-1/rapport.pdf"
+        result = await temporary_delete_file("chat_tmp/thread-1/att-1/rapport.pdf")
+        assert result["deleted"] == "chat_tmp/thread-1/att-1/rapport.pdf"
         assert result["present"] is False
 
     async def test_delete_surfaces_a_real_storage_failure_for_retry(
@@ -295,7 +328,25 @@ class TestTemporaryDeleteFile:
 
         storage_mock.remove_object.side_effect = RuntimeError("AccessDenied")
         with pytest.raises(ToolError):
-            await temporary_delete_file("chat_tmp/user-a/thread-1/att-1/rapport.pdf")
+            await temporary_delete_file("chat_tmp/thread-1/att-1/rapport.pdf")
+
+    async def test_delete_requires_the_agent_scope(
+        self, storage_mock, monkeypatch
+    ):
+        """User × agent directive: the delete side refuses an absent agent
+        scope before touching storage (legacy lenient composition gone)."""
+        _patch_storage(monkeypatch, storage_mock)
+        from application.api.mcp_file_tools import temporary_delete_file
+
+        token = current_user_id.set("user-a")
+        token_missing = current_agent_scope.set(None)
+        try:
+            with pytest.raises(ToolError, match="(?i)agent scope"):
+                await temporary_delete_file("chat_tmp/thread-1/att-1/rapport.pdf")
+        finally:
+            current_agent_scope.reset(token_missing)
+            current_user_id.reset(token)
+        storage_mock.remove_object.assert_not_called()
 
 
 class TestNoPgvectorCascadeEver:
@@ -310,7 +361,7 @@ class TestNoPgvectorCascadeEver:
         from application.api.mcp_file_tools import temporary_delete_file
 
         await _upload()
-        await temporary_delete_file("chat_tmp/user-a/thread-1/att-1/rapport.pdf")
+        await temporary_delete_file("chat_tmp/thread-1/att-1/rapport.pdf")
         assert mcp_files.name == "Files"  # same server instance, no re-registration
 
 
@@ -320,10 +371,11 @@ class TestTemporaryPathPolicyBranches:
     Parametrized over the exact error paths the review uncovered
     (empty value, absolute path, residual ``..`` segment, folder-form
     normalisation, foreign/other roots, basename reduction, control
-    characters).
+    characters). Shapes follow the user × agent directive (chat_tmp
+    Option 2): ``chat_tmp/<thread_id>/<attachment_id>/<file>`` — NO user
+    segment in the relative path.
     """
 
-    USER = "user-a"
     TMP_ROOT = "chat_tmp"
 
     # --- validate_temporary_prefix ------------------------------------------------
@@ -335,31 +387,31 @@ class TestTemporaryPathPolicyBranches:
             "/absolute/prefix/",  # absolute
             "..",  # pure traversal (normpath keeps "..")
             "../etc",  # traversal above the root
-            "chat_tmp/user-a/../../etc",  # traversal inside an authorized shape
-            "chat_tmp",  # root alone → no user segment
-            "chat_tmp/",  # root with slash → no user segment
-            "chat_tmp/user-b/thread/att",  # foreign user
+            "chat_tmp/thread-1/../../etc",  # traversal inside an authorized shape
+            "chat_tmp",  # root alone → no scoping segments
+            "chat_tmp/",  # root with slash → no scoping segments
+            "chat_tmp/thread-1",  # thread only → missing attachment
             "documents/shared/",  # outside the temporary root
             "uploads/tmp/",  # other root
         ],
     )
     def test_prefix_rejected(self, bad_prefix):
         with pytest.raises(ValueError):
-            validate_temporary_prefix(bad_prefix, self.USER)
+            validate_temporary_prefix(bad_prefix)
 
     @pytest.mark.parametrize(
         "good_prefix,expected",
         [
-            ("chat_tmp/user-a/thread-1/att-1/", "chat_tmp/user-a/thread-1/att-1/"),
+            ("chat_tmp/thread-1/att-1/", "chat_tmp/thread-1/att-1/"),
             # a missing trailing slash on an authorized shape stays accepted
-            ("chat_tmp/user-a/thread-1/att-1", "chat_tmp/user-a/thread-1/att-1"),
+            ("chat_tmp/thread-1/att-1", "chat_tmp/thread-1/att-1"),
             # normpath strips the trailing slash → the folder form is restored
-            ("chat_tmp/user-a/thread-1//att-1///", "chat_tmp/user-a/thread-1/att-1/"),
-            ("chat_tmp/user-a/./t/a", "chat_tmp/user-a/t/a"),
+            ("chat_tmp/thread-1//att-1///", "chat_tmp/thread-1/att-1/"),
+            ("chat_tmp/./t/a", "chat_tmp/t/a"),
         ],
     )
     def test_prefix_accepted_and_normalized(self, good_prefix, expected):
-        assert validate_temporary_prefix(good_prefix, self.USER) == expected
+        assert validate_temporary_prefix(good_prefix) == expected
 
     # --- validate_temporary_object_path -------------------------------------------
     @pytest.mark.parametrize(
@@ -369,28 +421,30 @@ class TestTemporaryPathPolicyBranches:
             "/absolute/path.pdf",  # absolute
             "..",  # pure traversal
             "../../etc/passwd",  # traversal above the root
-            "chat_tmp/user-a/../../etc/passwd",  # traversal inside the shape
+            "chat_tmp/thread-1/../../etc/passwd",  # traversal inside the shape
             "chat_tmp",  # root alone
-            "chat_tmp/user-b/thread-2/att-2/foreign.pdf",  # foreign user
+            "chat_tmp/thread-1/",  # missing attachment + file
+            "chat_tmp/thread-1/rapport.pdf",  # missing the attachment segment
+            "chat_tmp/thread-1/att-1/",  # folder-shaped: no file segment
             "documents/shared/keep.pdf",  # outside the temporary root
         ],
     )
     def test_object_path_rejected(self, bad_path):
         with pytest.raises(ValueError):
-            validate_temporary_object_path(bad_path, self.USER)
+            validate_temporary_object_path(bad_path)
 
     @pytest.mark.parametrize(
         "good_path,expected",
         [
-            ("chat_tmp/user-a/t/a/rapport.pdf", "chat_tmp/user-a/t/a/rapport.pdf"),
+            ("chat_tmp/thread-1/att-1/rapport.pdf", "chat_tmp/thread-1/att-1/rapport.pdf"),
             (
-                "chat_tmp/user-a/t//a/x.pdf",
-                "chat_tmp/user-a/t/a/x.pdf",
+                "chat_tmp/thread-1//att-1/x.pdf",
+                "chat_tmp/thread-1/att-1/x.pdf",
             ),  # double slash collapse
         ],
     )
     def test_object_path_accepted_and_normalized(self, good_path, expected):
-        assert validate_temporary_object_path(good_path, self.USER) == expected
+        assert validate_temporary_object_path(good_path) == expected
 
     # --- sanitize_temporary_file_name ----------------------------------------------
     @pytest.mark.parametrize(

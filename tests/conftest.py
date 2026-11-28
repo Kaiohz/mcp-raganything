@@ -246,9 +246,18 @@ def mcp_client_factory(running_app):
         credential: str | None = "jwt-alice",
         headers: dict[str, str] | None = None,
     ):
-        request_headers = (
-            _credential_headers(credential) if headers is None else headers
-        )
+        request_headers = _credential_headers(credential)
+        if headers is not None:
+            if not headers or "Authorization" in headers or "X-API-Key" in headers:
+                # Suites FORGING the auth state explicitly want the replace
+                # semantics: a dict carrying its own credential (subject
+                # under test) replaces whole; an EMPTY dict deliberately
+                # clears the credential (the no-auth probe).
+                request_headers = headers
+            else:
+                # MERGE: suites pass extra headers (agent scope, session
+                # ids) while still authenticating via ``credential``.
+                request_headers = {**request_headers, **headers}
 
         def httpx_client_factory(
             headers: dict[str, str] | None = None,

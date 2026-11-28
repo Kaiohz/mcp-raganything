@@ -420,7 +420,9 @@ async def test_files_mount_still_exposes_the_public_file_tools(mcp_list):
 
 
 # ---------------------------------------------------------------------------
-# REQ-004: the temporary chat-attachment policy is unchanged
+# REQ-004 + user × agent directive (chat_tmp Option 2): the temporary
+# chat-attachment paths carry NO user id — the identity is the REQUIRED
+# agent scope composed server-side.
 # ---------------------------------------------------------------------------
 
 
@@ -429,7 +431,9 @@ async def test_temporary_upload_composes_the_caller_scope_before_chat_tmp(
 ):
     """chat_tmp rides the CALLER'S scope (write == read of the agent-facing
     file tools, scope-rag-memories REQ-003): the scoped composition applies
-    in front of the RELATIVE chat_tmp prefix."""
+    in front of the RELATIVE chat_tmp prefix — and WITHOUT the agent header
+    the tool is refused (user × agent directive, Option 2): the legacy
+    lenient composition is gone."""
     result = await mcp_call(
         FILES_MOUNT,
         "temporary_upload_file",
@@ -437,7 +441,7 @@ async def test_temporary_upload_composes_the_caller_scope_before_chat_tmp(
             "file_name": "attachment.txt",
             "content_base64": "aGVsbG8=",
             "content_type": "text/plain",
-            "prefix": "chat_tmp/user-alice/session-1",
+            "prefix": "chat_tmp/session-1/att-1",
         },
         headers={**{"Authorization": "Bearer jwt-alice"}, AGENT_HEADER: "agent-x"},
     )
@@ -447,13 +451,15 @@ async def test_temporary_upload_composes_the_caller_scope_before_chat_tmp(
     assert (
         stored
         and stored[-1]["object_path"]
-        == "user-alice/agent-x/chat_tmp/user-alice/session-1/attachment.txt"
+        == "user-alice/agent-x/chat_tmp/session-1/att-1/attachment.txt"
     )
 
 
-async def test_temporary_upload_still_rejects_another_users_chat_tmp_prefix(
+async def test_temporary_upload_without_agent_header_is_rejected(
     mcp_call, storage_external
 ):
+    """The temporary tools REQUIRE the agent scope now — no header, no
+    storage operation (chat_tmp Option 2)."""
     result = await mcp_call(
         FILES_MOUNT,
         "temporary_upload_file",
@@ -461,25 +467,27 @@ async def test_temporary_upload_still_rejects_another_users_chat_tmp_prefix(
             "file_name": "attachment.txt",
             "content_base64": "aGVsbG8=",
             "content_type": "text/plain",
-            "prefix": "chat_tmp/user-bob/evil",
+            "prefix": "chat_tmp/session-1/att-1",
         },
-        headers={**{"Authorization": "Bearer jwt-alice"}, AGENT_HEADER: "agent-x"},
+        # Authorization carries the caller, but NO X-Composable-Agent.
+        headers={"Authorization": "Bearer jwt-alice"},
     )
 
     assert result.is_error is True
+    assert "agent scope required" in error_text(result).lower()
     assert storage_external.calls_for("put_object") == []
 
 
 async def test_temporary_delete_composes_the_caller_scope_like_the_write_side(
     mcp_call, storage_external
 ):
-    scoped_name = "user-alice/agent-x/chat_tmp/user-alice/session-1/attachment.txt"
+    scoped_name = "user-alice/agent-x/chat_tmp/session-1/att-1/attachment.txt"
     storage_external.seed({scoped_name: b"hello"})
 
     result = await mcp_call(
         FILES_MOUNT,
         "temporary_delete_file",
-        {"object_path": "chat_tmp/user-alice/session-1/attachment.txt"},
+        {"object_path": "chat_tmp/session-1/att-1/attachment.txt"},
         headers={**{"Authorization": "Bearer jwt-alice"}, AGENT_HEADER: "agent-x"},
     )
 
@@ -498,7 +506,7 @@ async def test_temporary_upload_of_disallowed_type_still_rejected(
             "file_name": "malware.exe",
             "content_base64": "aGVsbG8=",
             "content_type": "application/x-msdownload",
-            "prefix": "chat_tmp/user-alice/x",
+            "prefix": "chat_tmp/session-1/att-1",
         },
     )
 
@@ -526,7 +534,7 @@ async def test_mcp_transport_accepts_mcp_post_bodies_above_the_sdk_4mib_default(
             "file_name": "big.pdf",
             "content_base64": base64.b64encode(payload).decode(),
             "content_type": "application/pdf",
-            "prefix": "chat_tmp/user-alice/session-1",
+            "prefix": "chat_tmp/session-1/att-1",
         },
         headers=WITH_AGENT_X,
     )
@@ -534,7 +542,7 @@ async def test_mcp_transport_accepts_mcp_post_bodies_above_the_sdk_4mib_default(
     assert result.is_error is False, error_text(result)
     stored = storage_external.calls_for("put_object")
     assert stored and stored[-1]["size"] == 8 * 1024 * 1024
-    assert stored[-1]["object_path"].endswith("chat_tmp/user-alice/session-1/big.pdf")
+    assert stored[-1]["object_path"].endswith("chat_tmp/session-1/att-1/big.pdf")
 
 
 def test_apply_mcp_max_request_body_size_patches_the_fastmcp_lifespan_symbol():
