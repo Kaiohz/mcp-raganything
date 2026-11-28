@@ -26,7 +26,6 @@ from application.api.mcp_guard import (
     McpAuthGuard,
     public_discovery_origin,
 )
-from application.api.mcp_memory_tools import mcp_memories
 from application.api.mcp_registry_routes import mcp_registry_router
 from application.api.mcp_transport_security import (
     McpTransportSecurityGuard,
@@ -91,7 +90,7 @@ logger = logging.getLogger(__name__)
 #: The four built-in MCP mount paths (wired below). The per-mount
 #: protected-resource documents (QA BUG-002) are served for these paths plus
 #: the ``/generated/{name}/mcp`` pattern the registry mounts at runtime.
-MCP_MOUNT_PATHS = ("/files/mcp", "/classical/mcp", "/web/mcp", "/memories/mcp")
+MCP_MOUNT_PATHS = ("/files/mcp", "/classical/mcp", "/web/mcp")
 
 #: The MCP resource advertised by the GLOBAL protected-resource metadata
 #: document (REQ-002-equivalent). QA BUG-002: one document cannot serve four
@@ -177,12 +176,11 @@ def _shutdown_adapters() -> list[tuple[object, LogMessage]]:
     return [
         (classical_bm25_adapter, LogMessage.APP_BM25_CLOSE_FAILED),
         (classical_vector_store, LogMessage.APP_CLASSICAL_VS_CLOSE_FAILED),
-        # The web/memory adapters are lazy singletons; access them through the
+        # The web adapters are lazy singletons; access them through the
         # dependencies module at call time so shutdown sees the built
         # instances.
         (_deps.web_crawler_adapter, LogMessage.CRAWLER_CLOSE_FAILED),
         (_deps.web_search_adapter, LogMessage.WEB_SEARCH_EXECUTOR_CLOSE_FAILED),
-        (_deps.memory_store_adapter, LogMessage.MEMORY_STORE_CLOSE_FAILED),
         # Code-review 🟡-3: the drop-capable vector adapter builds its own
         # SQLAlchemy PGEngine on first cascade drop — closed here so no pool
         # outlives the process.
@@ -195,8 +193,8 @@ async def db_lifespan(_app: FastAPI):
     """Close process-wide resources and connection pools on shutdown.
 
     Closes the shared web crawler (if it was lazily created), the dedicated
-    DDGS search executor, any dangling memory-store HTTP client and the
-    drop-capable vector adapter, in addition to the classical RAG adapters.
+    DDGS search executor and the drop-capable vector adapter, in addition to
+    the classical RAG adapters.
     Every close is idempotent so repeated shutdowns are harmless. The
     background space-write tasks are drained FIRST (code-review iteration-4
     🟡-3): they must not hit the closing asyncpg pool.
@@ -217,7 +215,6 @@ mcp_middleware = McpApiKeyMiddleware(master_key=app_config.API_KEY)
 mcp_files.add_middleware(mcp_middleware)
 mcp_classical.add_middleware(mcp_middleware)
 mcp_web.add_middleware(mcp_middleware)
-mcp_memories.add_middleware(mcp_middleware)
 
 # STATELESS transport (CRITICAL fix, code-review C-1): each HTTP request — and
 # the MCP tool task it dispatches — runs under its OWN task context, so the
@@ -232,7 +229,6 @@ apply_mcp_max_request_body_size()
 mcp_files_app = mcp_files.http_app(path="/", stateless_http=True)
 mcp_classical_app = mcp_classical.http_app(path="/", stateless_http=True)
 mcp_web_app = mcp_web.http_app(path="/", stateless_http=True)
-mcp_memories_app = mcp_memories.http_app(path="/", stateless_http=True)
 
 
 def build_mcp_guard_stack(inner_app: ASGIApp, mount_path: str) -> ASGIApp:
@@ -459,7 +455,6 @@ async def combined_lifespan(app: FastAPI):
         mcp_files_app.lifespan(app),
         mcp_classical_app.lifespan(app),
         mcp_web_app.lifespan(app),
-        mcp_memories_app.lifespan(app),
     ):
         yield
 
@@ -668,7 +663,7 @@ async def oauth_protected_resource_for_mount(
 # each FastMCP app (above) as defense-in-depth behind the HTTP guard.
 for _mount_path, _mcp_app in zip(
     MCP_MOUNT_PATHS,
-    (mcp_files_app, mcp_classical_app, mcp_web_app, mcp_memories_app),
+    (mcp_files_app, mcp_classical_app, mcp_web_app),
     strict=True,
 ):
     _guarded = build_mcp_guard_stack(_mcp_app, _mount_path)

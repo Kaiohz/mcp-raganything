@@ -35,7 +35,7 @@ pytestmark = pytest.mark.asyncio(loop_scope="session")
 #: The production proxy Host / the foreign (never allowed) Host.
 PROD_HOST = "raganything.soludev.tech"
 FOREIGN_HOST = "dns-rebind.evil.example"
-MCP_MOUNTS = ("/files/mcp", "/classical/mcp", "/web/mcp", "/memories/mcp")
+MCP_MOUNTS = ("/files/mcp", "/classical/mcp", "/web/mcp")
 #: Accepted credentials from the root ``auth_directory`` external doubles.
 API_KEY_KEY_ALICE = "key-alice"
 
@@ -86,7 +86,7 @@ class TestDefaultPortHostForms:
     ):
         resp = await mcp_post(
             http_client,
-            f"http://{PROD_HOST}:443/memories/mcp/",
+            f"http://{PROD_HOST}:443/files/mcp/",
             headers={"X-API-Key": API_KEY_KEY_ALICE},
         )
         assert resp.status_code == 200, (
@@ -99,7 +99,7 @@ class TestDefaultPortHostForms:
     ):
         resp = await mcp_post(
             http_client,
-            f"http://{PROD_HOST}:80/memories/mcp/",
+            f"http://{PROD_HOST}:80/files/mcp/",
             headers={"X-API-Key": API_KEY_KEY_ALICE},
         )
         assert resp.status_code == 200, (
@@ -112,7 +112,7 @@ class TestDefaultPortHostForms:
     ):
         resp = await mcp_post(
             http_client,
-            f"http://{FOREIGN_HOST}:443/memories/mcp/",
+            f"http://{FOREIGN_HOST}:443/files/mcp/",
             headers={"X-API-Key": API_KEY_KEY_ALICE},
         )
         assert resp.status_code == 421, (

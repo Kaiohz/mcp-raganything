@@ -76,7 +76,7 @@ class TestInvalidJwtNeverFallsBackToApiKey:
         )
         assert_unauthorized_with_challenge(resp, "/files/mcp")
 
-    @pytest.mark.parametrize("mount", ["/classical/mcp", "/web/mcp", "/memories/mcp"])
+    @pytest.mark.parametrize("mount", ["/classical/mcp", "/web/mcp", "/files/mcp"])
     async def test_no_fallback_contract_covers_every_mount(
         self, http_client, mount, mcp_post
     ):
@@ -122,39 +122,3 @@ class TestApiKeyFlowRegressionPins:
                 await mcp_list("/files/mcp", credential=API_KEY_KEY_ALICE)
         finally:
             repo.find_active_by_hash.side_effect = original_side_effect
-
-    async def test_valid_api_key_flow_is_unchanged(self, mcp_call, memory_external):
-        """REQ-012 regression pin: the plain `X-API-Key` flow still
-        authenticates via hash lookup and scopes the upstream call to the
-        key's OWNER (RLS context)."""
-        result = await mcp_call(
-            "/memories/mcp",
-            "save_memory",
-            {"name": "precedence", "content": "api key pin"},
-            credential=API_KEY_KEY_ALICE,
-        )
-
-        assert result.is_error is False, result.content
-        assert memory_external.stored(API_KEY_KEY_ALICE, "precedence") == "api key pin"
-        assert memory_external.stored("jwt-alice", "precedence") is None
-        assert all(
-            request.headers.get("x-api-key") == API_KEY_KEY_ALICE
-            and request.headers.get("authorization") is None
-            for request in memory_external.requests
-        )
-
-    async def test_valid_jwt_takes_precedence_over_the_api_key(
-        self, mcp_call, memory_external
-    ):
-        """Edge pin: both valid credentials → the JWT wins and ONLY its owner
-        context reaches the upstream (no cross-user leak)."""
-        result = await mcp_call(
-            "/memories/mcp",
-            "save_memory",
-            {"name": "precedence", "content": "jwt wins"},
-            headers={"Authorization": "Bearer jwt-alice", "X-API-Key": "key-bob"},
-        )
-
-        assert result.is_error is False, result.content
-        assert memory_external.stored("jwt-alice", "precedence") == "jwt wins"
-        assert memory_external.stored("key-bob", "precedence") is None

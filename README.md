@@ -23,8 +23,7 @@ The service also hosts the **MCP server registry** — a CRUD API for registerin
         | api/ + use_cases/            |       | Files           | /files/mcp
         |   files + classical RAG      |       | ClassicalRAG    | /classical/mcp
         |   registry + health          |       | Web             | /web/mcp
-        |   web_search_use_case        |       | Memories        | /memories/mcp
-        |   save_memory_use_case       |       +---------------+
+        |   web_search_use_case        |       +---------------+
         +------------------------------+
         |   IndexFolderUseCase         |
         |   QueryUseCase               |
@@ -183,12 +182,6 @@ mcp_servers:
     headers:
       Authorization: "Bearer ${USER_JWT}"
       X-API-Key: "${USER_API_KEY}"
-  - name: memories
-    transport: http
-    url: https://raganything.soludev.tech/memories/mcp
-    headers:
-      Authorization: "Bearer ${USER_JWT}"
-      X-API-Key: "${USER_API_KEY}"
   - name: files
     transport: http
     url: https://raganything.soludev.tech/files/mcp
@@ -210,7 +203,7 @@ mcp_servers:
 
 ### MCP OAuth2 discovery (feat-mcp-oauth2-dual-auth)
 
-Every MCP mount (`/files/mcp`, `/classical/mcp`, `/web/mcp`, `/memories/mcp`, generated `/generated/{name}/mcp`) implements the MCP authorization discovery chain:
+Every MCP mount (`/files/mcp`, `/classical/mcp`, `/web/mcp`, generated `/generated/{name}/mcp`) implements the MCP authorization discovery chain:
 
 1. an unauthenticated request (including `initialize`) is answered HTTP `401` with
    `WWW-Authenticate: Bearer resource_metadata="https://<host>/.well-known/oauth-protected-resource/<mount>"`
@@ -222,7 +215,7 @@ Every MCP mount (`/files/mcp`, `/classical/mcp`, `/web/mcp`, `/memories/mcp`, ge
    `:443`/`:80` forms, foreign hosts answered `421`) and the fallback discovery-origin derivation
    (`MCP_PUBLIC_BASE_URL` always wins when set); `MCP_ALLOWED_ORIGINS` accepts browser MCP clients
    (CORS `*` is translated to Origin-not-validated; explicit origins are exact);
-4. no `307` redirect on either path form (`/memories/mcp` ↔ `/memories/mcp/`) and no `http://`
+4. no `307` redirect on either path form (`/web/mcp` ↔ `/web/mcp/`) and no `http://`
    scheme downgrade behind the proxy.
 
 Recommended deployment env (mirrors the flux configmap prerequisites in `src/main.py`):
@@ -252,12 +245,12 @@ When `current_user_id` is `None` (e.g. local dev with auth disabled), the factor
 
 ### Agent & personal scopes (`X-Composable-Agent`)
 
-Every authenticated request also carries a **scope slug** that isolates an agent's RAG corpus, files and memories inside the caller's own data:
+Every authenticated request also carries a **scope slug** that isolates an agent's RAG corpus and files inside the caller's own data:
 
 1. The scope value is read from the `X-Composable-Agent` HTTP header. **Absent → `personal`** (the user's own default space — old clients keep working).
 2. The value must match `^[a-z0-9][a-z0-9-]{0,99}$`; an invalid value is rejected with **422** (REST) / `ToolError` (MCP) before any storage operation.
 3. The `user_id` always comes from the authenticated credential (JWT / `X-API-Key`) — never from a header — so cross-user access is impossible by construction. Two clients presenting the same header value are always isolated per user.
-4. Every file operation is prefixed `{user_id}/{agent_slug}/…`, every `working_dir` is composed `{user_id}/{agent_slug}/{working_dir}`, and memories live under `/memories/{agent_slug}/{name}.md` (personal: `/memories/{name}.md`). Intra-user spoofing of the header (claiming another of **your own** agents' slugs) is accepted and documented — everything stays inside the same account.
+4. Every file operation is prefixed `{user_id}/{agent_slug}/…` and every `working_dir` is composed `{user_id}/{agent_slug}/{working_dir}`. Intra-user spoofing of the header (claiming another of **your own** agents' slugs) is accepted and documented — everything stays inside the same account.
 
 External MCP clients (OpenCode, Claude Code, …) configure the header per scope — e.g. one MCP server entry per scope with different `headers` in `opencode.jsonc`, all pointing at the same URL:
 
@@ -294,9 +287,7 @@ curl -X DELETE https://<host>/api/v1/spaces/opencode -H "Authorization: Bearer <
 
 Invalid slugs (`personal`, non-matching charset) are rejected with 422; per-user live-space count is capped (`MAX_SPACES_PER_USER`). The composable-agents agent lifecycle provisions/deprovisions these spaces automatically.
 
-### Scoped memories tools + data migration
-
-The dedicated Memories MCP server exposes four tools — `save_memory`, `list_memories`, `get_memory`, `delete_memory` — all resolving the caller scope from `X-Composable-Agent` (see above): agent memories are stored at `/memories/{agent_slug}/{name}.md` and validated with the same slug rule (one segment; deeper nesting rejected).
+### Scope data migration
 
 Pre-existing (pre-feature) data must be migrated so it lands in the `personal` tree — a maintenance-window task, run **after deploying** this backend and **before** composable-agents (deployment order):
 
@@ -925,7 +916,7 @@ If BM25 is unavailable (`BM25_ENABLED=false` or pg_textsearch extension missing)
 
 ## MCP Servers
 
-The service exposes **four MCP servers**, all using streamable HTTP transport:
+The service exposes **three MCP servers**, all using streamable HTTP transport:
 
 ### Web — `/web/mcp`
 
@@ -954,35 +945,6 @@ curl -X POST http://localhost:8000/web/mcp \
 ```
 
 The provider may return no results during an anti-bot/network challenge; this is logged distinctly for operators without changing the genuine empty-result contract.
-
-### Memories — `/memories/mcp`
-
-The `Memories` server exposes exactly one tool:
-
-```python
-save_memory(
-    name: str,
-    content: str,
-    if_exists: Literal["fail", "append", "replace"] = "fail",
-)
-```
-
-The tool normalizes `name` to `/memories/<name>.md` and writes through composable-agents' existing `GET`/`PUT /api/v1/store/files/memories/{name}.md` API. It never accepts `user_id`, tenant, or namespace arguments. The caller must have a resolved user identity and a forwardable JWT or per-user API key; legacy/unauthenticated modes fail closed with zero upstream requests.
-
-- `fail` (default) creates a missing memory but never overwrites an existing one.
-- `append` preserves existing content and appends with exactly one blank Markdown separator where needed.
-- `replace` replaces only with explicit user intent; when absent it creates the file.
-- The response contains `{path, action, chars}`, where `action` is `created`, `appended`, or `replaced` and `chars` is the final content length.
-
-```bash
-curl -X POST http://localhost:8000/memories/mcp \
-  -H "X-API-Key: ${USER_API_KEY}" \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"save_memory","arguments":{"name":"preferences","content":"I prefer concise answers.","if_exists":"append"}}}'
-```
-
-Saved memories appear on the existing composable-ui `/memories` page on the next load/refetch. Store File GET→PUT is not atomic across concurrent writers. Selected memories are copied into agent namespaces when runners are built; saving a global memory does not refresh an already-built runner automatically. composable-agents' `InMemoryStore` fallback is process-local and non-durable; production persistence requires its PostgreSQL store.
 
 ### Removed: RAGAnythingQuery — `/rag/mcp`
 
@@ -1159,7 +1121,6 @@ All MCP servers use **streamable HTTP** transport exclusively. Connect MCP clien
 http://localhost:8000/files/mcp        # Files: list_files, list_folders, read_file
 http://localhost:8000/classical/mcp    # ClassicalRAG: classical_query
 http://localhost:8000/web/mcp          # Web: web_search
-http://localhost:8000/memories/mcp     # Memories: save_memory
 ```
 
 ---
@@ -1365,8 +1326,6 @@ All configuration is via environment variables, loaded through Pydantic Settings
 | `CRAWL_PAGE_TIMEOUT_SECONDS` | `20` | Per-page timeout |
 | `CRAWL_OVERALL_TIMEOUT_SECONDS` | `45` | Whole exploration deadline, below the 60-second MCP caller timeout |
 | `CRAWL_RATE_LIMIT_MIN_DELAY_SECONDS` / `CRAWL_RATE_LIMIT_MAX_DELAY_SECONDS` | `1` / `2` | Shared per-domain base-delay range |
-| `COMPOSABLE_AGENTS_BASE_URL` | `http://localhost:8010` | Store File API base URL; scheme+host only, no path |
-| `MEMORY_STORE_TIMEOUT_SECONDS` | `15` | Memory upstream GET/PUT timeout |
 
 All concurrency settings are process-local. No web character/output-size setting exists. The Compose example uses `http://composable-agents:8000` and documents all required dual-auth placeholders. Replace the non-empty `API_KEY=<operator-provided-legacy-master-key>` placeholder with a strong secret: anyone copying the public placeholder verbatim would otherwise know the degraded-mode fallback credential.
 

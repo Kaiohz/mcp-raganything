@@ -664,36 +664,3 @@ class CrawlConfig(BaseSettings):
                 "CRAWL_RATE_LIMIT_MAX_DELAY_SECONDS"
             )
         return self
-
-
-class MemoryStoreConfig(BaseSettings):
-    """composable-agents Store File API client configuration."""
-
-    COMPOSABLE_AGENTS_BASE_URL: str = Field(
-        default="http://localhost:8010",
-        description="Base URL of the composable-agents Store File API used to "
-        "persist per-user memories (e.g. http://composable-agents:8000 in "
-        "Compose deployments).",
-    )
-    MEMORY_STORE_TIMEOUT_SECONDS: float = Field(
-        default=15.0,
-        gt=0,
-        description="Upstream Store File API request timeout (seconds).",
-    )
-
-    @model_validator(mode="after")
-    def validate_base_url(self) -> "MemoryStoreConfig":
-        """Require a valid absolute HTTP/HTTPS base scheme+host URL."""
-        parsed = urlsplit(self.COMPOSABLE_AGENTS_BASE_URL)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise ValueError(
-                "COMPOSABLE_AGENTS_BASE_URL must be a valid absolute http(s) URL"
-            )
-        if parsed.path not in ("", "/"):
-            # httpx concatenates a base URL path with relative request paths,
-            # which would corrupt the Store File API route — reject it early.
-            raise ValueError(
-                "COMPOSABLE_AGENTS_BASE_URL must not include a path; only "
-                "scheme and host are supported (e.g. http://composable-agents:8000)"
-            )
-        return self

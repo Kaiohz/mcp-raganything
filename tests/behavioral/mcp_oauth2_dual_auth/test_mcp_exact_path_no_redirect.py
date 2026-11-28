@@ -10,7 +10,7 @@ Delegation contract pinned here:
   ``Route("/mcp")`` pattern) — never a Starlette Mount 307;
 * any generated redirect/URL behind the proxy honours ``X-Forwarded-Proto``:
   no ``http://`` scheme downgrade is ever observable (today's production
-  breakage: ``Location: http://raganything.soludev.tech/memories/mcp/``).
+  breakage: ``Location: http://raganything.soludev.tech/web/mcp/``).
 
 RED phase: today POST ``<mount>`` (no trailing slash) is a Mount 307 with an
 ``http://`` redirect target that ignores ``X-Forwarded-Proto`` — the exact
@@ -22,7 +22,7 @@ import pytest
 pytestmark = pytest.mark.asyncio(loop_scope="session")
 
 REDIRECT_STATUSES = {301, 302, 307, 308}
-MCP_MOUNTS = ("/files/mcp", "/classical/mcp", "/web/mcp", "/memories/mcp")
+MCP_MOUNTS = ("/files/mcp", "/classical/mcp", "/web/mcp")
 #: Accepted credentials from the root ``auth_directory`` external doubles.
 API_KEY_KEY_ALICE = "key-alice"
 

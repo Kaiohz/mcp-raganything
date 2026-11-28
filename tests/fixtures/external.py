@@ -7,14 +7,12 @@ The real application, middleware, use cases, and internal adapters remain wired.
 import asyncio
 import copy
 import importlib
-import json
 import threading
 from collections.abc import AsyncIterator, Callable
 from contextlib import ExitStack, contextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-import httpx
 import pytest
 
 from domain.entities.user.user import User
@@ -360,103 +358,3 @@ def reset_web_external(request):
     yield
     if external.search_gate is not None:
         external.search_gate.set()
-
-
-class FakeComposableAgentsStore:
-    """HTTP-boundary double for composable-agents' canonical Store File API."""
-
-    PATH_PREFIX = "/api/v1/store/files/"
-
-    def __init__(self) -> None:
-        self.client_kwargs_history = []
-        self.clients = []
-        self.reset()
-
-    def reset(self) -> None:
-        self.files = {}
-        self.requests = []
-        self.outcomes = []
-
-    def identity(self, request: httpx.Request) -> str | None:
-        authorization = request.headers.get("authorization")
-        api_key = request.headers.get("x-api-key")
-        if authorization:
-            return authorization
-        if api_key:
-            return f"X-API-Key: {api_key}"
-        return None
-
-    def seed(self, credential: str, name: str, content: str) -> None:
-        identity = (
-            f"Bearer {credential}"
-            if credential.startswith("jwt-")
-            else f"X-API-Key: {credential}"
-        )
-        self.files[(identity, f"/memories/{name}.md")] = content
-
-    def stored(self, credential: str, name: str) -> str | None:
-        identity = (
-            f"Bearer {credential}"
-            if credential.startswith("jwt-")
-            else f"X-API-Key: {credential}"
-        )
-        return self.files.get((identity, f"/memories/{name}.md"))
-
-    def respond_next(self, method: str, status: int, body: str = "") -> None:
-        self.outcomes.append((method.upper(), httpx.Response(status, text=body)))
-
-    def fail_next(self, method: str, error: Exception) -> None:
-        self.outcomes.append((method.upper(), error))
-
-    def handle(self, request: httpx.Request) -> httpx.Response:
-        self.requests.append(request)
-        method = request.method.upper()
-        if self.outcomes and self.outcomes[0][0] == method:
-            _method, outcome = self.outcomes.pop(0)
-            if isinstance(outcome, Exception):
-                raise outcome
-            return outcome
-
-        path = request.url.path
-        if not path.startswith(self.PATH_PREFIX):
-            return httpx.Response(404, text="unknown upstream route")
-        file_path = "/" + path[len(self.PATH_PREFIX) :]
-        identity = self.identity(request)
-        key = (identity, file_path)
-
-        if method == "GET":
-            if key not in self.files:
-                return httpx.Response(404, json={"detail": "File not found"})
-            return httpx.Response(
-                200, json={"path": file_path, "content": self.files[key]}
-            )
-        if method == "PUT":
-            payload = json.loads(request.content)
-            content = payload["content"]
-            self.files[key] = content
-            return httpx.Response(200, json={"path": file_path, "content": content})
-        return httpx.Response(405, text="method not allowed")
-
-    def client_factory(self, *args, **kwargs):
-        self.client_kwargs_history.append(copy.deepcopy(kwargs))
-        kwargs["transport"] = httpx.MockTransport(self.handle)
-        client = httpx.AsyncClient(*args, **kwargs)
-        self.clients.append(client)
-        return client
-
-
-@pytest.fixture(scope="session")
-def memory_external():
-    external = FakeComposableAgentsStore()
-    with _patch_when_feature_exists(
-        "infrastructure.memory.composable_agents_store_adapter.httpx.AsyncClient",
-        external.client_factory,
-    ):
-        yield external
-
-
-@pytest.fixture(autouse=True)
-def reset_memory_external(request):
-    external = request.getfixturevalue("memory_external")
-    external.reset()
-    yield

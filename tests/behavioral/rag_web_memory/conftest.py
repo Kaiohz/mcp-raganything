@@ -4,9 +4,8 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def reset_feature_externals(web_external, memory_external):
+def reset_feature_externals(web_external):
     web_external.reset()
-    memory_external.reset()
     yield
     if web_external.search_gate is not None:
         web_external.search_gate.set()

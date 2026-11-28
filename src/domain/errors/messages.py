@@ -110,32 +110,6 @@ class ErrorMessage(StrEnum):
     WEB_SEARCH_CRAWL_REDIRECTED = "Page was redirected to a disallowed destination."
     WEB_SEARCH_CRAWL_BATCH_FAILED = "The page exploration did not complete in time."
 
-    # --- Memory store (composable-agents Store File API) ---
-    MEMORY_IDENTITY_REQUIRED = (
-        "Saving memories requires an authenticated user identity with a "
-        "forwardable JWT or API key credential."
-    )
-    MEMORY_NAME_INVALID = (
-        "Invalid memory name: use letters, digits, dots, hyphens or "
-        "underscores without paths or separators."
-    )
-    MEMORY_CONTENT_REQUIRED = "Memory content must not be empty."
-    MEMORY_EXISTS = "A memory with this name already exists (if_exists='fail')."
-    MEMORY_MODE_INVALID = "if_exists must be one of: fail, append, replace."
-    MEMORY_STORE_TIMEOUT = "The memory service did not respond in time."
-    MEMORY_STORE_UNAVAILABLE = "The memory service is temporarily unavailable."
-    MEMORY_STORE_REJECTED = "The memory service rejected the memory save request."
-    MEMORY_STORE_UNEXPECTED = "The memory service request failed unexpectedly."
-    MEMORY_STORE_FORBIDDEN = (
-        "The memory request was rejected by the upstream service: authentication "
-        "or permission failure."
-    )
-    MEMORY_STORE_INVALID_RESPONSE = "The memory service returned an invalid response."
-    MEMORY_STORE_PATH_ESCAPE = "Memory storage path must stay inside /memories/."
-    MEMORY_SAVE_FAILED = "Saving the memory failed. Try again later."
-    MEMORY_OPERATION_FAILED = "The memory operation failed. Try again later."
-    MEMORY_NOT_FOUND = "Memory not found: {name}"
-
     # --- Caller scope / RAG spaces ---
     AGENT_SCOPE_INVALID = (
         "Invalid agent scope: the '{header}' header value {value!r} does not "

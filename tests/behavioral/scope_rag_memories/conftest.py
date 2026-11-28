@@ -1,13 +1,13 @@
-"""Feature-local fixtures for the scope-RAG-&-memories behavioral suites (TDD RED).
+"""Feature-local fixtures for the scope-RAG behavioral suites (TDD RED).
 
-Feature: Scope RAG & Memories per User × Agent (mcp-raganything side).
+Feature: Scope RAG per User × Agent (mcp-raganything side).
 
 Boundary policy — mirrors the repo's ``tests/fixtures/external.py`` conventions:
 
 * The application, its middleware, routers / MCP tools, use cases and DI wiring
   run REAL: every test goes through the real ``main.app`` (REST via httpx
-  ``ASGITransport``; MCP via the mounted ``/files|mcp``, ``/classical|mcp``,
-  ``/memories|mcp`` apps using the global ``mcp_call`` / ``mcp_list`` fixtures).
+  ``ASGITransport``; MCP via the mounted ``/files|mcp``, ``/classical|mcp`` and
+  ``/web|mcp`` apps using the global ``mcp_call`` / ``mcp_list`` fixtures).
 * Object storage (MinIO/RustFS) is an outbound object-storage system. The suite
   swaps ONLY the ``StoragePort`` adapter singletons (``dependencies.minio_adapter``
   and the ``mcp_file_tools`` binding used by the temporary chat tools) for a
@@ -20,9 +20,6 @@ Boundary policy — mirrors the repo's ``tests/fixtures/external.py`` convention
   ``mock_llm`` external double, so the composed working_dir namespaces, the
   ``user_id`` chunk tag at index time and the query-time metadata filter stay
   observable through the real MCP tools and REST routes.
-* The memories upstream (composable-agents Store File API) is the session
-  ``memory_external`` HTTP-boundary double, extended by this conftest with
-  directory-listing and DELETE handlers (instance-level, restored per test).
 
 REST routes authenticate through the production composition-root hook:
 ``main.rest_security`` is wired with the REAL ``AuthService`` over the suite's
@@ -50,7 +47,6 @@ AGENT_HEADER = "X-Composable-Agent"
 
 FILES_MOUNT = "/files/mcp"
 CLASSICAL_MOUNT = "/classical/mcp"
-MEMORIES_MOUNT = "/memories/mcp"
 
 USER_ALICE = "user-alice"
 USER_BOB = "user-bob"
@@ -100,19 +96,6 @@ async def wait_for_record(predicate, timeout_seconds: float = 10.0) -> bool:
             return True
         await asyncio.sleep(0.05)
     return predicate()
-
-
-@pytest.fixture(autouse=True)
-def reset_feature_externals(memory_external):
-    """Reset the shared Store File API double around every test.
-
-    Mirrors the ``rag_web_memory`` feature-local reset convention: the global
-    ``tests/conftest.py`` re-exports the session-double fixture but not its
-    resetters, and this suite seeds/mutates the recorded state per test.
-    """
-    memory_external.reset()
-    yield
-    memory_external.reset()
 
 
 @pytest.fixture(autouse=True)
@@ -377,60 +360,3 @@ def rag_boundaries(monkeypatch, mock_llm) -> NamespaceVectorStore:
     )
     monkeypatch.setattr(dependencies, "get_chat_llm_for_user", chat_llm_for_user)
     return double
-
-
-@pytest.fixture
-def memory_store_ext(memory_external, monkeypatch):
-    """Extend the Store File API double with listing + DELETE handlers.
-
-    The shared session double answers GET (file content) and PUT (write).
-    The feature's ``list_memories``/``delete_memory`` tools need the
-    directory listing (GET on a non-``.md`` path) and ``DELETE`` file
-    routes of the Store File API; the extension is instance-level (monkeypatch
-    restores the original handler afterwards) and delegates everything else to
-    the existing handler so the established GET/PUT behaviour is untouched.
-    """
-    external = memory_external
-    original_handle = external.handle
-    path_prefix = "/api/v1/store/files/"
-
-    def handle_with_listing_and_delete(request: httpx.Request) -> httpx.Response:
-        # Mirrors the base handler's established observation contract: EVERY
-        # request is recorded, and a scripted ``respond_next`` outcome wins
-        # before any branch (the base ``handle`` does exactly this for the
-        # GET/PUT paths — the extension must behave identically for the
-        # directory-listing and DELETE paths).
-        external.requests.append(request)
-        method = request.method.upper()
-        if external.outcomes and external.outcomes[0][0] == method:
-            _method, outcome = external.outcomes.pop(0)
-            if isinstance(outcome, Exception):
-                raise outcome
-            return outcome
-        path = request.url.path
-        if method == "DELETE" and path.startswith(path_prefix):
-            # QA BUG-004 evidence (steps I2/I3): the REAL store route answers
-            # 204 No Content for an absent file exactly like for a successful
-            # deletion — the double mirrors that contract faithfully; the
-            # adapter's existence pre-check is what enforces not-found.
-            file_path = "/" + path[len(path_prefix) :]
-            identity = external.identity(request)
-            external.files.pop((identity, file_path), None)
-            return httpx.Response(204)
-        if method == "GET" and path == "/api/v1/store/files":
-            # QA BUG-002: the REAL listing route is
-            # GET /api/v1/store/files?prefix=<scope> and answers a plain JSON
-            # array of store paths (NOT a "files" document).
-            scope_prefix = str(request.url.params.get("prefix", ""))
-            entries = [
-                stored_path
-                for (owner, stored_path), _content in sorted(external.files.items())
-                if owner == external.identity(request)
-                and stored_path.startswith(scope_prefix)
-                and stored_path.endswith(".md")
-            ]
-            return httpx.Response(200, json=entries)
-        return original_handle(request)
-
-    monkeypatch.setattr(external, "handle", handle_with_listing_and_delete)
-    return external

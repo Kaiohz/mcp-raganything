@@ -112,12 +112,11 @@ class TestLifespan:
         """
         from application.api.mcp_classical_tools import mcp_classical
         from application.api.mcp_file_tools import mcp_files
-        from application.api.mcp_memory_tools import mcp_memories
         from application.api.mcp_web_tools import mcp_web
         from security import McpApiKeyMiddleware
 
         our_guard = main_middleware_singleton()
-        for server in (mcp_files, mcp_classical, mcp_web, mcp_memories):
+        for server in (mcp_files, mcp_classical, mcp_web):
             guards = [
                 mw for mw in server.middleware if isinstance(mw, McpApiKeyMiddleware)
             ]

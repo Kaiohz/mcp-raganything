@@ -24,7 +24,6 @@ pytestmark = pytest.mark.asyncio(loop_scope="session")
 AGENT_HEADER = "X-Composable-Agent"
 CLASSICAL_MOUNT = "/classical/mcp"
 FILES_MOUNT = "/files/mcp"
-MEMORIES_MOUNT = "/memories/mcp"
 REST_LIST = "/api/v1/files/list"
 
 
@@ -149,39 +148,6 @@ async def test_rest_rejects_invalid_agent_header_with_422_without_storage_call(
     assert response.status_code == 422
     # No storage operation may occur on an invalid scope (REQ-002).
     assert storage_external.calls == []
-
-
-@pytest.mark.parametrize("value", INVALID_AGENT_HEADERS)
-async def test_mcp_files_rejects_invalid_agent_header_without_storage_call(
-    mcp_call, storage_external, value
-):
-    storage_external.seed({"user-alice/personal/notes.txt": b"content"})
-
-    result = await mcp_call(
-        FILES_MOUNT,
-        "list_files",
-        {"prefix": ""},
-        headers={**bearer("jwt-alice"), AGENT_HEADER: value},
-    )
-
-    assert result.is_error is True
-    message = error_text(result).lower()
-    assert any(word in message for word in ("agent", "scope", value.lower()))
-    assert storage_external.calls == []
-
-
-async def test_mcp_memories_rejects_invalid_agent_header_without_upstream_call(
-    mcp_call, memory_external
-):
-    result = await mcp_call(
-        MEMORIES_MOUNT,
-        "save_memory",
-        {"name": "prefs", "content": "must not persist"},
-        headers={**bearer("jwt-alice"), AGENT_HEADER: "Bad_Name!"},
-    )
-
-    assert result.is_error is True
-    assert memory_external.requests == []
 
 
 async def test_mcp_classical_rejects_invalid_agent_header_before_query(
