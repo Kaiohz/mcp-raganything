@@ -259,21 +259,29 @@ class XbergAdapter(DocumentReaderPort):
 
     @staticmethod
     def _page_dict(page: object) -> dict:
-        """Read the xberg PageContent fields via explicit attribute access.
+        """Read the xberg PageContent via explicit attribute access.
 
-        ``PageContent`` is a pyo3 Rust class WITHOUT ``__dict__`` — ``vars()``
-        raises TypeError and its ``__dict__``-style copies leak non-JSON
+        ``PageContent`` is a pyo3 Rust class WITHOUT ``__dict__``: ``vars()``
+        raises TypeError and ``__dict__``-style copies leak non-JSON
         ``getset_descriptor`` objects; explicit attribute reads only (dict
         pages are accepted raw).
         """
         if isinstance(page, dict):
-            return {
-                "page_number": int(page.get("page_number", 1) or 1),
-                "content": str(page.get("content", "") or ""),
-                "tables": [
-                    XbergAdapter._serialize_table(t) for t in (page.get("tables") or [])
-                ],
-            }
+            return XbergAdapter._dict_page(page)
+        return XbergAdapter._object_page(page)
+
+    @staticmethod
+    def _dict_page(page: dict) -> dict:
+        return {
+            "page_number": int(page.get("page_number", 1) or 1),
+            "content": str(page.get("content", "") or ""),
+            "tables": [
+                XbergAdapter._serialize_table(t) for t in (page.get("tables") or [])
+            ],
+        }
+
+    @staticmethod
+    def _object_page(page: object) -> dict:
         return {
             "page_number": int(getattr(page, "page_number", 1) or 1),
             "content": str(getattr(page, "content", "") or ""),
